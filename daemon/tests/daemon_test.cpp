@@ -44,7 +44,7 @@ namespace process = boost::process::v1;
 #include <boost/test/unit_test.hpp>
 
 #if !(defined(__arm__) || defined(__arm64__))
-//#define _MEMORY_CHECK_
+// #define _MEMORY_CHECK_
 #endif
 
 constexpr static const char g_daemon_address[] = "127.0.0.1";
@@ -90,12 +90,11 @@ struct DaemonInstance {
   static bool is_ok() { return ok; }
 
  private:
-  child daemon_ {
+  child daemon_{
 #if defined _MEMORY_CHECK_
-    search_path("valgrind"),
+      search_path("valgrind"),
 #endif
-        "../aes67-daemon", "-c", "daemon.conf", "-p", "9999"
-  };
+      "../aes67-daemon",       "-c", "daemon.conf", "-p", "9999"};
   inline static bool ok{false};
 };
 
@@ -410,7 +409,9 @@ BOOST_AUTO_TEST_CASE(get_config) {
   auto max_tic_frame_size = pt.get<int>("max_tic_frame_size");
   auto sample_rate = pt.get<int>("sample_rate");
   auto rtp_mcast_base = pt.get<std::string>("rtp_mcast_base");
+  auto rtp_mcast_base_sec = pt.get<std::string>("rtp_mcast_base_sec");
   auto rtp_port = pt.get<int>("rtp_port");
+  auto rtp_port_sec = pt.get<int>("rtp_port_sec");
   auto ptp_domain = pt.get<int>("ptp_domain");
   auto ptp_dscp = pt.get<int>("ptp_dscp");
   auto sap_interval = pt.get<int>("sap_interval");
@@ -438,7 +439,9 @@ BOOST_AUTO_TEST_CASE(get_config) {
   BOOST_CHECK_MESSAGE(max_tic_frame_size == 1024, "config as excepcted");
   BOOST_CHECK_MESSAGE(sample_rate == 44100, "config as excepcted");
   BOOST_CHECK_MESSAGE(rtp_mcast_base == "239.1.0.1", "config as excepcted");
+  BOOST_CHECK_MESSAGE(rtp_mcast_base_sec == "239.1.1.1", "config as excepcted");
   BOOST_CHECK_MESSAGE(rtp_port == 6004, "config as excepcted");
+  BOOST_CHECK_MESSAGE(rtp_port_sec == 6006, "config as excepcted");
   BOOST_CHECK_MESSAGE(ptp_domain == 0, "config as excepcted");
   BOOST_CHECK_MESSAGE(ptp_dscp == 46, "config as excepcted");
   BOOST_CHECK_MESSAGE(sap_interval == 1, "config as excepcted");
@@ -655,9 +658,9 @@ BOOST_AUTO_TEST_CASE(sink_check_status) {
   boost::property_tree::read_json(ss, pt);
   // auto is_sink_muted = pt.get<bool>("sink_flags.muted");
   auto is_sink_some_muted = pt.get<bool>("sink_flags.some_muted");
-  //auto is_sink_all_muted = pt.get<bool>("sink_flags.all_muted");
-  // BOOST_REQUIRE_MESSAGE(is_sink_muted, "sink is muted");
-  //BOOST_REQUIRE_MESSAGE(!is_sink_all_muted, "all sinks are muted");
+  // auto is_sink_all_muted = pt.get<bool>("sink_flags.all_muted");
+  //  BOOST_REQUIRE_MESSAGE(is_sink_muted, "sink is muted");
+  // BOOST_REQUIRE_MESSAGE(!is_sink_all_muted, "all sinks are muted");
   BOOST_REQUIRE_MESSAGE(!is_sink_some_muted, "some sinks are muted");
   BOOST_REQUIRE_MESSAGE(cli.remove_sink(0), "removed sink 0");
 }

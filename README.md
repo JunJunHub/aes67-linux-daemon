@@ -232,7 +232,7 @@ The [aes67-daemon branch of ravenna-alsa-lkm repository](https://github.com/bond
 
  The following patches have been applied to the original module:
 
-* set of patches to improve driver stability and performance, see [367c166] https://github.com/bondagit/ravenna-alsa-lkm/commit/367c1665e8038272514a637ea03799350e8e12a8. Added _audio_cpu_affinity_ module parameter to have the audio timer pinned to a specific CPU (from driver 2.1).
+* set of patches to improve driver stability and performance, see [367c166](https://github.com/bondagit/ravenna-alsa-lkm/commit/367c1665e8038272514a637ea03799350e8e12a8). Added _audio_cpu_affinity_ module parameter to have the audio timer pinned to a specific CPU (from driver 2.1).
 * added support for ST-2022-7 (from driver version 2.0). This version breaks compatibility with the older and requires a new daemon. See [issue 248](https://github.com/bondagit/aes67-linux-daemon/issues/248)
 * patch to update the grand master clock ID of the current master clock when it gets updated in the ANNOUNCE messages (from driver version v1.18). See driver [issue 34](https://github.com/bondagit/ravenna-alsa-lkm/issues/34)
 * patch to fix the PTP master sync timeout and to have a less restrictive spin lock (from driver version v1.17). See [issue 246](https://github.com/bondagit/aes67-linux-daemon/issues/246)

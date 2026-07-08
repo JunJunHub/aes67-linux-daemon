@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 option(WITH_SYSTEMD "Include systemd notify and watchdog support" OFF)
 option(WITH_STREAMER "Enable streamer support" ON)
+option(WITH_OCA "AES70/OCA device control surface" OFF)
 
 # ravena lkm _should_ be provided by the CLI. Nonetheless, we should be able
 # to find it in system dirs too...
@@ -41,6 +42,14 @@ if(WITH_STREAMER)
   MESSAGE(STATUS "WITH_STREAMER")
   add_definitions(-D_USE_STREAMER_)
   list(APPEND SOURCES streamer.cpp)
+endif()
+
+if(WITH_OCA)
+  MESSAGE(STATUS "WITH_OCA")
+  add_definitions(-D_USE_OCA_)
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR})  # 让 #include "oca/..." 可解析
+  # OCA 源文件推迟到 Task 16(主 daemon 接线)再加入 SOURCES;此处不列出,
+  # 否则 WITH_OCA=ON 时 add_executable(aes67-daemon) 因源文件不存在而在配置期报错。
 endif()
 
 if(FAKE_DRIVER)

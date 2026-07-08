@@ -2,8 +2,27 @@
 #include <boost/test/unit_test.hpp>
 
 #include "oca/methods.hpp"
+#include "oca/object.hpp"
 #include "oca/ocp1.hpp"
 #include "oca/types.hpp"
+
+namespace {
+class StubObject : public oca::Object {
+ public:
+  explicit StubObject(oca::ONo ono) : oca::Object(ono) {}
+  const oca::ClassIdentification& class_id() const override { return id_; }
+  uint16_t class_version() const override { return 1; }
+  oca::Status exec(oca::MethodID,
+                   oca::ocp1::Reader&,
+                   oca::ocp1::Writer&,
+                   oca::Session&) override {
+    return oca::Status::OK;
+  }
+
+ private:
+  oca::ClassIdentification id_{};
+};
+}  // namespace
 
 BOOST_AUTO_TEST_CASE(types_and_constants) {
   namespace m = oca::methods;
@@ -221,4 +240,24 @@ BOOST_AUTO_TEST_CASE(ocp1_fuzz_no_crash) {
   BOOST_CHECK(!hdr);  // 不足 9 字节
   hdr = oca::ocp1::PduReader::try_parse_header(junk + 1, 8);
   BOOST_CHECK(!hdr);
+}
+
+BOOST_AUTO_TEST_CASE(registry_find_and_range) {
+  oca::ObjectRegistry reg;
+  reg.register_object(std::make_unique<StubObject>(1));
+  reg.register_object(std::make_unique<StubObject>(4));
+  reg.register_object(std::make_unique<StubObject>(100));
+
+  BOOST_CHECK(reg.find(1) != nullptr);
+  BOOST_CHECK(reg.find(4) != nullptr);
+  BOOST_CHECK(reg.find(2) == nullptr);  // 未注册
+  BOOST_CHECK_EQUAL(reg.size(), 3u);
+
+  auto mgrs = reg.objects_in_range(1, 99);
+  BOOST_REQUIRE_EQUAL(mgrs.size(), 2u);  // 1 和 4
+  BOOST_CHECK_EQUAL(mgrs[0]->ono(), 1u);
+  BOOST_CHECK_EQUAL(mgrs[1]->ono(), 4u);
+
+  auto all = reg.objects_in_range(1, 100);
+  BOOST_CHECK_EQUAL(all.size(), 3u);
 }

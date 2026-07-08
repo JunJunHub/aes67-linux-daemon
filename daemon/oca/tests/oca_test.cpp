@@ -4,6 +4,7 @@
 #include "oca/methods.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
+#include "oca/session.hpp"
 #include "oca/types.hpp"
 
 namespace {
@@ -260,4 +261,41 @@ BOOST_AUTO_TEST_CASE(registry_find_and_range) {
 
   auto all = reg.objects_in_range(1, 100);
   BOOST_CHECK_EQUAL(all.size(), 3u);
+}
+
+BOOST_AUTO_TEST_CASE(session_subscription_and_queue) {
+  oca::Session s(1);
+  BOOST_CHECK_EQUAL(s.session_id(), 1u);
+
+  oca::Subscription2 sub;
+  sub.emitterONo = 1;
+  sub.eventID = {oca::methods::kDefLevelDeviceMngr,
+                 oca::methods::kEventOperationalState};
+  s.add_subscription(sub);
+  s.add_subscription(sub);  // 去重
+  BOOST_CHECK_EQUAL(s.subscriptions().size(), 1u);
+  BOOST_CHECK(s.has_subscription(1, sub.eventID));
+
+  s.remove_subscription(1, sub.eventID);
+  BOOST_CHECK(!s.has_subscription(1, sub.eventID));
+  BOOST_CHECK_EQUAL(s.subscriptions().size(), 0u);
+
+  // 写队列
+  s.enqueue_notification({0x3B, 0x00, 0x01});
+  s.enqueue_notification({0x3B, 0x00, 0x02});
+  std::vector<uint8_t> out;
+  BOOST_CHECK(s.take_notification(out));
+  BOOST_CHECK_EQUAL(out[2], 0x01);
+  BOOST_CHECK(s.take_notification(out));
+  BOOST_CHECK_EQUAL(out[2], 0x02);
+  BOOST_CHECK(!s.take_notification(out));
+}
+
+BOOST_AUTO_TEST_CASE(session_keepalive_expiry) {
+  oca::Session s(2);
+  s.set_heartbeat(5);
+  s.touch(100);
+  BOOST_CHECK(!s.expired(110));   // 10s < 15s
+  BOOST_CHECK(!s.expired(115));   // 15s == 3*5,不超(严格大于)
+  BOOST_CHECK(s.expired(116));    // 16s > 15s
 }

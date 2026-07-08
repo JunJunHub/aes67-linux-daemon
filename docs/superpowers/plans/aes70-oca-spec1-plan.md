@@ -19,6 +19,7 @@
 5. **OcaBlock.GetMembers**:规格 §C 写的是 `GetControlObjects`,但其真实 MethodIndex 仅存在于 AES70-2 Annex A XMI(文本源不可得)。`GetMembers`(DefLevel=3,索引 5,ocac 核对)是标准的对象树发现方法,返回成员 ONo 列表,完全满足"浏览对象树"验收。Spec1 Root Block 实现 `GetMembers(5)` 返回 `[1,2,4]`;`GetControlObjects` 列为 Spec1 收尾项(取得 XMI 后补)。
 6. **Notification2 帧格式**:规格 §B 的 `Notification2` 结构漏了 `Data` 字段。采用 AES70-3-2023 §9.4.4 真实布局:`NotificationSize(u32) + OcaEvent{EmitterONo(u32), EventID{DefLevel(u16), EventIndex(u16)}} + NotificationType(u8) + Data(Ocp1List<u8> = u16 count + bytes)`。
 7. **OcaSubscriptionManager EV2 索引**:ocac 仅含 EV1(AddSubscription=3m01…)。EV2(AddSubscription2 等)的真实索引需 AES70-2-2023 Annex A XMI 确认。本计划在 `methods.hpp` 中给出候选值并设 XMI 校验关卡(见 Task 2);因所有分派引用命名常量,若候选错误为单行修正,真实控制器订阅测试会捕获。
+8. **OcaBitstring 编码**:计划初稿 `Writer::bitstring` 误写为 `u16(numBits)+u16(nbytes)+bytes`。按 AES70-3-2023 §21 Datatype 表,OcaBitstring = `u16(位数) + bytes`(字节数 = ceil(位数/8),无独立 nbytes 字段)。`Reader::bitstring` 已正确;已修正 `Writer::bitstring` 去掉多余 `u16(nbytes)`,并相应修正 Task 4 测试的期望字节数(6->4)。
 
 ## Global Constraints
 
@@ -818,7 +819,6 @@ void Writer::blob(const uint8_t* data, size_t len) {
 void Writer::bitstring(const OcaBitstring& bs) {
   u16(bs.numBits);
   uint16_t nbytes = static_cast<uint16_t>((bs.numBits + 7) / 8);
-  u16(nbytes);
   if (nbytes) buf_.insert(buf_.end(), bs.bytes.begin(), bs.bytes.begin() + nbytes);
 }
 ```
@@ -866,8 +866,8 @@ BOOST_AUTO_TEST_CASE(ocp1_blob_and_bitstring) {
   bs.bytes = {0xFF, 0x03};
   oca::ocp1::Writer wb;
   wb.bitstring(bs);
-  // u16 numBits(10) + u16 nbytes(2) + 2 bytes
-  BOOST_CHECK_EQUAL(wb.size(), 6u);
+  // u16 numBits(10) + 2 bytes (AES70-3: 无独立 nbytes 字段,字节数=ceil(numBits/8))
+  BOOST_CHECK_EQUAL(wb.size(), 4u);
   oca::ocp1::Reader rb(wb.data(), wb.size());
   auto bs2 = rb.bitstring();
   BOOST_CHECK_EQUAL(bs2.numBits, 10u);

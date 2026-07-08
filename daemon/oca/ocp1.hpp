@@ -139,6 +139,25 @@ struct PduWriter {
   static std::vector<uint8_t> build_keepalive_pdu(uint16_t heartbeatTimeSec);
 };
 
+// 单条消息序列化(不含 sync/header,写入 Writer)
+void write_command(Writer& w,
+                   uint32_t handle,
+                   ONo targetONo,
+                   MethodID methodID,
+                   const uint8_t* params,
+                   uint8_t paramCount);
+void write_response(Writer& w,
+                    uint32_t handle,
+                    Status status,
+                    const uint8_t* params,
+                    uint8_t paramCount);
+void write_notification2(Writer& w,
+                         ONo emitterONo,
+                         EventID eventID,
+                         uint8_t notificationType,
+                         const uint8_t* data,
+                         uint16_t dataCount);
+
 // 模板方法定义(放头文件)
 template <typename T>
 std::vector<T> Reader::list(std::function<T(Reader&)> read_item) {

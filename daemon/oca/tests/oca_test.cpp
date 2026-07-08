@@ -125,3 +125,100 @@ BOOST_AUTO_TEST_CASE(ocp1_list_roundtrip) {
   auto out = r.list<uint32_t>([](oca::ocp1::Reader& rr) { return rr.u32(); });
   BOOST_CHECK(out == in);
 }
+
+BOOST_AUTO_TEST_CASE(ocp1_command_pdu_roundtrip) {
+  // 构造一条 command:handle=42, target=1, method {3,1} (GetOcaVersion), 无参
+  oca::ocp1::Writer cw;
+  oca::ocp1::write_command(
+      cw, 42, 1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion},
+      nullptr, 0);
+  auto pdu = oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size());
+
+  // 校验 sync + header
+  BOOST_CHECK_EQUAL(pdu[0], 0x3B);
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  BOOST_REQUIRE(hdr);
+  BOOST_CHECK_EQUAL(hdr->protocolVersion, 1);
+  BOOST_CHECK_EQUAL(hdr->pduType, oca::methods::kPduCommand);
+  BOOST_CHECK_EQUAL(hdr->messageCount, 1);
+  BOOST_CHECK_EQUAL(hdr->pduSize, 9u + cw.size());
+
+  // 解析 command
+  const uint8_t* payload = pdu.data() + 1 + 9;
+  size_t payloadLen = cw.size();
+  auto cmds = oca::ocp1::PduReader::parse_commands(payload, payloadLen,
+                                                   hdr->messageCount);
+  BOOST_REQUIRE_EQUAL(cmds.size(), 1u);
+  BOOST_CHECK_EQUAL(cmds[0].handle, 42u);
+  BOOST_CHECK_EQUAL(cmds[0].targetONo, 1u);
+  BOOST_CHECK_EQUAL(cmds[0].methodID.defLevel,
+                    oca::methods::kDefLevelDeviceMngr);
+  BOOST_CHECK_EQUAL(cmds[0].methodID.methodIndex,
+                    oca::methods::kDevGetOcaVersion);
+  BOOST_CHECK_EQUAL(cmds[0].paramCount, 0);
+}
+
+BOOST_AUTO_TEST_CASE(ocp1_response_and_notification2_roundtrip) {
+  // response: handle=7, status=OK, params={0x00,0x01} (u16 OcaVersion=1)
+  uint8_t params[2] = {0x00, 0x01};
+  oca::ocp1::Writer rw;
+  oca::ocp1::write_response(rw, 7, oca::Status::OK, params, 2);
+  auto pdu = oca::ocp1::PduWriter::build_response_pdu(1, rw.data(), rw.size());
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  auto rsps = oca::ocp1::PduReader::parse_responses(
+      pdu.data() + 1 + 9, rw.size(), hdr->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+  BOOST_CHECK_EQUAL(rsps[0].handle, 7u);
+  BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(rsps[0].paramCount, 2);
+  BOOST_CHECK_EQUAL(rsps[0].paramData[1], 0x01);
+
+  // notification2: emitter=1, event {3,1}, type=0(event),
+  // data={0x00}(DeviceState Operational)
+  uint8_t evdata[1] = {static_cast<uint8_t>(oca::DeviceState::Operational)};
+  oca::ocp1::Writer nw;
+  oca::ocp1::write_notification2(
+      nw, 1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kEventOperationalState},
+      0, evdata, 1);
+  auto npdu =
+      oca::ocp1::PduWriter::build_notification2_pdu(1, nw.data(), nw.size());
+  auto nhdr =
+      oca::ocp1::PduReader::try_parse_header(npdu.data() + 1, npdu.size() - 1);
+  BOOST_CHECK_EQUAL(nhdr->pduType, oca::methods::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      npdu.data() + 1 + 9, nw.size(), nhdr->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.eventIndex,
+                    oca::methods::kEventOperationalState);
+  BOOST_CHECK_EQUAL(ntfs[0].dataCount, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].data[0],
+                    static_cast<uint8_t>(oca::DeviceState::Operational));
+}
+
+BOOST_AUTO_TEST_CASE(ocp1_keepalive_pdu) {
+  auto pdu = oca::ocp1::PduWriter::build_keepalive_pdu(5);
+  BOOST_CHECK_EQUAL(pdu[0], 0x3B);
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  BOOST_REQUIRE(hdr);
+  BOOST_CHECK_EQUAL(hdr->pduType, oca::methods::kPduKeepAlive);
+  BOOST_CHECK_EQUAL(hdr->messageCount, 1);
+  BOOST_CHECK_EQUAL(hdr->pduSize, 11u);  // 9 header + 2 heartbeat
+  // heartbeat = u16 at offset 1(sync)+9(header) = 10
+  BOOST_CHECK_EQUAL(pdu[10], 0x00);
+  BOOST_CHECK_EQUAL(pdu[11], 0x05);
+}
+
+BOOST_AUTO_TEST_CASE(ocp1_fuzz_no_crash) {
+  // 随机字节不应让 header 解析崩溃
+  uint8_t junk[9] = {0x3B, 0, 1, 0, 0, 0, 9, 0, 0};
+  auto hdr = oca::ocp1::PduReader::try_parse_header(junk + 1, 8);
+  BOOST_CHECK(!hdr);  // 不足 9 字节
+  hdr = oca::ocp1::PduReader::try_parse_header(junk + 1, 8);
+  BOOST_CHECK(!hdr);
+}

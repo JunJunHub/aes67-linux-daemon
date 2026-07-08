@@ -172,6 +172,195 @@ void Writer::bitstring(const OcaBitstring& bs) {
     buf_.insert(buf_.end(), bs.bytes.begin(), bs.bytes.begin() + nbytes);
 }
 
-// PDU 分帧在 Task 5 实现
+// ---------- 单条消息序列化 ----------
+void write_command(Writer& w,
+                   uint32_t handle,
+                   ONo targetONo,
+                   MethodID methodID,
+                   const uint8_t* params,
+                   uint8_t paramCount) {
+  // commandSize = 4+4+4+4+1 + paramCount = 17 + paramCount
+  uint32_t cmdSize = 17u + paramCount;
+  w.u32(cmdSize);
+  w.u32(handle);
+  w.u32(targetONo);
+  w.u16(methodID.defLevel);
+  w.u16(methodID.methodIndex);
+  w.u8(paramCount);
+  for (uint8_t i = 0; i < paramCount; ++i)
+    w.u8(params[i]);
+}
+
+void write_response(Writer& w,
+                    uint32_t handle,
+                    Status status,
+                    const uint8_t* params,
+                    uint8_t paramCount) {
+  // responseSize = 4+4+1+1 + paramCount = 10 + paramCount
+  uint32_t rspSize = 10u + paramCount;
+  w.u32(rspSize);
+  w.u32(handle);
+  w.u8(static_cast<uint8_t>(status));
+  w.u8(paramCount);
+  for (uint8_t i = 0; i < paramCount; ++i)
+    w.u8(params[i]);
+}
+
+void write_notification2(Writer& w,
+                         ONo emitterONo,
+                         EventID eventID,
+                         uint8_t notificationType,
+                         const uint8_t* data,
+                         uint16_t dataCount) {
+  // notificationSize = 4+4+4+1+2 + dataCount = 15 + dataCount
+  uint32_t ntfSize = 15u + dataCount;
+  w.u32(ntfSize);
+  w.u32(emitterONo);
+  w.u16(eventID.defLevel);
+  w.u16(eventID.eventIndex);
+  w.u8(notificationType);
+  w.u16(dataCount);
+  for (uint16_t i = 0; i < dataCount; ++i)
+    w.u8(data[i]);
+}
+
+// ---------- PduReader ----------
+std::optional<Header> PduReader::try_parse_header(const uint8_t* buf,
+                                                  size_t len) {
+  if (len < 9)
+    return std::nullopt;
+  Reader r(buf, 9);
+  Header h;
+  h.protocolVersion = r.u16();
+  h.pduSize = r.u32();
+  h.pduType = r.u8();
+  h.messageCount = r.u16();
+  return h;
+}
+
+std::vector<Command> PduReader::parse_commands(const uint8_t* data,
+                                               size_t len,
+                                               uint16_t count) {
+  Reader r(data, len);
+  std::vector<Command> out;
+  for (uint16_t i = 0; i < count; ++i) {
+    Command c;
+    c.commandSize = r.u32();
+    c.handle = r.u32();
+    c.targetONo = r.u32();
+    c.methodID.defLevel = r.u16();
+    c.methodID.methodIndex = r.u16();
+    c.paramCount = r.u8();
+    size_t consumed = len - r.remaining();
+    c.paramData = data + consumed;  // 指向 buffer 内 params 起点
+    for (uint8_t p = 0; p < c.paramCount; ++p)
+      r.u8();  // 跳过 params
+    out.push_back(c);
+  }
+  return out;
+}
+
+std::vector<Response> PduReader::parse_responses(const uint8_t* data,
+                                                 size_t len,
+                                                 uint16_t count) {
+  Reader r(data, len);
+  std::vector<Response> out;
+  for (uint16_t i = 0; i < count; ++i) {
+    Response rsp;
+    rsp.responseSize = r.u32();
+    rsp.handle = r.u32();
+    rsp.statusCode = static_cast<Status>(r.u8());
+    rsp.paramCount = r.u8();
+    size_t consumed = len - r.remaining();
+    rsp.paramData = data + consumed;
+    for (uint8_t p = 0; p < rsp.paramCount; ++p)
+      r.u8();
+    out.push_back(rsp);
+  }
+  return out;
+}
+
+std::vector<Notification2> PduReader::parse_notifications2(const uint8_t* data,
+                                                           size_t len,
+                                                           uint16_t count) {
+  Reader r(data, len);
+  std::vector<Notification2> out;
+  for (uint16_t i = 0; i < count; ++i) {
+    Notification2 n;
+    n.notificationSize = r.u32();
+    n.emitterONo = r.u32();
+    n.eventID.defLevel = r.u16();
+    n.eventID.eventIndex = r.u16();
+    n.notificationType = r.u8();
+    n.dataCount = r.u16();
+    size_t consumed = len - r.remaining();
+    n.data = data + consumed;
+    for (uint32_t d = 0; d < n.dataCount; ++d)
+      r.u8();
+    out.push_back(n);
+  }
+  return out;
+}
+
+// ---------- PduWriter ----------
+static void write_pdu_header(Writer& w,
+                             uint8_t pduType,
+                             uint16_t msgCount,
+                             uint32_t payloadLen) {
+  w.u16(methods::kProtocolVersion);
+  w.u32(9u + payloadLen);  // pduSize = header(9) + payload
+  w.u8(pduType);
+  w.u16(msgCount);
+}
+
+std::vector<uint8_t> PduWriter::build_command_pdu(uint16_t msgCount,
+                                                  const uint8_t* cmds,
+                                                  size_t len) {
+  std::vector<uint8_t> out;
+  out.push_back(methods::kSyncVal);
+  Writer h;
+  write_pdu_header(h, methods::kPduCommand, msgCount,
+                   static_cast<uint32_t>(len));
+  out.insert(out.end(), h.data(), h.data() + h.size());
+  out.insert(out.end(), cmds, cmds + len);
+  return out;
+}
+
+std::vector<uint8_t> PduWriter::build_response_pdu(uint16_t msgCount,
+                                                   const uint8_t* rsps,
+                                                   size_t len) {
+  std::vector<uint8_t> out;
+  out.push_back(methods::kSyncVal);
+  Writer h;
+  write_pdu_header(h, methods::kPduResponse, msgCount,
+                   static_cast<uint32_t>(len));
+  out.insert(out.end(), h.data(), h.data() + h.size());
+  out.insert(out.end(), rsps, rsps + len);
+  return out;
+}
+
+std::vector<uint8_t> PduWriter::build_notification2_pdu(uint16_t msgCount,
+                                                        const uint8_t* ntfs,
+                                                        size_t len) {
+  std::vector<uint8_t> out;
+  out.push_back(methods::kSyncVal);
+  Writer h;
+  write_pdu_header(h, methods::kPduNtf2, msgCount, static_cast<uint32_t>(len));
+  out.insert(out.end(), h.data(), h.data() + h.size());
+  out.insert(out.end(), ntfs, ntfs + len);
+  return out;
+}
+
+std::vector<uint8_t> PduWriter::build_keepalive_pdu(uint16_t heartbeatTimeSec) {
+  std::vector<uint8_t> out;
+  out.push_back(methods::kSyncVal);
+  Writer h;
+  write_pdu_header(h, methods::kPduKeepAlive, 1, 2u);  // payload = u16
+  out.insert(out.end(), h.data(), h.data() + h.size());
+  Writer payload;
+  payload.u16(heartbeatTimeSec);
+  out.insert(out.end(), payload.data(), payload.data() + payload.size());
+  return out;
+}
 
 }  // namespace oca::ocp1

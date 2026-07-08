@@ -36,6 +36,7 @@ if(WITH_OCA)
   # 将其新源加入本目标(CMake 对 add_executable 中不存在的源文件会在配置期报错,
   # 故源文件须随创建随加入)。Task 14 创建 mdns_publisher.cpp 时一并补 AVAHI 条件。
   add_executable(oca-test ${CMAKE_SOURCE_DIR}/oca/tests/oca_test.cpp)
+  target_sources(oca-test PRIVATE ${CMAKE_SOURCE_DIR}/oca/ocp1.cpp)
   target_include_directories(oca-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(oca-test ${Boost_LIBRARIES})
   add_test(oca-test oca-test)

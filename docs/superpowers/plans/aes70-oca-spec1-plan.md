@@ -937,7 +937,7 @@ void write_notification2(Writer& w, ONo emitterONo, EventID eventID,
 // ---------- 单条消息序列化 ----------
 void write_command(Writer& w, uint32_t handle, ONo targetONo, MethodID methodID,
                    const uint8_t* params, uint8_t paramCount) {
-  // commandSize = 4+4+4+4+1 + paramCount = 17 + paramCount
+  // commandSize = 4+4+4+2+2+1 + paramCount = 17 + paramCount
   uint32_t cmdSize = 17u + paramCount;
   w.u32(cmdSize);
   w.u32(handle);

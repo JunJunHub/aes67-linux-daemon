@@ -66,7 +66,42 @@ double Reader::f64() {
   return d;
 }
 
-// string/blob/bitstring/list 在 Task 4 实现(此处暂留,Task 4 补全)
+std::string Reader::string() {
+  uint16_t count = u16();  // 码点数
+  std::string out;
+  for (uint16_t i = 0; i < count; ++i) {
+    check(1);
+    unsigned char c = *p_++;
+    out.push_back(static_cast<char>(c));
+    int extra = (c < 0x80)           ? 0
+                : ((c >> 5) == 0x6)  ? 1  // 110xxxxx
+                : ((c >> 4) == 0xE)  ? 2  // 1110xxxx
+                : ((c >> 3) == 0x1E) ? 3  // 11110xxx
+                                     : 0;
+    check(extra);
+    for (int j = 0; j < extra; ++j)
+      out.push_back(static_cast<char>(*p_++));
+  }
+  return out;
+}
+
+std::vector<uint8_t> Reader::blob() {
+  uint16_t count = u16();
+  check(count);
+  std::vector<uint8_t> out(p_, p_ + count);
+  p_ += count;
+  return out;
+}
+
+OcaBitstring Reader::bitstring() {
+  OcaBitstring bs;
+  bs.numBits = u16();
+  uint16_t nbytes = static_cast<uint16_t>((bs.numBits + 7) / 8);
+  check(nbytes);
+  bs.bytes.assign(p_, p_ + nbytes);
+  p_ += nbytes;
+  return bs;
+}
 
 // ---------- Writer ----------
 void Writer::u8(uint8_t v) {
@@ -109,7 +144,33 @@ void Writer::f64(double v) {
   u64(bits);
 }
 
-// string/blob/bitstring/list 在 Task 4 实现
+void Writer::string(const std::string& utf8) {
+  size_t i = 0, count = 0;
+  while (i < utf8.size()) {
+    unsigned char c = static_cast<unsigned char>(utf8[i]);
+    i += (c < 0x80)           ? 1
+         : ((c >> 5) == 0x6)  ? 2
+         : ((c >> 4) == 0xE)  ? 3
+         : ((c >> 3) == 0x1E) ? 4
+                              : 1;
+    ++count;
+  }
+  u16(static_cast<uint16_t>(count));  // 码点计数
+  buf_.insert(buf_.end(), utf8.begin(), utf8.end());
+}
+
+void Writer::blob(const uint8_t* data, size_t len) {
+  u16(static_cast<uint16_t>(len));
+  if (len)
+    buf_.insert(buf_.end(), data, data + len);
+}
+
+void Writer::bitstring(const OcaBitstring& bs) {
+  u16(bs.numBits);
+  uint16_t nbytes = static_cast<uint16_t>((bs.numBits + 7) / 8);
+  if (nbytes)
+    buf_.insert(buf_.end(), bs.bytes.begin(), bs.bytes.begin() + nbytes);
+}
 
 // PDU 分帧在 Task 5 实现
 

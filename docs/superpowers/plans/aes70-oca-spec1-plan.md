@@ -28,6 +28,7 @@
 - 编解码一律 big-endian,逐字段 stream 读写 + 边界检查,禁止 packed struct 指针强转。
 - `ProtocolVersion` 硬编码 `1`;`SyncVal` 硬编码 `0x3B`;仅实现 EV2 通知。
 - 构建开关:`WITH_OCA`(默认 OFF)。`WITH_OCA && WITH_AVAHI` 才编译 mDNS 发布器;`WITH_OCA` 开但 `WITH_AVAHI` 关 → TCP 照跑、mDNS 不发。
+- **CMake 增量源规则:** CMake 对 `add_executable`/`add_library` 中不存在的源文件在配置期报错,故 OCA 源列表初始为空,随任务进度增量加入--主 daemon 的 OCA 源在 Task 16 加入 `SOURCES`;oca-test 初始仅含 `oca_test.cpp`,每个创建 `.cpp` 的任务(Task 3/7/8/9/10/11/12/13/14)用 `target_sources` 将新源加入 oca-test,Task 14 补 AVAHI 条件。
 - 与 `FAKE_DRIVER` 完全兼容;OCA 单测在 `buildfake.sh` 路径下必须全绿。
 - 频繁提交:每个 Task 结束 commit 一次,中文提交信息。
 
@@ -115,24 +116,14 @@ if(WITH_OCA)
   MESSAGE(STATUS "WITH_OCA")
   add_definitions(-D_USE_OCA_)
   include_directories(${CMAKE_CURRENT_SOURCE_DIR})  # 让 #include "oca/..." 可解析
-  list(APPEND SOURCES
-    oca/ocp1.cpp
-    oca/session.cpp
-    oca/classes/root.cpp
-    oca/classes/device_manager.cpp
-    oca/classes/network_manager.cpp
-    oca/classes/subscription_manager.cpp
-    oca/transport.cpp
-    oca/oca_server.cpp)
-  if(WITH_AVAHI)
-    list(APPEND SOURCES oca/mdns_publisher.cpp)
-  endif()
+  # OCA 源文件推迟到 Task 16(主 daemon 接线)再加入 SOURCES;此处不列出,
+  # 否则 WITH_OCA=ON 时 add_executable(aes67-daemon) 因源文件不存在而在配置期报错。
 endif()
 ```
 
 **include 约定:** 所有 OCA 头文件内部与测试统一用 `oca/` 前缀引用(如 `#include "oca/types.hpp"`、`#include "oca/classes/root.hpp"`),靠上面新增的 `daemon/` include 目录解析。
 
-注:`oca_test.cpp` 不进 `aes67-daemon`,由 `tests/CMakeLists.txt` 单独编译。上述源文件此刻尚不存在,但 `WITH_OCA=OFF` 默认不编译,不报错;开启 `WITH_OCA=ON` 时后续任务会创建它们。
+注:`oca_test.cpp` 不进 `aes67-daemon`,由 `tests/CMakeLists.txt` 单独编译。**增量源规则(勘误修正):** CMake 对 `add_executable` 中列出的不存在源文件会在配置期报错(已实测验证),故主 daemon 与 oca-test 的 OCA 源列表初始为空--主 daemon 的 OCA 源推迟到 Task 16(全部 `.cpp` 已存在)再加入 `SOURCES`;oca-test 初始仅含 `oca_test.cpp`,后续每个创建 `.cpp` 的任务(Task 3/7/8/9/10/11/12/13/14)须用 `target_sources(oca-test PRIVATE ${CMAKE_SOURCE_DIR}/oca/<file>.cpp)` 将新源加入本目标,Task 14 创建 `mdns_publisher.cpp` 时补 `if(WITH_AVAHI)` 条件与 avahi 链接。
 
 - [ ] **Step 3: 在 `daemon/tests/CMakeLists.txt` 加 `oca-test` 目标**
 
@@ -141,24 +132,13 @@ endif()
 ```cmake
 if(WITH_OCA)
   MESSAGE(STATUS "tests: WITH_OCA")
-  add_executable(oca-test
-    ${CMAKE_SOURCE_DIR}/oca/tests/oca_test.cpp
-    ${CMAKE_SOURCE_DIR}/oca/ocp1.cpp
-    ${CMAKE_SOURCE_DIR}/oca/session.cpp
-    ${CMAKE_SOURCE_DIR}/oca/classes/root.cpp
-    ${CMAKE_SOURCE_DIR}/oca/classes/device_manager.cpp
-    ${CMAKE_SOURCE_DIR}/oca/classes/network_manager.cpp
-    ${CMAKE_SOURCE_DIR}/oca/classes/subscription_manager.cpp
-    ${CMAKE_SOURCE_DIR}/oca/transport.cpp
-    ${CMAKE_SOURCE_DIR}/oca/oca_server.cpp)
+  # oca-test 初始仅编译 oca_test.cpp。后续每个创建 .cpp 的任务用 target_sources
+  # 将其新源加入本目标(CMake 对 add_executable 中不存在的源文件会在配置期报错,
+  # 故源文件须随创建随加入)。Task 14 创建 mdns_publisher.cpp 时一并补 AVAHI 条件。
+  add_executable(oca-test ${CMAKE_SOURCE_DIR}/oca/tests/oca_test.cpp)
   target_include_directories(oca-test PRIVATE ${CMAKE_SOURCE_DIR})
   target_link_libraries(oca-test ${Boost_LIBRARIES})
   add_test(oca-test oca-test)
-  if(WITH_AVAHI)
-    target_sources(oca-test PRIVATE ${CMAKE_SOURCE_DIR}/oca/mdns_publisher.cpp)
-    target_include_directories(oca-test PRIVATE ${AVAHI_INCLUDE_DIRS})
-    target_link_libraries(oca-test ${AVAHI_LIBRARIES})
-  endif()
 endif()
 ```
 

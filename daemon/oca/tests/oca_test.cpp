@@ -728,3 +728,155 @@ BOOST_AUTO_TEST_CASE(mdns_publisher_smoke) {
   pub.stop();
 }
 #endif
+
+BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
+  oca::OcaServerConfig cfg;
+  cfg.port = 0;
+  cfg.node_id = "AES67 daemon e2e";
+  cfg.daemon_version = "bondagit-3.1.0";
+  oca::OcaServer server(cfg);
+  BOOST_REQUIRE(server.start());
+  uint16_t port = server.port();
+
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  auto sendPdu = [&](const std::vector<uint8_t>& p) {
+    BOOST_REQUIRE_EQUAL(::send(sock, p.data(), p.size(), 0), (ssize_t)p.size());
+  };
+  auto recvPdu = [&](std::vector<uint8_t>& out) -> bool {
+    uint8_t sync;
+    if (::recv(sock, &sync, 1, 0) != 1 || sync != 0x3B)
+      return false;
+    uint8_t hdr[9];
+    size_t got = 0;
+    while (got < 9) {
+      ssize_t r = ::recv(sock, hdr + got, 9 - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    auto h = oca::ocp1::PduReader::try_parse_header(hdr, 9);
+    if (!h)
+      return false;
+    size_t plen = h->pduSize - 9;
+    out.assign(hdr, hdr + 9);
+    out.resize(9 + plen);
+    got = 0;
+    while (got < plen) {
+      ssize_t r = ::recv(sock, out.data() + 9 + got, plen - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    out.insert(out.begin(), 0x3B);
+    return true;
+  };
+  auto cmd = [&](uint32_t handle, oca::ONo target,
+                 oca::MethodID mid) -> oca::ocp1::Response {
+    oca::ocp1::Writer cw;
+    oca::ocp1::write_command(cw, handle, target, mid, nullptr, 0);
+    sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+    std::vector<uint8_t> rsp;
+    BOOST_REQUIRE(recvPdu(rsp));
+    auto h =
+        oca::ocp1::PduReader::try_parse_header(rsp.data() + 1, rsp.size() - 1);
+    auto rsps = oca::ocp1::PduReader::parse_responses(
+        rsp.data() + 1 + 9, h->pduSize - 9, h->messageCount);
+    BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+    return rsps[0];
+  };
+
+  // 1) KeepAlive
+  sendPdu(oca::ocp1::PduWriter::build_keepalive_pdu(5));
+  std::vector<uint8_t> ka;
+  BOOST_REQUIRE(recvPdu(ka));
+
+  // 2) 身份:GetOcaVersion=1
+  auto r1 =
+      cmd(1, 1,
+          {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion});
+  BOOST_CHECK(r1.statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(r1.paramData, r1.paramCount).u16(), 1u);
+
+  // 3) 身份:GetModelDescription -> {mfr, model=version, version}
+  auto r2 = cmd(2, 1,
+                {oca::methods::kDefLevelDeviceMngr,
+                 oca::methods::kDevGetModelDescription});
+  BOOST_CHECK(r2.statusCode == oca::Status::OK);
+  {
+    oca::ocp1::Reader r(r2.paramData, r2.paramCount);
+    BOOST_CHECK_EQUAL(r.string(), "AES67-Linux-Daemon");
+    BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
+    BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
+  }
+
+  // 4) 发现:GetMembers(ONo 100) -> [1,2,4]
+  auto r3 = cmd(3, 100,
+                {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
+  BOOST_CHECK(r3.statusCode == oca::Status::OK);
+  {
+    oca::ocp1::Reader r(r3.paramData, r3.paramCount);
+    BOOST_CHECK_EQUAL(r.u16(), 3u);
+    BOOST_CHECK_EQUAL(r.u32(), 1u);
+    BOOST_CHECK_EQUAL(r.u32(), 2u);
+    BOOST_CHECK_EQUAL(r.u32(), 4u);
+  }
+
+  // 5) 订阅:AddSubscription2(emitter=1, OperationalState)
+  oca::ocp1::Writer params;
+  params.u32(1);  // EmitterONo
+  params.u16(oca::methods::kDefLevelDeviceMngr);
+  params.u16(oca::methods::kEventOperationalState);
+  params.u16(0);  // 空 context
+  oca::ocp1::Writer cw;
+  oca::ocp1::write_command(
+      cw, 5, 4,
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription2},
+      params.data(), static_cast<uint8_t>(params.size()));
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+  std::vector<uint8_t> rspsub;
+  BOOST_REQUIRE(recvPdu(rspsub));
+  auto hs = oca::ocp1::PduReader::try_parse_header(rspsub.data() + 1,
+                                                   rspsub.size() - 1);
+  auto subrsps = oca::ocp1::PduReader::parse_responses(
+      rspsub.data() + 1 + 9, hs->pduSize - 9, hs->messageCount);
+  BOOST_REQUIRE_EQUAL(subrsps.size(), 1u);
+  BOOST_CHECK(subrsps[0].statusCode == oca::Status::OK);
+  uint32_t subId =
+      oca::ocp1::Reader(subrsps[0].paramData, subrsps[0].paramCount).u32();
+
+  // 6) 触发事件,然后发一个 ping 让传输层排空通知队列
+  uint8_t evdata = static_cast<uint8_t>(oca::DeviceState::Operational);
+  server.subscription_manager()->trigger_event(
+      1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kEventOperationalState},
+      &evdata, 1);
+  cmd(4, 1,
+      {oca::methods::kDefLevelDeviceMngr,
+       oca::methods::kDevGetOcaVersion});  // ping -> 触发排空
+
+  // 7) 收 Notification2
+  std::vector<uint8_t> ntf;
+  BOOST_REQUIRE(recvPdu(ntf));
+  auto hn =
+      oca::ocp1::PduReader::try_parse_header(ntf.data() + 1, ntf.size() - 1);
+  BOOST_CHECK_EQUAL(hn->pduType, oca::methods::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      ntf.data() + 1 + 9, hn->pduSize - 9, hn->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.eventIndex,
+                    oca::methods::kEventOperationalState);
+  BOOST_CHECK_EQUAL(ntfs[0].dataCount, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].data[0], evdata);
+
+  (void)subId;
+  ::close(sock);
+  server.stop();
+}

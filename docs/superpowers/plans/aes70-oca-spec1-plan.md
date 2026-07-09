@@ -20,6 +20,7 @@
 6. **Notification2 帧格式**:规格 §B 的 `Notification2` 结构漏了 `Data` 字段。采用 AES70-3-2023 §9.4.4 真实布局:`NotificationSize(u32) + OcaEvent{EmitterONo(u32), EventID{DefLevel(u16), EventIndex(u16)}} + NotificationType(u8) + Data(Ocp1List<u8> = u16 count + bytes)`。
 7. **OcaSubscriptionManager EV2 索引**:ocac 仅含 EV1(AddSubscription=3m01…)。EV2(AddSubscription2 等)的真实索引需 AES70-2-2023 Annex A XMI 确认。本计划在 `methods.hpp` 中给出候选值并设 XMI 校验关卡(见 Task 2);因所有分派引用命名常量,若候选错误为单行修正,真实控制器订阅测试会捕获。
 8. **OcaBitstring 编码**:计划初稿 `Writer::bitstring` 误写为 `u16(numBits)+u16(nbytes)+bytes`。按 AES70-3-2023 §21 Datatype 表,OcaBitstring = `u16(位数) + bytes`(字节数 = ceil(位数/8),无独立 nbytes 字段)。`Reader::bitstring` 已正确;已修正 `Writer::bitstring` 去掉多余 `u16(nbytes)`,并相应修正 Task 4 测试的期望字节数(6->4)。
+9. **OcaManagerDescriptor 结构**:计划初稿 `GetManagers` 的每个 descriptor 只写 `{ONo, ClassIdentification}`,漏了 `Name` 字段。按 ocac(派生自 AES70-2 Annex A XMI)`OcaManagerDescriptor = {ObjectNumber, Name(OcaString=对象 Role), ClassID, ClassVersion}`。已修正 `GetManagers` 在 ONo 后补写 `string(o->role())`,并相应修正 Task 9 测试(读取 Name="DeviceManager")。`Name` 即对象的 `Role`(AES70-1 §Role,`OcaRoot::role()`)。
 
 ## Global Constraints
 
@@ -1915,10 +1916,11 @@ Status OcaDeviceManager::GetManagers(ocp1::Writer& rsp, Session& sess) {
   auto* reg = sess.registry();
   if (!reg) return Status::DeviceError;
   auto objs = reg->objects_in_range(1, 99);
-  // Ocp1List<OcaManagerDescriptor>,ManagerDescriptor={ONo, ClassIdentification}
+  // Ocp1List<OcaManagerDescriptor>,ManagerDescriptor={ONo, Name(string=Role), ClassIdentification}
   rsp.u16(static_cast<uint16_t>(objs.size()));
   for (auto* o : objs) {
     rsp.u32(o->ono());
+    rsp.string(o->role());  // Name = 对象 Role(OcaRoot::role())
     const auto& ci = o->class_id();
     rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
     for (auto lvl : ci.classID.levels) rsp.u16(lvl);
@@ -1984,13 +1986,14 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(b4.data(), b4.size()).u8(),
                     static_cast<uint8_t>(oca::DeviceState::Operational));
 
-  // GetManagers -> 3 descriptors, first is ONo 1
+  // GetManagers -> 3 descriptors, first is ONo 1 / Role "DeviceManager"
   auto [st5, b5] = call(oca::methods::kDevGetManagers);
   BOOST_CHECK(st5 == oca::Status::OK);
   {
     oca::ocp1::Reader r(b5.data(), b5.size());
     BOOST_CHECK_EQUAL(r.u16(), 3u);
     BOOST_CHECK_EQUAL(r.u32(), 1u);  // first manager ONo
+    BOOST_CHECK_EQUAL(r.string(), "DeviceManager");  // Name = Role
     uint16_t levels = r.u16();       // ClassID level count
     BOOST_CHECK_EQUAL(levels, 3u);   // {1,2,1}
     r.u16(); r.u16(); r.u16();       // skip 1,2,1

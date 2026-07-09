@@ -132,6 +132,7 @@ static uint64_t now_sec() {
 void Transport::conn_loop(int fd, ONo session_id) {
   Session sess(session_id);
   sess.set_registry(registry_);
+  sess.touch(now_sec());  // 初始化 last_seen,避免首个 PDU 到达前的误超时断连
   std::mutex write_mutex;
 
   auto send_pdu = [&](const std::vector<uint8_t>& pdu) {

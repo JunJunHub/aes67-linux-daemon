@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "oca/methods.hpp"
+#include "oca/oca_server.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
 #include "oca/classes/device_manager.hpp"
@@ -615,4 +616,103 @@ BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
 
   ::close(sock);
   transport.stop();
+}
+
+BOOST_AUTO_TEST_CASE(oca_server_facade) {
+  oca::OcaServerConfig cfg;
+  cfg.port = 0;  // 自动
+  cfg.node_id = "AES67 daemon abc123";
+  cfg.daemon_version = "bondagit-3.1.0";
+  cfg.manufacturer = "AES67-Linux-Daemon";
+
+  oca::OcaServer server(cfg);
+  BOOST_REQUIRE(server.start());
+  uint16_t port = server.port();
+
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  // 复用 Task 12 的 sendPdu/recvPdu 逻辑(此处内联简版)
+  auto sendPdu = [&](const std::vector<uint8_t>& p) {
+    ::send(sock, p.data(), p.size(), 0);
+  };
+  auto recvPdu = [&](std::vector<uint8_t>& out) -> bool {
+    uint8_t sync;
+    if (::recv(sock, &sync, 1, 0) != 1 || sync != 0x3B)
+      return false;
+    uint8_t hdr[9];
+    size_t got = 0;
+    while (got < 9) {
+      ssize_t r = ::recv(sock, hdr + got, 9 - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    auto h = oca::ocp1::PduReader::try_parse_header(hdr, 9);
+    if (!h)
+      return false;
+    size_t plen = h->pduSize - 9;
+    out.assign(hdr, hdr + 9);
+    out.resize(9 + plen);
+    got = 0;
+    while (got < plen) {
+      ssize_t r = ::recv(sock, out.data() + 9 + got, plen - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    out.insert(out.begin(), 0x3B);
+    return true;
+  };
+
+  // KeepAlive
+  sendPdu(oca::ocp1::PduWriter::build_keepalive_pdu(5));
+  std::vector<uint8_t> ka;
+  BOOST_CHECK(recvPdu(ka));
+
+  // GetDeviceName(4) -> node_id("AES67 daemon abc123")
+  oca::ocp1::Writer cw;
+  oca::ocp1::write_command(
+      cw, 1, 1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetDeviceName},
+      nullptr, 0);
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+  std::vector<uint8_t> rsp;
+  BOOST_CHECK(recvPdu(rsp));
+  auto rh =
+      oca::ocp1::PduReader::try_parse_header(rsp.data() + 1, rsp.size() - 1);
+  auto rsps = oca::ocp1::PduReader::parse_responses(
+      rsp.data() + 1 + 9, rh->pduSize - 9, rh->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+  BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
+  oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramCount);
+  BOOST_CHECK_EQUAL(pr.string(), "AES67 daemon abc123");
+
+  // GetMembers(5) on Root Block(ONo 100) -> [1,2,4]
+  oca::ocp1::Writer cw2;
+  oca::ocp1::write_command(
+      cw2, 2, 100,
+      {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers}, nullptr,
+      0);
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw2.data(), cw2.size()));
+  std::vector<uint8_t> rsp2;
+  BOOST_CHECK(recvPdu(rsp2));
+  auto rh2 =
+      oca::ocp1::PduReader::try_parse_header(rsp2.data() + 1, rsp2.size() - 1);
+  auto rsps2 = oca::ocp1::PduReader::parse_responses(
+      rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
+  oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramCount);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u32(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u32(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u32(), 4u);
+
+  ::close(sock);
+  server.stop();
 }

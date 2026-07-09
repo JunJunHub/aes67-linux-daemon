@@ -25,6 +25,9 @@ class Object {
                       ocp1::Reader& req,
                       ocp1::Writer& rsp,
                       Session& sess) = 0;
+  // OcaRoot::GetRole 的默认实现:OCA 对象均有 Role,基类默认空串。
+  // 置于 Object 以便注册表持有的 Object* 可取 Role(GetManagers 描述符 Name)。
+  virtual std::string role() const { return {}; }
 
  protected:
   explicit Object(ONo ono) : ono_(ono) {}

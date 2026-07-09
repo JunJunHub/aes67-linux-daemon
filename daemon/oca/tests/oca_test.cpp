@@ -4,6 +4,7 @@
 #include "oca/methods.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
+#include "oca/classes/device_manager.hpp"
 #include "oca/classes/root.hpp"
 #include "oca/session.hpp"
 #include "oca/types.hpp"
@@ -347,4 +348,75 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   oca::ocp1::Writer rsp4;
   st = root.exec({99, 1}, empty, rsp4, sess);
   BOOST_CHECK(st == oca::Status::BadMethod);
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
+  oca::OcaDeviceIdentity id;
+  id.manufacturer = "Acme";
+  id.model_name = "AES67-daemon";
+  id.model_version = "bondagit-3.1.0";
+  id.serial_number = "node-42";
+  id.device_name = "Studio A";
+
+  oca::OcaDeviceManager dm(1, id);
+  oca::ObjectRegistry reg;
+  reg.register_object(std::make_unique<oca::OcaDeviceManager>(1, id));
+  reg.register_object(std::make_unique<StubObject>(2));
+  reg.register_object(std::make_unique<StubObject>(4));
+  oca::Session sess(1);
+  sess.set_registry(&reg);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  auto call = [&](uint16_t idx) {
+    oca::ocp1::Writer w;
+    auto st = dm.exec({oca::methods::kDefLevelDeviceMngr, idx}, empty, w, sess);
+    return std::make_pair(st, w.take());
+  };
+
+  // GetOcaVersion -> 1
+  auto [st1, b1] = call(oca::methods::kDevGetOcaVersion);
+  BOOST_CHECK(st1 == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(b1.data(), b1.size()).u16(), 1u);
+
+  // GetDeviceName -> "Studio A"
+  auto [st2, b2] = call(oca::methods::kDevGetDeviceName);
+  BOOST_CHECK(st2 == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(b2.data(), b2.size()).string(),
+                    "Studio A");
+
+  // GetModelDescription -> {Acme, AES67-daemon, bondagit-3.1.0}
+  auto [st3, b3] = call(oca::methods::kDevGetModelDescription);
+  BOOST_CHECK(st3 == oca::Status::OK);
+  {
+    oca::ocp1::Reader r(b3.data(), b3.size());
+    BOOST_CHECK_EQUAL(r.string(), "Acme");
+    BOOST_CHECK_EQUAL(r.string(), "AES67-daemon");
+    BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
+  }
+
+  // GetState -> Operational(2)
+  auto [st4, b4] = call(oca::methods::kDevGetState);
+  BOOST_CHECK(st4 == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(b4.data(), b4.size()).u8(),
+                    static_cast<uint8_t>(oca::DeviceState::Operational));
+
+  // GetManagers -> 3 descriptors, first is ONo 1 / Role "DeviceManager"
+  auto [st5, b5] = call(oca::methods::kDevGetManagers);
+  BOOST_CHECK(st5 == oca::Status::OK);
+  {
+    oca::ocp1::Reader r(b5.data(), b5.size());
+    BOOST_CHECK_EQUAL(r.u16(), 3u);
+    BOOST_CHECK_EQUAL(r.u32(), 1u);                  // first manager ONo
+    BOOST_CHECK_EQUAL(r.string(), "DeviceManager");  // Name = Role
+    uint16_t levels = r.u16();                       // ClassID level count
+    BOOST_CHECK_EQUAL(levels, 3u);                   // {1,2,1}
+    r.u16();
+    r.u16();
+    r.u16();                         // skip 1,2,1
+    BOOST_CHECK_EQUAL(r.u16(), 4u);  // classVersion
+  }
+
+  // 未实现方法 -> BadMethod
+  auto [st6, b6] = call(oca::methods::kDevSetDeviceName);
+  BOOST_CHECK(st6 == oca::Status::BadMethod);
 }

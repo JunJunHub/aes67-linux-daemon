@@ -1,6 +1,11 @@
 #define BOOST_TEST_MODULE oca_test
 #include <boost/test/unit_test.hpp>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include "oca/methods.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
@@ -9,6 +14,7 @@
 #include "oca/classes/root.hpp"
 #include "oca/classes/subscription_manager.hpp"
 #include "oca/session.hpp"
+#include "oca/transport.hpp"
 #include "oca/types.hpp"
 
 namespace {
@@ -509,4 +515,104 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   BOOST_CHECK(
       !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
                                  oca::methods::kEventOperationalState}));
+}
+
+BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
+  // 构造对象树
+  oca::OcaDeviceIdentity id;
+  id.model_name = "daemon";
+  id.model_version = "v1";
+  id.serial_number = "n1";
+  id.device_name = "dev";
+  oca::ObjectRegistry reg;
+  auto* dm = new oca::OcaDeviceManager(1, id);
+  auto* nm = new oca::OcaNetworkManager(2);
+  auto* sm = new oca::OcaSubscriptionManager(4);
+  auto* root = new oca::OcaBlock(100);
+  reg.register_object(std::unique_ptr<oca::Object>(dm));
+  reg.register_object(std::unique_ptr<oca::Object>(nm));
+  reg.register_object(std::unique_ptr<oca::Object>(sm));
+  reg.register_object(std::unique_ptr<oca::Object>(root));
+
+  oca::Transport transport(&reg, sm);
+  BOOST_REQUIRE(transport.start(0));  // 自动端口
+  uint16_t port = transport.port();
+
+  // 连接
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  auto sendPdu = [&](const std::vector<uint8_t>& p) {
+    BOOST_CHECK_EQUAL(::send(sock, p.data(), p.size(), 0), (ssize_t)p.size());
+  };
+  auto recvPdu = [&](std::vector<uint8_t>& out) -> bool {
+    uint8_t sync;
+    if (::recv(sock, &sync, 1, 0) != 1)
+      return false;
+    if (sync != 0x3B)
+      return false;
+    uint8_t hdr[9];
+    size_t got = 0;
+    while (got < 9) {
+      ssize_t r = ::recv(sock, hdr + got, 9 - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    auto h = oca::ocp1::PduReader::try_parse_header(hdr, 9);
+    if (!h)
+      return false;
+    size_t plen = h->pduSize - 9;
+    out.assign(hdr, hdr + 9);
+    out.resize(9 + plen);
+    got = 0;
+    while (got < plen) {
+      ssize_t r = ::recv(sock, out.data() + 9 + got, plen - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    out.insert(out.begin(), 0x3B);
+    return true;
+  };
+
+  // 1) KeepAlive(5s) -> 应收到 KeepAlive 回应
+  sendPdu(oca::ocp1::PduWriter::build_keepalive_pdu(5));
+  std::vector<uint8_t> ka;
+  BOOST_CHECK(recvPdu(ka));
+  auto kah =
+      oca::ocp1::PduReader::try_parse_header(ka.data() + 1, ka.size() - 1);
+  BOOST_REQUIRE(kah);
+  BOOST_CHECK_EQUAL(kah->pduType, oca::methods::kPduKeepAlive);
+
+  // 2) GetOcaVersion 命令(handle=7)
+  oca::ocp1::Writer cw;
+  oca::ocp1::write_command(
+      cw, 7, 1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion},
+      nullptr, 0);
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+  std::vector<uint8_t> rsp;
+  BOOST_CHECK(recvPdu(rsp));
+  auto rh =
+      oca::ocp1::PduReader::try_parse_header(rsp.data() + 1, rsp.size() - 1);
+  BOOST_REQUIRE(rh);
+  BOOST_CHECK_EQUAL(rh->pduType, oca::methods::kPduResponse);
+  auto rsps = oca::ocp1::PduReader::parse_responses(
+      rsp.data() + 1 + 9, rh->pduSize - 9, rh->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+  BOOST_CHECK_EQUAL(rsps[0].handle, 7u);
+  BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(rsps[0].paramCount, 2);
+  // OcaVersion=1 big-endian
+  BOOST_CHECK_EQUAL(rsps[0].paramData[0], 0x00);
+  BOOST_CHECK_EQUAL(rsps[0].paramData[1], 0x01);
+
+  ::close(sock);
+  transport.stop();
 }

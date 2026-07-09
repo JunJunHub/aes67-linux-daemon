@@ -4,6 +4,7 @@
 #include "oca/methods.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
+#include "oca/classes/root.hpp"
 #include "oca/session.hpp"
 #include "oca/types.hpp"
 
@@ -295,7 +296,55 @@ BOOST_AUTO_TEST_CASE(session_keepalive_expiry) {
   oca::Session s(2);
   s.set_heartbeat(5);
   s.touch(100);
-  BOOST_CHECK(!s.expired(110));   // 10s < 15s
-  BOOST_CHECK(!s.expired(115));   // 15s == 3*5,不超(严格大于)
-  BOOST_CHECK(s.expired(116));    // 16s > 15s
+  BOOST_CHECK(!s.expired(110));  // 10s < 15s
+  BOOST_CHECK(!s.expired(115));  // 15s == 3*5,不超(严格大于)
+  BOOST_CHECK(s.expired(116));   // 16s > 15s
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_root_block) {
+  oca::OcaBlock root(100);
+  oca::ObjectRegistry reg;
+  reg.register_object(std::make_unique<StubObject>(1));
+  reg.register_object(std::make_unique<StubObject>(2));
+  reg.register_object(std::make_unique<StubObject>(4));
+  reg.register_object(std::make_unique<StubObject>(100));  // root 自己
+
+  oca::Session sess(1);
+  sess.set_registry(&reg);
+
+  // GetClassIdentification {1,1} defLevel=1 methodIndex=1
+  oca::ocp1::Reader empty(nullptr, 0);
+  oca::ocp1::Writer rsp;
+  auto st = root.exec(
+      {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
+      empty, rsp, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  // ClassID = u16 count(3) + 1,1,3 + u16 version(2)
+  oca::ocp1::Reader r(rsp.data(), rsp.size());
+  BOOST_CHECK_EQUAL(r.u16(), 3u);  // 3 levels
+  BOOST_CHECK_EQUAL(r.u16(), 1u);
+  BOOST_CHECK_EQUAL(r.u16(), 1u);
+  BOOST_CHECK_EQUAL(r.u16(), 3u);
+  BOOST_CHECK_EQUAL(r.u16(), 2u);  // classVersion
+
+  // GetMembers {3,5} -> [1,2,4]
+  oca::ocp1::Writer rsp2;
+  st = root.exec({oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers},
+                 empty, rsp2, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
+  BOOST_CHECK_EQUAL(r2.u16(), 3u);  // 3 members
+  BOOST_CHECK_EQUAL(r2.u32(), 1u);
+  BOOST_CHECK_EQUAL(r2.u32(), 2u);
+  BOOST_CHECK_EQUAL(r2.u32(), 4u);
+
+  // 未知方法 -> BadMethod
+  oca::ocp1::Writer rsp3;
+  st = root.exec({oca::methods::kDefLevelBlock, 99}, empty, rsp3, sess);
+  BOOST_CHECK(st == oca::Status::BadMethod);
+
+  // 未知 defLevel -> BadMethod
+  oca::ocp1::Writer rsp4;
+  st = root.exec({99, 1}, empty, rsp4, sess);
+  BOOST_CHECK(st == oca::Status::BadMethod);
 }

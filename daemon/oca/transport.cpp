@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <stdexcept>
 #include <utility>
 
 #include "oca/classes/subscription_manager.hpp"
@@ -188,24 +189,30 @@ void Transport::conn_loop(int fd, ONo session_id) {
       send_pdu(ocp1::PduWriter::build_keepalive_pdu(hb));  // 回应 KeepAlive
     } else if (hdr->pduType == methods::kPduCommand ||
                hdr->pduType == methods::kPduCommandRrq) {
-      auto cmds = ocp1::PduReader::parse_commands(payload.data(), payloadLen,
-                                                  hdr->messageCount);
-      ocp1::Writer rspAcc;
-      for (const auto& c : cmds) {
-        ocp1::Writer params;
-        Status st;
-        Object* obj = registry_->find(c.targetONo);
-        if (!obj) {
-          st = Status::BadONo;
-        } else {
-          ocp1::Reader pr(c.paramData, c.paramCount);
-          st = obj->exec(c.methodID, pr, params, sess);
+      // 畸形 PDU 或对象方法异常不得逃逸线程致 daemon 崩溃:
+      // 捕获后断开该连接,不影响其它连接与进程。
+      try {
+        auto cmds = ocp1::PduReader::parse_commands(payload.data(), payloadLen,
+                                                    hdr->messageCount);
+        ocp1::Writer rspAcc;
+        for (const auto& c : cmds) {
+          ocp1::Writer params;
+          Status st;
+          Object* obj = registry_->find(c.targetONo);
+          if (!obj) {
+            st = Status::BadONo;
+          } else {
+            ocp1::Reader pr(c.paramData, c.paramCount);
+            st = obj->exec(c.methodID, pr, params, sess);
+          }
+          ocp1::write_response(rspAcc, c.handle, st, params.data(),
+                               static_cast<uint8_t>(params.size()));
         }
-        ocp1::write_response(rspAcc, c.handle, st, params.data(),
-                             static_cast<uint8_t>(params.size()));
+        send_pdu(ocp1::PduWriter::build_response_pdu(
+            static_cast<uint16_t>(cmds.size()), rspAcc.data(), rspAcc.size()));
+      } catch (const std::exception&) {
+        break;  // 畸形/不可解析 PDU:关闭该连接
       }
-      send_pdu(ocp1::PduWriter::build_response_pdu(
-          static_cast<uint16_t>(cmds.size()), rspAcc.data(), rspAcc.size()));
     }
     // 其他 PduType(Response/Ntf)在设备侧忽略
 

@@ -123,7 +123,16 @@ std::string config_to_json(const Config& config) {
      << ",\n  \"streamer_enabled\": " << std::boolalpha
      << config.get_streamer_enabled()
      << ",\n  \"auto_sinks_update\": " << std::boolalpha
-     << config.get_auto_sinks_update() << "\n}\n";
+     << config.get_auto_sinks_update()
+     << ",\n  \"oca_enabled\": " << std::boolalpha << config.get_oca_enabled()
+     << ",\n  \"oca_port\": " << config.get_oca_port()
+     << ",\n  \"oca_device_name\": \""
+     << escape_json(config.get_oca_device_name()) << "\""
+     << ",\n  \"oca_manufacturer\": \""
+     << escape_json(config.get_oca_manufacturer()) << "\""
+     << ",\n  \"oca_model\": \"" << escape_json(config.get_oca_model()) << "\""
+     << ",\n  \"oca_serial_number\": \""
+     << escape_json(config.get_oca_serial_number()) << "\"" << "\n}\n";
   return ss.str();
 }
 
@@ -326,6 +335,18 @@ Config json_to_config_(std::istream& js, Config& config) {
         config.set_streamer_player_buffer_files_num(val.get_value<uint8_t>());
       } else if (key == "streamer_enabled") {
         config.set_streamer_enabled(val.get_value<bool>());
+      } else if (key == "oca_enabled") {
+        config.set_oca_enabled(val.get_value<bool>());
+      } else if (key == "oca_port") {
+        config.set_oca_port(static_cast<uint16_t>(val.get_value<uint32_t>()));
+      } else if (key == "oca_device_name") {
+        config.set_oca_device_name(val.get_value<std::string>());
+      } else if (key == "oca_manufacturer") {
+        config.set_oca_manufacturer(val.get_value<std::string>());
+      } else if (key == "oca_model") {
+        config.set_oca_model(val.get_value<std::string>());
+      } else if (key == "oca_serial_number") {
+        config.set_oca_serial_number(val.get_value<std::string>());
       } else if (key == "log_severity") {
         config.set_log_severity(val.get_value<int>());
       } else if (key == "interface_name") {

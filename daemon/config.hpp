@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 
 class Config {
  public:
@@ -73,6 +74,14 @@ class Config {
   const std::string& get_custom_node_id() const { return custom_node_id_; };
   std::string get_node_id() const;
   bool get_auto_sinks_update() const { return auto_sinks_update_; };
+  bool get_oca_enabled() const { return oca_enabled_; };
+  uint16_t get_oca_port() const { return oca_port_; };
+  const std::string& get_oca_device_name() const { return oca_device_name_; };
+  const std::string& get_oca_manufacturer() const { return oca_manufacturer_; };
+  const std::string& get_oca_model() const { return oca_model_; };
+  const std::string& get_oca_serial_number() const {
+    return oca_serial_number_;
+  };
 
   /* attributes set during init */
   const std::array<uint8_t, 6>& get_mac_addr() const { return mac_addr_; };
@@ -169,6 +178,12 @@ class Config {
   void set_auto_sinks_update(bool auto_sinks_update) {
     auto_sinks_update_ = auto_sinks_update;
   };
+  void set_oca_enabled(bool v) { oca_enabled_ = v; };
+  void set_oca_port(uint16_t v) { oca_port_ = v; };
+  void set_oca_device_name(std::string_view v) { oca_device_name_ = v; };
+  void set_oca_manufacturer(std::string_view v) { oca_manufacturer_ = v; };
+  void set_oca_model(std::string_view v) { oca_model_ = v; };
+  void set_oca_serial_number(std::string_view v) { oca_serial_number_ = v; };
   void set_driver_restart(bool restart) { driver_restart_ = restart; }
 
   friend bool operator!=(const Config& lhs, const Config& rhs) {
@@ -202,6 +217,12 @@ class Config {
            lhs.get_interface_name() != rhs.get_interface_name() ||
            lhs.get_mdns_enabled() != rhs.get_mdns_enabled() ||
            lhs.get_auto_sinks_update() != rhs.get_auto_sinks_update() ||
+           lhs.get_oca_enabled() != rhs.get_oca_enabled() ||
+           lhs.get_oca_port() != rhs.get_oca_port() ||
+           lhs.get_oca_device_name() != rhs.get_oca_device_name() ||
+           lhs.get_oca_manufacturer() != rhs.get_oca_manufacturer() ||
+           lhs.get_oca_model() != rhs.get_oca_model() ||
+           lhs.get_oca_serial_number() != rhs.get_oca_serial_number() ||
            lhs.get_custom_node_id() != rhs.get_custom_node_id();
   };
   friend bool operator==(const Config& lhs, const Config& rhs) {
@@ -242,6 +263,12 @@ class Config {
   std::string custom_node_id_;
   std::string node_id_;
   bool auto_sinks_update_{true};
+  bool oca_enabled_{false};
+  uint16_t oca_port_{65037};
+  std::string oca_device_name_;
+  std::string oca_manufacturer_;
+  std::string oca_model_;
+  std::string oca_serial_number_;
 
   /* set during init */
   std::array<uint8_t, 6> mac_addr_{0, 0, 0, 0, 0, 0};

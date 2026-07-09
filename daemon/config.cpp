@@ -105,6 +105,8 @@ std::shared_ptr<Config> Config::parse(const std::string& filename,
   if (ec) {
     config.sap_mcast_addr_ = "224.2.127.254";
   }
+  if (config.oca_port_ == 0)
+    config.oca_port_ = 65037;
   if (config.ptp_domain_ > 127)
     config.ptp_domain_ = 0;
 
@@ -182,7 +184,9 @@ bool Config::save(const Config& config) {
         get_streamer_files_num() != config.get_streamer_files_num() ||
         get_streamer_player_buffer_files_num() !=
             config.get_streamer_player_buffer_files_num() ||
-        get_streamer_enabled() != config.get_streamer_enabled();
+        get_streamer_enabled() != config.get_streamer_enabled() ||
+        get_oca_enabled() != config.get_oca_enabled() ||
+        get_oca_port() != config.get_oca_port();
 
     if (!daemon_restart_)
       *this = config;

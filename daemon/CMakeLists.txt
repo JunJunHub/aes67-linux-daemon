@@ -52,7 +52,6 @@ if(WITH_OCA)
        oca/oca_server.cpp oca/classes/root.cpp oca/classes/device_manager.cpp
        oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp)
 endif()
-
 if(FAKE_DRIVER)
   MESSAGE(STATUS "FAKE_DRIVER")
   add_definitions(-D_USE_FAKE_DRIVER_)
@@ -61,6 +60,13 @@ else()
   list(APPEND SOURCES driver_handler.cpp driver_manager.cpp)
 endif()
 add_executable(aes67-daemon ${SOURCES})
+
+if(WITH_OCA)
+  # OCP.1 探测客户端:独立验证工具,仅链接 ocp1.cpp(纯标准库,不拉 Boost/httplib)。
+  # 行为等同外部陌生控制器,用于真实控制器对接前的独立验证。见 oca/tools/oca_probe.cpp。
+  add_executable(oca-probe oca/tools/oca_probe.cpp oca/ocp1.cpp)
+  target_include_directories(oca-probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
 
 if(ENABLE_TESTS)
     add_subdirectory(tests)

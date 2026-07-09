@@ -16,6 +16,7 @@
 #   ./oca-dev.sh stop                            # 停止后台 daemon
 #   ./oca-dev.sh status                          # 查看运行状态 + OCA 端口
 #   ./oca-dev.sh test                            # 跑 oca-test 全量
+#   ./oca-dev.sh probe [host] [port] [--no-sub]  # 跑 OCP.1 探测客户端
 #   ./oca-dev.sh clean                           # 温和清理(只删构建产物,保留子模块)
 #
 # Examples:
@@ -23,6 +24,7 @@
 #   ./oca-dev.sh run -i ens160                   # 在 ens160 上跑,OCA+mDNS 发布到 LAN
 #   ./oca-dev.sh status
 #   ./oca-dev.sh test
+#   ./oca-dev.sh probe 172.16.1.198 65037        # 探测指定地址的 OCA 设备
 #   ./oca-dev.sh stop
 #
 # 不入库:本脚本为本地自用,放仓库根,不纳入版本库(见 .gitignore)。
@@ -35,6 +37,7 @@ DAEMON_CONF="$DAEMON_DIR/daemon.conf"
 BUILD_DIR="$DAEMON_DIR/build"   # out-of-source 构建目录,不污染源码
 BIN="$BUILD_DIR/aes67-daemon"
 OCATEST="$BUILD_DIR/tests/oca-test"
+PROBE="$BUILD_DIR/oca-probe"
 
 # 运行时文件(按接口隔离,避免与 daemonctl.sh 冲突)
 RUN_CONF="/tmp/aes67-dev.<iface>.conf"
@@ -85,8 +88,9 @@ cmd_build() {
       -DWITH_STREAMER=OFF
 
   log "building aes67-daemon + oca-test ..."
-  cmake --build "$BUILD_DIR" --target aes67-daemon oca-test
+  cmake --build "$BUILD_DIR" --target aes67-daemon oca-test oca-probe
   log "build done. binary: $BIN"
+  log "probe:      $BUILD_DIR/oca-probe (OCP.1 探测客户端)"
   log "compile_commands.json: $BUILD_DIR/compile_commands.json (供 .clangd)"
 }
 
@@ -211,6 +215,15 @@ cmd_test() {
   "$OCATEST" -p
 }
 
+# ---- probe -------------------------------------------------------------------
+# OCP.1 探测客户端:作为外部陌生控制器连真实 daemon,独立验证控制平面。
+# 不带参数时默认探测本机 65037;可指定 host/port 探测远端设备。
+cmd_probe() {
+  [ -x "$PROBE" ] || die "oca-probe not found, run './oca-dev.sh build' first"
+  log "running oca-probe ..."
+  "$PROBE" "$@"
+}
+
 # ---- clean (温和:只删构建产物,保留子模块) ----------------------------------
 cmd_clean() {
   log "cleaning build artifacts (keeping submodules) ..."
@@ -243,6 +256,7 @@ case "$ACTION" in
   stop)   cmd_stop   "$@" ;;
   status) cmd_status ;;
   test)   cmd_test   ;;
+  probe)  cmd_probe  "$@" ;;
   clean)  cmd_clean  ;;
   -h|--help) usage ;;
   *)      usage ;;

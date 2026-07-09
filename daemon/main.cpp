@@ -35,6 +35,10 @@
 #include "streamer.hpp"
 #endif
 
+#ifdef _USE_OCA_
+#include "oca/oca_server.hpp"
+#endif
+
 #ifdef _USE_SYSTEMD_
 #include <systemd/sd-daemon.h>
 #endif
@@ -200,6 +204,30 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error(std::string("HttpServer:: init failed"));
       }
 
+      /* start OCA server */
+#ifdef _USE_OCA_
+      std::unique_ptr<oca::OcaServer> oca_server;
+      if (config->get_oca_enabled()) {
+        oca::OcaServerConfig ocacfg;
+        ocacfg.port = config->get_oca_port();
+        ocacfg.device_name = config->get_oca_device_name();
+        ocacfg.manufacturer = config->get_oca_manufacturer();
+        ocacfg.model = config->get_oca_model();
+        ocacfg.serial_number = config->get_oca_serial_number();
+        ocacfg.node_id = config->get_node_id();
+        ocacfg.daemon_version = get_version();
+        ocacfg.mdns_enabled = config->get_mdns_enabled();
+        oca_server = std::make_unique<oca::OcaServer>(ocacfg);
+        if (!oca_server->start()) {
+          throw std::runtime_error(std::string("OcaServer:: start failed"));
+        }
+        BOOST_LOG_TRIVIAL(info)
+            << "main:: OCA server listening on port " << oca_server->port();
+      }
+#else
+      (void)0;
+#endif
+
       /* load session status from file */
       session_manager->load_status();
 
@@ -253,6 +281,13 @@ int main(int argc, char* argv[]) {
       if (!http_server.terminate()) {
         throw std::runtime_error(std::string("HttpServer:: terminate failed"));
       }
+
+      /* stop OCA server */
+#ifdef _USE_OCA_
+      if (oca_server) {
+        oca_server->stop();
+      }
+#endif
 
       /* stop streamer */
 #ifdef _USE_STREAMER_

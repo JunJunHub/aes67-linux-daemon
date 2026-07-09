@@ -48,8 +48,9 @@ if(WITH_OCA)
   MESSAGE(STATUS "WITH_OCA")
   add_definitions(-D_USE_OCA_)
   include_directories(${CMAKE_CURRENT_SOURCE_DIR})  # 让 #include "oca/..." 可解析
-  # OCA 源文件推迟到 Task 16(主 daemon 接线)再加入 SOURCES;此处不列出,
-  # 否则 WITH_OCA=ON 时 add_executable(aes67-daemon) 因源文件不存在而在配置期报错。
+  list(APPEND SOURCES oca/ocp1.cpp oca/session.cpp oca/transport.cpp
+       oca/oca_server.cpp oca/classes/root.cpp oca/classes/device_manager.cpp
+       oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp)
 endif()
 
 if(FAKE_DRIVER)
@@ -71,6 +72,10 @@ if(WITH_AVAHI)
   add_definitions(-D_USE_AVAHI_)
   include_directories(aes67-daemon ${AVAHI_INCLUDE_DIRS})
   target_link_libraries(aes67-daemon ${AVAHI_LIBRARIES})
+  if(WITH_OCA)
+    # mdns_publisher.cpp 仅在 WITH_AVAHI 时加入(空翻译单元避免无谓编译)
+    target_sources(aes67-daemon PRIVATE oca/mdns_publisher.cpp)
+  endif()
 endif()
 
 if(WITH_SYSTEMD)

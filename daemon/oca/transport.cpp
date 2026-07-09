@@ -169,6 +169,10 @@ void Transport::conn_loop(int fd, ONo session_id) {
       break;
     if (hdr->pduSize < 9)
       break;
+    // 上界:防止恶意/畸形 pduSize 触发超大分配(bad_alloc 逃逸线程致 daemon
+    // 崩溃)。Spec1 PDU 远小于 64KB(GetManagers 3 描述符约 89 字节)。
+    if (hdr->pduSize > 65536)
+      break;
 
     // 3. 读 payload(pduSize - 9 字节)
     size_t payloadLen = hdr->pduSize - 9;

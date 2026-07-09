@@ -880,3 +880,39 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   ::close(sock);
   server.stop();
 }
+
+BOOST_AUTO_TEST_CASE(transport_rejects_oversized_pdu) {
+  // 回归:畸形 pduSize(0xFFFFFFFF)不得触发超大 payload 分配致 daemon 崩溃。
+  // 服务端应在分配前因 pduSize 越界关闭该连接,测试进程存活。
+  oca::OcaServerConfig cfg;
+  cfg.port = 0;
+  cfg.node_id = "AES67 daemon ovs";
+  cfg.daemon_version = "v1";
+  oca::OcaServer server(cfg);
+  BOOST_REQUIRE(server.start());
+  uint16_t port = server.port();
+
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  // 畸形 PDU:sync(3B)+header(protoVer=1, pduSize=0xFFFFFFFF, type=Command,
+  // msgCount=1),不附 payload。未修时 payloadLen≈4GB 触发 bad_alloc 逃逸线程
+  // -> std::terminate -> SIGABRT,本测试进程崩溃,无法到达下方断言。
+  std::vector<uint8_t> bad{0x3B, 0x00, 0x01, 0xFF, 0xFF,
+                           0xFF, 0xFF, 0x00, 0x00, 0x01};
+  BOOST_REQUIRE_EQUAL(::send(sock, bad.data(), bad.size(), 0),
+                      (ssize_t)bad.size());
+
+  // 服务端应关闭连接(recv 返回 0);进程不崩溃。
+  uint8_t dummy;
+  ssize_t r = ::recv(sock, &dummy, 1, 0);
+  BOOST_CHECK(r <= 0);
+
+  ::close(sock);
+  server.stop();
+}

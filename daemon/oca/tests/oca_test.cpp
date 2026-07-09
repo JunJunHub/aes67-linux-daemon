@@ -7,6 +7,7 @@
 #include "oca/classes/device_manager.hpp"
 #include "oca/classes/network_manager.hpp"
 #include "oca/classes/root.hpp"
+#include "oca/classes/subscription_manager.hpp"
 #include "oca/session.hpp"
 #include "oca/types.hpp"
 
@@ -446,4 +447,66 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   BOOST_CHECK_EQUAL(r2.u16(), 2u);
   BOOST_CHECK_EQUAL(r2.u16(), 3u);
   BOOST_CHECK_EQUAL(r2.u16(), 3u);  // classVersion
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
+  oca::OcaSubscriptionManager sm(4);
+  oca::Session sess(1);
+  oca::ObjectRegistry reg;
+  sess.set_registry(&reg);
+
+  // 构造 AddSubscription2 请求:emitter=1, event={3,1}, ctx=空
+  oca::ocp1::Writer reqw;
+  reqw.u32(1);  // EmitterONo
+  reqw.u16(oca::methods::kDefLevelDeviceMngr);
+  reqw.u16(oca::methods::kEventOperationalState);
+  reqw.u16(0);  // 空 subscriberContext
+  oca::ocp1::Reader req(reqw.data(), reqw.size());
+
+  oca::ocp1::Writer rspw;
+  auto st = sm.exec(
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription2}, req,
+      rspw, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  oca::ocp1::Reader rspr(rspw.data(), rspw.size());
+  uint32_t subId = rspr.u32();
+  BOOST_CHECK(subId != 0);
+  BOOST_CHECK(sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
+                                        oca::methods::kEventOperationalState}));
+
+  // 触发 OperationalState 事件 -> 会话写队列应收到 Notification2 PDU
+  uint8_t evdata = static_cast<uint8_t>(oca::DeviceState::Operational);
+  sm.trigger_event(
+      1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kEventOperationalState},
+      &evdata, 1);
+  std::vector<uint8_t> pdu;
+  BOOST_CHECK(sess.take_notification(pdu));
+  // 校验 PDU:sync + header(pduType=Ntf2) + notification2
+  BOOST_REQUIRE(pdu.size() > 10);
+  BOOST_CHECK_EQUAL(pdu[0], 0x3B);
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  BOOST_REQUIRE(hdr);
+  BOOST_CHECK_EQUAL(hdr->pduType, oca::methods::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      pdu.data() + 1 + 9, pdu.size() - 1 - 9, hdr->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].dataCount, 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].data[0], evdata);
+  BOOST_CHECK(!sess.take_notification(pdu));  // 队列已空
+
+  // RemoveSubscription2
+  oca::ocp1::Writer reqw2;
+  reqw2.u32(subId);
+  oca::ocp1::Reader req2(reqw2.data(), reqw2.size());
+  oca::ocp1::Writer rspw2;
+  st = sm.exec(
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubRemoveSubscription2},
+      req2, rspw2, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(
+      !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
+                                 oca::methods::kEventOperationalState}));
 }

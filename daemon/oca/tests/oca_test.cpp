@@ -5,6 +5,7 @@
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
 #include "oca/classes/device_manager.hpp"
+#include "oca/classes/network_manager.hpp"
 #include "oca/classes/root.hpp"
 #include "oca/session.hpp"
 #include "oca/types.hpp"
@@ -419,4 +420,30 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   // 未实现方法 -> BadMethod
   auto [st6, b6] = call(oca::methods::kDevSetDeviceName);
   BOOST_CHECK(st6 == oca::Status::BadMethod);
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
+  oca::OcaNetworkManager nm(2);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+  oca::ocp1::Writer rsp;
+  auto st = nm.exec(
+      {oca::methods::kDefLevelNetworkMngr, oca::methods::kNetGetNetworks},
+      empty, rsp, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  oca::ocp1::Reader r(rsp.data(), rsp.size());
+  BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空网络列表
+
+  // GetClassIdentification(继承自 Root) -> {1,2,3} v3
+  oca::ocp1::Writer rsp2;
+  st = nm.exec(
+      {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
+      empty, rsp2, sess);
+  BOOST_CHECK(st == oca::Status::OK);
+  oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
+  BOOST_CHECK_EQUAL(r2.u16(), 3u);
+  BOOST_CHECK_EQUAL(r2.u16(), 1u);
+  BOOST_CHECK_EQUAL(r2.u16(), 2u);
+  BOOST_CHECK_EQUAL(r2.u16(), 3u);
+  BOOST_CHECK_EQUAL(r2.u16(), 3u);  // classVersion
 }

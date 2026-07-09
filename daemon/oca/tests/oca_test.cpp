@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "oca/methods.hpp"
+#include "oca/mdns_publisher.hpp"
 #include "oca/oca_server.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
@@ -716,3 +717,14 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   ::close(sock);
   server.stop();
 }
+
+#ifdef _USE_AVAHI_
+BOOST_AUTO_TEST_CASE(mdns_publisher_smoke) {
+  // 需要 avahi-daemon 运行才真正发布;此处仅验证 start/stop 不崩溃
+  oca::MdnsPublisher pub("aes67-oca-test", 65037);
+  BOOST_CHECK(pub.start());
+  pub.stop();
+  // 重复 stop 不崩溃
+  pub.stop();
+}
+#endif

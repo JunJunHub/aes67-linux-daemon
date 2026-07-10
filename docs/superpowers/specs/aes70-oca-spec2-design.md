@@ -270,6 +270,28 @@ Phase 0 分两步:(1) OCAMicro 源码(本地,2018 版)坐实 ClassID 类树与 2
 
 阶段一完成标志:G0/G11/G1/G2/G9/G10/G12 闭环,官方工具对象合规测试通过(或经 MITM 坐实剩余失败为 2023 方法缺失 G3/G4/G6/G7/G8)。
 
+### 阶段一实现与验证结果(2026-07-10,SDD 完成 T1-T8)
+
+7 项缺口全部闭环,提交 `2411497..e087df9`(8 commit,分支 `feature/aes70-oca`):
+
+| Task | 缺口 | 实现 | 验证 |
+|------|------|------|------|
+| T1 | G0 | 三 Manager ClassID -> {1,3,x}(DeviceManager {1,3,1}、SubscriptionManager {1,3,4}、NetworkManager {1,3,6}),版本暂留(T4 改) | oca-test + MITM |
+| T2 | G11 | EV2 索引 {1,2,3,4}->{8,9,10,11};AddSubscription2/RemoveSubscription2 入参对齐 sphinx 2024(OcaEvent+DeliveryMode(u8,Normal=1)+NetworkAddress(blob),去 ctx);RemoveSub2 改按 event 移除全部+幂等 | oca-test + oca-probe + MITM |
+| T3 | G1/G2 | NetworkManager ONo 2->6(ONo 2=SecurityManager 空置);GetMembers/GetManagers 列表 [1,2,4]->[1,4,6] | oca-test + MITM |
+| T4 | G10 | DeviceManager/NetworkManager class_version 4/3->2(与 OCAMicro 2018 一致) | oca-test + MITM |
+| T5 | G12 | 新增 GetOperationalState(3.23)返回 OcaDeviceOperationalState{u8 Generic=NormalOperation(0)+空 Details blob};GetState(3.13) deprecated 保留 | oca-test |
+| T6 | G9 | 各类 default 分支(defLevel 匹配但方法未实现)BadMethod->NotImplemented;defLevel 不匹配仍 BadMethod(Annex B.3.0) | oca-test |
+| T7 | — | oca-probe 用正确 EV2 索引/入参;新增"旧索引 1 返回非 OK"断言,消除自测盲点 | oca-probe e2e + MITM |
+
+**验证(Step1-3 全 PASS):**
+- oca-test 21/21 绿(22 宏/21 运行,1 个 Avahi 条件用例 OFF 时不跑,预存在)。
+- oca-probe e2e 经 MITM(65038->65037)全部探测通过(exit 0):发现/身份/GetManagers/GetMembers/GetClassIdentification/AddSubscription2/旧索引断言。
+- MITM 字节级裁决(权威):GetManagers 与 GetMembers 均返回 `ONo=1{1,3,1}v2 / ONo=4{1,3,4}v2 / ONo=6{1,3,6}v2`;GetClassIdentification(target=1)返回 `{1,3,1} v2`;AddSubscription2 命令 `target=4 dl=3 mi=8 nr=3`->OK 返回 subscriptionID;旧索引 `target=4 mi=1`->**NotImplemented**(自测盲点消除)。
+- 附带修复 `e087df9`:oca-probe GetMembers 解析对齐 List<OcaObjectIdentification>(db371a2 改返回结构后 oca-probe 解析陈旧,T8 暴露)。
+
+**待用户执行(Step4):** 在 Win 重跑 Aes70CompliancyTestTool(MITM 抓包),确认对象合规测试从 Spec1 的 2/5 改善。预期:G0 修正后 DeviceManager 不再被误读为 OcaNetwork,G11 修正后订阅测试转通过。剩余失败应经 MITM 坐实为 G3/G4/G6/G7/G8(2023 方法缺失,归阶段二)。
+
 **阶段二(补 2023 强制方法/事件,索引已坐实可立即实施):**
 
 | 缺口 | 改动 | 索引/结构(已坐实) |

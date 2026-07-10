@@ -95,7 +95,7 @@ const char* status_name(o::Status s) {
   return "?";
 }
 
-// ClassID 转字符串,如 {1,2,1}
+// ClassID 转字符串,如 {1,3,1}
 std::string classid_str(const std::vector<uint16_t>& levels) {
   std::string s = "{";
   for (size_t i = 0; i < levels.size(); ++i) {
@@ -462,15 +462,18 @@ int main(int argc, char** argv) {
   // --- 6. EV2 订阅验证(AddSubscription2)-----------------------------------
   if (do_sub) {
     section("EV2 订阅 (AddSubscription2) — Task17 关键验证门");
-    // 找 SubscriptionManager(通常是 GetManagers 里 classID 含 {1,2,4} 的,
+    // 找 SubscriptionManager(通常是 GetManagers 里 classID 含 {1,3,4} 的,
     // 但探测客户端不硬编码:直接试已知 ONo=4,失败则回退遍历)
-    // 参数:EmitterONo(u32)=1, EventID(u16 defLevel, u16 idx)={3,1},
-    //      subscriberContext(u16)=0
+    // 参数(Task 2 对齐 sphinx 2024):
+    //   OcaEvent = EmitterONo(u32)=1 + EventID(u16 defLevel, u16 idx)={3,1},
+    //   NotificationDeliveryMode(u8)=1(Normal),
+    //   NetworkAddress(OcaBlob)=空(u16 长度=0)
     oca::ocp1::Writer params;
     params.u32(1);  // EmitterONo = DeviceManager
     params.u16(m::kDefLevelDeviceMngr);
     params.u16(m::kEventOperationalState);
-    params.u16(0);  // 空 subscriberContext
+    params.u8(1);   // NotificationDeliveryMode = Normal
+    params.u16(0);  // 空 NetworkAddress (OcaBlob)
 
     auto r = probe.cmd(4, {m::kDefLevelSubMngr, m::kSubAddSubscription2},
                        params.data(), static_cast<uint32_t>(params.size()), 3);
@@ -488,12 +491,25 @@ int main(int argc, char** argv) {
       std::cout << ERR()
                 << "  [FAIL] AddSubscription2 status=" << status_name(r.status)
                 << " — EV2 方法索引(" << m::kSubAddSubscription2
-                << ")可能不正确,需对照 AES70-2 XMI 修正" << OFF() << "\n";
+                << ")已按 sphinx 2024 校正,此失败为真实回归" << OFF() << "\n";
       probe.failures++;
     } else {
       std::cout << WARN()
                 << "  [--] AddSubscription2 status=" << status_name(r.status)
                 << OFF() << "\n";
+    }
+
+    // 自测盲点回归:旧 EV2 索引(methodIndex=1,即 Spec1 旧 kSubAddSubscription2)
+    // 不应被当作订阅方法 - 必须返回非 OK(BadMethod 或 Task6 后的
+    // NotImplemented)。
+    auto rb = probe.cmd0(4, {m::kDefLevelSubMngr, 1});
+    if (rb.ok && rb.status != o::Status::OK) {
+      std::cout << OK() << "  [OK] 旧索引 1 返回 " << status_name(rb.status)
+                << " (非 OK,自测盲点已消除)" << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] 旧索引 1 返回 OK - 自测盲点仍存在"
+                << " (daemon 误把旧索引当订阅方法)" << OFF() << "\n";
+      probe.failures++;
     }
   }
 

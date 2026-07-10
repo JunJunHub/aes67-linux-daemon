@@ -11,7 +11,7 @@ class OcaNetworkManager : public OcaManager {
  public:
   explicit OcaNetworkManager(ONo ono) : OcaManager(ono) {}
   const ClassIdentification& class_id() const override;
-  uint16_t class_version() const override { return 3; }
+  uint16_t class_version() const override { return 2; }
   std::string role() const override { return "NetworkManager"; }
   ExecResult exec(MethodID m,
                   ocp1::Reader& req,

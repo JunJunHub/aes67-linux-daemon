@@ -23,7 +23,7 @@ class OcaDeviceManager : public OcaManager {
   OcaDeviceManager(ONo ono, const OcaDeviceIdentity& identity)
       : OcaManager(ono), identity_(identity) {}
   const ClassIdentification& class_id() const override;
-  uint16_t class_version() const override { return 4; }
+  uint16_t class_version() const override { return 2; }
   std::string role() const override { return "DeviceManager"; }
   ExecResult exec(MethodID m,
                   ocp1::Reader& req,

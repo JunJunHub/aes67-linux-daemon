@@ -52,6 +52,7 @@ BOOST_AUTO_TEST_CASE(types_and_constants) {
   BOOST_CHECK_EQUAL(m::kDevGetSerialNumber, 3);
   BOOST_CHECK_EQUAL(m::kDevGetModelDescription, 6);
   BOOST_CHECK_EQUAL(m::kDevGetState, 13);
+  BOOST_CHECK_EQUAL(m::kDevGetOperationalState, 23);
   BOOST_CHECK_EQUAL(m::kDevGetManagers, 19);
   BOOST_CHECK_EQUAL(m::kBlockGetMembers, 5);
   BOOST_CHECK_EQUAL(m::kRootGetClassIdentification, 1);
@@ -421,6 +422,16 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   BOOST_CHECK(st4.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(b4.data(), b4.size()).u8(),
                     static_cast<uint8_t>(oca::DeviceState::Operational));
+
+  // GetOperationalState -> {Generic=NormalOperation(0), Details=空 blob}
+  auto [st4b, b4b] = call(oca::methods::kDevGetOperationalState);
+  BOOST_CHECK(st4b.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st4b.nrParameters, 1);
+  {
+    oca::ocp1::Reader r(b4b.data(), b4b.size());
+    BOOST_CHECK_EQUAL(r.u8(), 0u);   // OcaDeviceGenericState::NormalOperation
+    BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空 OcaBlob Details
+  }
 
   // GetManagers -> 3 descriptors, first is ONo 1 / Role "DeviceManager"
   auto [st5, b5] = call(oca::methods::kDevGetManagers);

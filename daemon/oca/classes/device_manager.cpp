@@ -31,6 +31,8 @@ ExecResult OcaDeviceManager::exec(MethodID m,
         return GetModelDescription(rsp);
       case methods::kDevGetState:
         return GetState(rsp);
+      case methods::kDevGetOperationalState:
+        return GetOperationalState(rsp);
       case methods::kDevGetManagers:
         return GetManagers(rsp, sess);
       default:
@@ -67,6 +69,14 @@ ExecResult OcaDeviceManager::GetState(ocp1::Writer& rsp) {
   rsp.u8(static_cast<uint8_t>(
       DeviceState::Operational));  // Spec1 总是 Operational
   return {Status::OK, 1};
+}
+
+ExecResult OcaDeviceManager::GetOperationalState(ocp1::Writer& rsp) {
+  // OcaDeviceOperationalState = {Generic(u8) + Details(OcaBlob)}
+  // Generic = OcaDeviceGenericState::NormalOperation(0); Details = 空 blob
+  rsp.u8(0);               // NormalOperation
+  rsp.u16(0);              // 空 OcaBlob Details
+  return {Status::OK, 1};  // 1 个结构化参数
 }
 
 ExecResult OcaDeviceManager::GetManagers(ocp1::Writer& rsp, Session& sess) {

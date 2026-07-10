@@ -41,7 +41,8 @@ constexpr uint16_t kDevGetSerialNumber        = 3;
 constexpr uint16_t kDevGetDeviceName          = 4;
 constexpr uint16_t kDevSetDeviceName          = 5;
 constexpr uint16_t kDevGetModelDescription    = 6;
-constexpr uint16_t kDevGetState               = 13;  // = GetOperationalState
+constexpr uint16_t kDevGetState               = 13;  // deprecated (v3), 被 GetOperationalState 取代
+constexpr uint16_t kDevGetOperationalState    = 23;  // sphinx 2024
 constexpr uint16_t kDevGetManagers            = 19;
 
 // OcaBlock methods (DefLevel 3) - ocac 核对

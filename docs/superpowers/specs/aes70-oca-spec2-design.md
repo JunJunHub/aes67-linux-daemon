@@ -330,6 +330,45 @@ Phase 0 分两步:(1) OCAMicro 源码(本地,2018 版)坐实 ClassID 类树与 2
 
 **不在阶段二范围:** CM3 网络对象(2023 弃用,Option A 不新增);Minimum object compliancy 5/5;OcaWorker defLevel 2(GetEnabled/SetEnabled/GetPorts,工具未测);PropertyChanged 实际通知投递(bonus)。均顺延 Spec3。
 
+### 阶段二抓包工具链验证(2026-07-10,T1 启动前)
+
+阶段二实施前,先用真实 Win 工具流量验证抓包工具链 + 再确认计划前提。
+
+**抓包架构简化(替代阶段一的在线 MITM):** OCA TCP server 绑 `INADDR_ANY`(`daemon/oca/transport.cpp:40`),`mdns_enabled=true` 时 daemon 自带 libavahi-client 发布 `_oca._tcp` 到 LAN。故 Win 工具 mDNS 直连 daemon:65037,**无需 MITM 代理、无需手动 avahi-publish**(阶段一的 lo↔LAN 桥接角色本就多余)。抓包改用 tcpdump 旁路:
+
+```text
+Win(172.16.1.211) ──mDNS 发现+直连──> daemon(172.16.1.198:65037)
+                                          ↑
+                       sudo tcpdump -i ens160 port 65037(旁路,非侵入)
+```
+
+**工具链(已落库):** `daemon/oca/tools/oca-parse-pcap.py`(纯 Python 零依赖,本机 tshark/scapy/dpkt 均缺)读 `.pcap` -> 剥 Ethernet/IP/TCP -> 按 4-tuple 分方向 seq 重组(处理重传/乱序)-> OCP.1 PDU 帧化(复用 MITM 已验证的 `parse_pdu` 逻辑)-> 命令/响应深度解码。产物持久落 `captures/`(非 /tmp),可反复重跑解析。`oca-mitm.py` 保留作 fallback(不删,按 `ai-collaboration.md` 只标记不擅自删)。
+
+**验证流程:**
+
+```bash
+./oca-dev.sh run -i ens160                                    # daemon 65037 + mDNS
+sudo -n tcpdump -i ens160 -w captures/realtool-<ts>.pcap 'tcp port 65037'  # 用户在 Win 跑工具
+python3 daemon/oca/tools/oca-parse-pcap.py captures/realtool-<ts>.pcap > captures/realtool-transcript.txt
+```
+
+> 注:sudo 拉起的 tcpdump 进程 Claude 权限 kill 不掉,抓完由用户收尾停止。
+
+**验证结果(254 帧 / 106 命令 / 106 响应 / 14 KeepAlive,状态分布 NotImplemented=66、OK=40):** 抓包工具链全链路正确。本次纯净 Win 工具流量(无阶段一 MITM 混入本地 probe 的问题),**计划前提全部再确认**:
+
+| 验证项 | 阶段二任务 | 本次抓包次数 | 当前状态 |
+|--------|-----------|------------|---------|
+| EV1 AddSubscription(target=4,{3,1}) | T1 枢纽 | 17 | NotImplemented(8) |
+| EV1 RemoveSubscription({3,2}) | T1 | 1 | NotImplemented(8) |
+| EV1 AddPropertyChangeSubscription({3,5}) | T1 | 1 | NotImplemented(8) |
+| Root Lock/Unlock({1,3}/{1,4}) | T2 | 7+6 | NotImplemented(8) |
+| DevMgr GetModelGUID/GetEnabled/SetEnabled/GetDeviceRevisionID | T3 | 各 2 | NotImplemented(8) |
+| NetMgr GetStream/Control/MediaTransportNetworks({3,2}/{3,3}/{3,4}) | T4 | 各 1 | NotImplemented(8) |
+
+EV1 AddSubscription 命令参数字节确认:`emitterONo u32=1 + EventID{defLevel u16=1,eventIndex u16=1}=PropertyChanged + subscriberONo u32 + ctx blob + subCtx blob`,与 OCAMicro 一致。阶段二 12 个目标方法当前统一返回 NotImplemented(8),正是 T1-T5 要补的缺口。
+
+**★ 协议事实(本次抓包坐实,影响实现):** Win 工具在 Root Lock/Unlock 等命令的 `nrParameters` 字段填 `0x64=100`(非真实参数个数 0)。查 OCAMicro `Ocp1LiteMessageCommand::Unmarshal` 确认:接收方用 `commandSize - 已读字节数` 推算 paramBytes,**完全忽略 nrParameters 字段**。daemon `parse_commands` 已是此实现(`paramBytes = commandSize - 17`,commit ef19171),能正确处理 nrParameters=100 的命令,**无需改动**。响应端仍写真实参数个数(ef19171 修正,继续有效)。
+
 ### 已定稿(2026-07-10 用户确认)
 
 1. **阶段一范围**:只做有硬证据项 G0/G1/G2/G9/G10,先把对象合规测试跑通;G3-G8(2023 新增方法)等文本源到位再做(决策 #7)。

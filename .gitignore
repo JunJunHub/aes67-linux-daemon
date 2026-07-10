@@ -124,6 +124,14 @@ MergingRavennaALSA.mod
 *.log
 logs/
 
+# OCA build artifacts (in-source 构建遗留的二进制,out-of-source 构建产物在 build/)
+daemon/oca-probe
+daemon/tests/oca-test
+
+# OCA 抓包产物(.pcap 体积大且可重抓,仅保留解析工具源码)
+captures/
+daemon/oca/tools/__pycache__/
+
 
 # Packaging temp files
 packaging/temp/

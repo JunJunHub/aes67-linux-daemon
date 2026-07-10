@@ -33,12 +33,30 @@ class OcaSubscriptionManager : public OcaManager {
   void remove_session(Session* sess);
 
  private:
+  ExecResult AddSubscription(ocp1::Reader& req,
+                             ocp1::Writer& rsp,
+                             Session& sess);
+  ExecResult RemoveSubscription(ocp1::Reader& req,
+                                ocp1::Writer& rsp,
+                                Session& sess);
+  ExecResult AddPropertyChangeSubscription(ocp1::Reader& req,
+                                           ocp1::Writer& rsp,
+                                           Session& sess);
+  ExecResult RemovePropertyChangeSubscription(ocp1::Reader& req,
+                                              ocp1::Writer& rsp,
+                                              Session& sess);
   ExecResult AddSubscription2(ocp1::Reader& req,
                               ocp1::Writer& rsp,
                               Session& sess);
   ExecResult RemoveSubscription2(ocp1::Reader& req,
                                  ocp1::Writer& rsp,
                                  Session& sess);
+  ExecResult AddPropertyChangeSubscription2(ocp1::Reader& req,
+                                            ocp1::Writer& rsp,
+                                            Session& sess);
+  ExecResult RemovePropertyChangeSubscription2(ocp1::Reader& req,
+                                               ocp1::Writer& rsp,
+                                               Session& sess);
 
   struct Entry {
     uint32_t id;

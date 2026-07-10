@@ -23,13 +23,24 @@ ExecResult OcaSubscriptionManager::exec(MethodID m,
                                         Session& sess) {
   if (m.defLevel == methods::kDefLevelSubMngr) {
     switch (m.methodIndex) {
+      case methods::kSubAddSubscription:
+        return AddSubscription(req, rsp, sess);
+      case methods::kSubRemoveSubscription:
+        return RemoveSubscription(req, rsp, sess);
+      case methods::kSubAddPropertyChangeSubscription:
+        return AddPropertyChangeSubscription(req, rsp, sess);
+      case methods::kSubRemovePropertyChangeSubscription:
+        return RemovePropertyChangeSubscription(req, rsp, sess);
       case methods::kSubAddSubscription2:
         return AddSubscription2(req, rsp, sess);
       case methods::kSubRemoveSubscription2:
         return RemoveSubscription2(req, rsp, sess);
+      case methods::kSubAddPropertyChangeSubscription2:
+        return AddPropertyChangeSubscription2(req, rsp, sess);
+      case methods::kSubRemovePropertyChangeSubscription2:
+        return RemovePropertyChangeSubscription2(req, rsp, sess);
       default:
-        return {Status::NotImplemented,
-                0};  // PropertyChange 变体/未实现方法 -> NotImplemented
+        return {Status::NotImplemented, 0};  // 未实现方法 -> NotImplemented
     }
   }
   return OcaManager::exec(m, req, rsp, sess);
@@ -76,6 +87,158 @@ ExecResult OcaSubscriptionManager::RemoveSubscription2(ocp1::Reader& req,
                  entries_.end());
   sess.remove_subscription(emitter, eid);
   return {Status::OK, 0};  // 无返回参数(幂等:无匹配也 OK)
+}
+
+ExecResult OcaSubscriptionManager::AddSubscription(ocp1::Reader& req,
+                                                   ocp1::Writer& rsp,
+                                                   Session& sess) {
+  // EV1 §3.1(OCAMicro,deprecated v3):
+  //   OcaEvent{EmitterONo+EventID} + OcaMethod{ONo+MethodID}(subscriber,忽略)
+  //   + OcaBlob(ctx,忽略) + NotificationDeliveryMode(u8,忽略)
+  //   + NetworkAddress(blob,忽略)
+  // 响应 0 参(无 subscriptionID,区别于 EV2 AddSubscription2 的 1 参)
+  ONo emitter = req.u32();
+  EventID eid{req.u16(), req.u16()};
+  (void)req.u32();   // subscriber ONo(忽略)
+  (void)req.u16();   // subscriber MethodID defLevel(忽略)
+  (void)req.u16();   // subscriber MethodID methodIndex(忽略)
+  (void)req.blob();  // context(忽略)
+  (void)req.u8();    // NotificationDeliveryMode(忽略)
+  (void)req.blob();  // NetworkAddress(忽略)
+
+  uint32_t id = next_id_.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    entries_.push_back({id, &sess, emitter, eid});
+  }
+  sess.add_subscription({emitter, eid});
+  return {Status::OK, 0};  // EV1:无返回参数
+}
+
+ExecResult OcaSubscriptionManager::RemoveSubscription(ocp1::Reader& req,
+                                                      ocp1::Writer& rsp,
+                                                      Session& sess) {
+  // EV1 §3.2: OcaEvent{EmitterONo+EventID} + OcaMethod(subscriber,忽略)
+  ONo emitter = req.u32();
+  EventID eid{req.u16(), req.u16()};
+  (void)req.u32();  // subscriber ONo(忽略)
+  (void)req.u16();  // subscriber MethodID defLevel(忽略)
+  (void)req.u16();  // subscriber MethodID methodIndex(忽略)
+
+  std::lock_guard<std::mutex> lk(mutex_);
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& e) {
+                                  return e.sess == &sess &&
+                                         e.emitterONo == emitter &&
+                                         e.eventID.defLevel == eid.defLevel &&
+                                         e.eventID.eventIndex == eid.eventIndex;
+                                }),
+                 entries_.end());
+  sess.remove_subscription(emitter, eid);
+  return {Status::OK, 0};  // 幂等:无匹配也 OK
+}
+
+ExecResult OcaSubscriptionManager::AddPropertyChangeSubscription(
+    ocp1::Reader& req,
+    ocp1::Writer& rsp,
+    Session& sess) {
+  // EV1 §3.5: EmitterONo + PropertyID{u16,u16}(忽略) + OcaMethod(忽略)
+  //   + OcaBlob(ctx,忽略) + NotificationDeliveryMode(u8,忽略)
+  //   + NetworkAddress(blob,忽略)
+  // 订阅 PropertyChanged 事件(OcaRoot event,defLevel 1 / eventIndex 1)
+  ONo emitter = req.u32();
+  (void)req.u16();   // PropertyID defLevel(忽略)
+  (void)req.u16();   // PropertyID propertyIndex(忽略)
+  (void)req.u32();   // subscriber ONo(忽略)
+  (void)req.u16();   // subscriber MethodID defLevel(忽略)
+  (void)req.u16();   // subscriber MethodID methodIndex(忽略)
+  (void)req.blob();  // context(忽略)
+  (void)req.u8();    // NotificationDeliveryMode(忽略)
+  (void)req.blob();  // NetworkAddress(忽略)
+
+  EventID pce{methods::kDefLevelRoot, methods::kEventPropertyChanged};
+  uint32_t id = next_id_.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    entries_.push_back({id, &sess, emitter, pce});
+  }
+  sess.add_subscription({emitter, pce});
+  return {Status::OK, 0};
+}
+
+ExecResult OcaSubscriptionManager::RemovePropertyChangeSubscription(
+    ocp1::Reader& req,
+    ocp1::Writer& rsp,
+    Session& sess) {
+  // EV1 §3.6: EmitterONo + PropertyID(忽略) + OcaMethod(忽略)
+  ONo emitter = req.u32();
+  (void)req.u16();  // PropertyID defLevel(忽略)
+  (void)req.u16();  // PropertyID propertyIndex(忽略)
+  (void)req.u32();  // subscriber ONo(忽略)
+  (void)req.u16();  // subscriber MethodID defLevel(忽略)
+  (void)req.u16();  // subscriber MethodID methodIndex(忽略)
+
+  EventID pce{methods::kDefLevelRoot, methods::kEventPropertyChanged};
+  std::lock_guard<std::mutex> lk(mutex_);
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& e) {
+                                  return e.sess == &sess &&
+                                         e.emitterONo == emitter &&
+                                         e.eventID.defLevel == pce.defLevel &&
+                                         e.eventID.eventIndex == pce.eventIndex;
+                                }),
+                 entries_.end());
+  sess.remove_subscription(emitter, pce);
+  return {Status::OK, 0};
+}
+
+ExecResult OcaSubscriptionManager::AddPropertyChangeSubscription2(
+    ocp1::Reader& req,
+    ocp1::Writer& rsp,
+    Session& sess) {
+  // EV2 §3.10(sphinx 2024): EmitterONo + PropertyID(忽略)
+  //   + NotificationDeliveryMode(u8,忽略) + NetworkAddress(blob,忽略)
+  // 响应 0 参(sphinx:仅返回 OcaStatus,无 subscriptionID)
+  ONo emitter = req.u32();
+  (void)req.u16();   // PropertyID defLevel(忽略)
+  (void)req.u16();   // PropertyID propertyIndex(忽略)
+  (void)req.u8();    // NotificationDeliveryMode(忽略)
+  (void)req.blob();  // NetworkAddress(忽略)
+
+  EventID pce{methods::kDefLevelRoot, methods::kEventPropertyChanged};
+  uint32_t id = next_id_.fetch_add(1);
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    entries_.push_back({id, &sess, emitter, pce});
+  }
+  sess.add_subscription({emitter, pce});
+  return {Status::OK, 0};
+}
+
+ExecResult OcaSubscriptionManager::RemovePropertyChangeSubscription2(
+    ocp1::Reader& req,
+    ocp1::Writer& rsp,
+    Session& sess) {
+  // EV2 §3.11(sphinx 2024): EmitterONo + PropertyID(忽略)
+  //   + NotificationDeliveryMode(u8,忽略) + NetworkAddress(blob,忽略)
+  ONo emitter = req.u32();
+  (void)req.u16();   // PropertyID defLevel(忽略)
+  (void)req.u16();   // PropertyID propertyIndex(忽略)
+  (void)req.u8();    // NotificationDeliveryMode(忽略)
+  (void)req.blob();  // NetworkAddress(忽略)
+
+  EventID pce{methods::kDefLevelRoot, methods::kEventPropertyChanged};
+  std::lock_guard<std::mutex> lk(mutex_);
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& e) {
+                                  return e.sess == &sess &&
+                                         e.emitterONo == emitter &&
+                                         e.eventID.defLevel == pce.defLevel &&
+                                         e.eventID.eventIndex == pce.eventIndex;
+                                }),
+                 entries_.end());
+  sess.remove_subscription(emitter, pce);
+  return {Status::OK, 0};
 }
 
 void OcaSubscriptionManager::trigger_event(ONo emitterONo,

@@ -554,9 +554,9 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
       !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
                                  oca::methods::kEventOperationalState}));
 
-  // 自测盲点回归:错误索引(methodIndex=1,即 Spec1 旧 kSubAddSubscription2)
-  // 不应误命中 EV1 默认分支之外的任何方法,必须返回非 OK。
-  // 用 != OK 而非 == BadMethod,以兼容 Task 6 将默认分支改为 NotImplemented。
+  // 自测盲点回归:未实现的方法索引(7)必须返回非 OK(NotImplemented),
+  // 不得误命中已实现方法。用 != OK 而非 == BadMethod,兼容默认分支
+  // NotImplemented。
   oca::ocp1::Writer badw;
   badw.u32(1);
   badw.u16(oca::methods::kDefLevelDeviceMngr);
@@ -566,8 +566,164 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   oca::ocp1::Reader badreq(badw.data(), badw.size());
   oca::ocp1::Writer badrsp;
   auto badst =
-      sm.exec({oca::methods::kDefLevelSubMngr, 1}, badreq, badrsp, sess);
+      sm.exec({oca::methods::kDefLevelSubMngr, 7}, badreq, badrsp, sess);
   BOOST_CHECK(badst.status != oca::Status::OK);
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_subscription_ev1_ev2_propertychange) {
+  oca::OcaSubscriptionManager sm(4);
+  oca::Session sess(1);
+  oca::ObjectRegistry reg;
+  sess.set_registry(&reg);
+
+  // EV1 AddSubscription(mi=1,5 参):
+  //   OcaEvent{emitter u32 + EventID u16,u16} + OcaMethod{ono u32 + mid
+  //   u16,u16}
+  //   + OcaBlob(ctx) + DeliveryMode u8 + NetworkAddress(blob)
+  oca::ocp1::Writer w1;
+  w1.u32(1);                                     // EmitterONo
+  w1.u16(oca::methods::kDefLevelDeviceMngr);     // EventID defLevel
+  w1.u16(oca::methods::kEventOperationalState);  // EventID eventIndex
+  w1.u32(7);                                     // subscriber ONo(忽略)
+  w1.u16(1);                                     // subscriber MethodID defLevel
+  w1.u16(1);  // subscriber MethodID methodIndex
+  w1.u16(0);  // 空 context blob
+  w1.u8(1);   // DeliveryMode Normal
+  w1.u16(0);  // 空 NetworkAddress
+  oca::ocp1::Reader r1(w1.data(), w1.size());
+  oca::ocp1::Writer rsp1;
+  auto st1 = sm.exec(
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription}, r1,
+      rsp1, sess);
+  BOOST_CHECK(st1.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st1.nrParameters, 0);  // EV1:0 参,无 subID
+  BOOST_CHECK_EQUAL(rsp1.size(), 0u);      // 响应体为空
+  BOOST_CHECK(sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
+                                        oca::methods::kEventOperationalState}));
+
+  // EV1 RemoveSubscription(mi=2,2 参):OcaEvent + OcaMethod(忽略)
+  oca::ocp1::Writer w2;
+  w2.u32(1);
+  w2.u16(oca::methods::kDefLevelDeviceMngr);
+  w2.u16(oca::methods::kEventOperationalState);
+  w2.u32(7);
+  w2.u16(1);
+  w2.u16(1);
+  oca::ocp1::Reader r2(w2.data(), w2.size());
+  oca::ocp1::Writer rsp2;
+  auto st2 = sm.exec(
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubRemoveSubscription},
+      r2, rsp2, sess);
+  BOOST_CHECK(st2.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st2.nrParameters, 0);
+  BOOST_CHECK(
+      !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
+                                 oca::methods::kEventOperationalState}));
+
+  // EV1 AddPropertyChangeSubscription(mi=5,6 参):
+  //   EmitterONo + PropertyID{u16,u16} + OcaMethod{u32,u16,u16}
+  //   + OcaBlob + DeliveryMode u8 + NetworkAddress(blob)
+  oca::ocp1::Writer w5;
+  w5.u32(1);  // EmitterONo
+  w5.u16(1);  // PropertyID defLevel(忽略)
+  w5.u16(1);  // PropertyID propertyIndex(忽略)
+  w5.u32(7);  // subscriber ONo(忽略)
+  w5.u16(1);  // subscriber MethodID defLevel
+  w5.u16(1);  // subscriber MethodID methodIndex
+  w5.u16(0);  // context(忽略)
+  w5.u8(1);   // DeliveryMode(忽略)
+  w5.u16(0);  // NetworkAddress(忽略)
+  oca::ocp1::Reader r5(w5.data(), w5.size());
+  oca::ocp1::Writer rsp5;
+  auto st5 = sm.exec({oca::methods::kDefLevelSubMngr,
+                      oca::methods::kSubAddPropertyChangeSubscription},
+                     r5, rsp5, sess);
+  BOOST_CHECK(st5.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st5.nrParameters, 0);
+  // 订阅记录为 PropertyChanged 事件 {defLevel 1, eventIndex 1}
+  BOOST_CHECK(sess.has_subscription(
+      1, {oca::methods::kDefLevelRoot, oca::methods::kEventPropertyChanged}));
+  // 触发 PropertyChanged -> 会话写队列收到 Notification2(验证记录生效)
+  uint8_t evdata = 0x42;
+  sm.trigger_event(
+      1, {oca::methods::kDefLevelRoot, oca::methods::kEventPropertyChanged},
+      &evdata, 1);
+  std::vector<uint8_t> ntf;
+  BOOST_CHECK(sess.take_notification(ntf));
+  BOOST_CHECK(!sess.take_notification(ntf));  // 队列已空
+
+  // EV1 RemovePropertyChangeSubscription(mi=6,3 参):
+  //   EmitterONo + PropertyID + OcaMethod(忽略)
+  oca::ocp1::Writer w6;
+  w6.u32(1);
+  w6.u16(1);
+  w6.u16(1);
+  w6.u32(7);
+  w6.u16(1);
+  w6.u16(1);
+  oca::ocp1::Reader r6(w6.data(), w6.size());
+  oca::ocp1::Writer rsp6;
+  auto st6 = sm.exec({oca::methods::kDefLevelSubMngr,
+                      oca::methods::kSubRemovePropertyChangeSubscription},
+                     r6, rsp6, sess);
+  BOOST_CHECK(st6.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st6.nrParameters, 0);
+  BOOST_CHECK(!sess.has_subscription(
+      1, {oca::methods::kDefLevelRoot, oca::methods::kEventPropertyChanged}));
+
+  // EV2 AddPropertyChangeSubscription2(mi=10,4 参,sphinx):
+  //   EmitterONo + PropertyID{u16,u16} + DeliveryMode u8 + NetworkAddress(blob)
+  oca::ocp1::Writer w10;
+  w10.u32(1);
+  w10.u16(1);
+  w10.u16(1);
+  w10.u8(1);
+  w10.u16(0);
+  oca::ocp1::Reader r10(w10.data(), w10.size());
+  oca::ocp1::Writer rsp10;
+  auto st10 = sm.exec({oca::methods::kDefLevelSubMngr,
+                       oca::methods::kSubAddPropertyChangeSubscription2},
+                      r10, rsp10, sess);
+  BOOST_CHECK(st10.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st10.nrParameters, 0);  // EV2 PropertyChange2:0 参(sphinx)
+  BOOST_CHECK(sess.has_subscription(
+      1, {oca::methods::kDefLevelRoot, oca::methods::kEventPropertyChanged}));
+
+  // EV2 RemovePropertyChangeSubscription2(mi=11,4 参,sphinx)
+  oca::ocp1::Writer w11;
+  w11.u32(1);
+  w11.u16(1);
+  w11.u16(1);
+  w11.u8(1);
+  w11.u16(0);
+  oca::ocp1::Reader r11(w11.data(), w11.size());
+  oca::ocp1::Writer rsp11;
+  auto st11 = sm.exec({oca::methods::kDefLevelSubMngr,
+                       oca::methods::kSubRemovePropertyChangeSubscription2},
+                      r11, rsp11, sess);
+  BOOST_CHECK(st11.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st11.nrParameters, 0);
+  BOOST_CHECK(!sess.has_subscription(
+      1, {oca::methods::kDefLevelRoot, oca::methods::kEventPropertyChanged}));
+
+  // 参差断言:EV1 AddSubscription(mi=1)=0 参  vs
+  //           EV2 AddSubscription2(mi=8)=1 参(subID),两者并存语义正确
+  oca::ocp1::Writer w8;
+  w8.u32(1);
+  w8.u16(oca::methods::kDefLevelDeviceMngr);
+  w8.u16(oca::methods::kEventOperationalState);
+  w8.u8(1);
+  w8.u16(0);
+  oca::ocp1::Reader r8(w8.data(), w8.size());
+  oca::ocp1::Writer rsp8;
+  auto st8 = sm.exec(
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription2}, r8,
+      rsp8, sess);
+  BOOST_CHECK(st8.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st8.nrParameters, 1);  // EV2 AddSubscription2:1 参(subID)
+  BOOST_CHECK(oca::ocp1::Reader(rsp8.data(), rsp8.size()).u32() != 0u);
+  BOOST_CHECK_EQUAL(st1.nrParameters, 0u);  // EV1 mi=1
+  BOOST_CHECK_EQUAL(st8.nrParameters, 1u);  // EV2 mi=8
 }
 
 BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {

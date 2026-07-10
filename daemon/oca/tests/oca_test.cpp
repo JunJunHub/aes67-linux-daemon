@@ -341,7 +341,9 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   BOOST_CHECK_EQUAL(r.u16(), 3u);
   BOOST_CHECK_EQUAL(r.u16(), 2u);  // classVersion
 
-  // GetMembers {3,5} -> [1,2,4]
+  // GetMembers {3,5} -> List<ObjectIdentification> [1,2,4]
+  // 每个元素 = ONo(u32) + ClassID(fieldCount u16 + levels) + ClassVersion(u16)
+  // StubObject 的 class_id 为空(levels=0, version=0)
   oca::ocp1::Writer rsp2;
   st = root.exec({oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers},
                  empty, rsp2, sess);
@@ -349,9 +351,13 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   BOOST_CHECK_EQUAL(st.nrParameters, 1);
   oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
   BOOST_CHECK_EQUAL(r2.u16(), 3u);  // 3 members
-  BOOST_CHECK_EQUAL(r2.u32(), 1u);
-  BOOST_CHECK_EQUAL(r2.u32(), 2u);
-  BOOST_CHECK_EQUAL(r2.u32(), 4u);
+  for (int i = 0; i < 3; ++i) {
+    BOOST_CHECK_EQUAL(r2.u32(), static_cast<uint32_t>(i == 0   ? 1
+                                                      : i == 1 ? 2
+                                                               : 4));
+    BOOST_CHECK_EQUAL(r2.u16(), 0u);  // ClassID fieldCount = 0 (StubObject)
+    BOOST_CHECK_EQUAL(r2.u16(), 1u);  // ClassVersion = 1 (StubObject)
+  }
 
   // 未知方法 -> BadMethod
   oca::ocp1::Writer rsp3;
@@ -705,7 +711,8 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramBytes);
   BOOST_CHECK_EQUAL(pr.string(), "AES67 daemon abc123");
 
-  // GetMembers(5) on Root Block(ONo 100) -> [1,2,4]
+  // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification> [1,2,4]
+  // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion
   oca::ocp1::Writer cw2;
   oca::ocp1::write_command(
       cw2, 2, 100,
@@ -720,10 +727,28 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
       rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
   oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // 3 members
+  // ONo=1 DeviceManager {1,2,1} v4
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 4u);  // ClassVersion
+  // ONo=2 NetworkManager {1,2,3} v3
   BOOST_CHECK_EQUAL(pr2.u32(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  // ONo=4 SubscriptionManager {1,2,4} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 4u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 4u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
 
   ::close(sock);
   server.stop();
@@ -828,16 +853,32 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
   }
 
-  // 4) 发现:GetMembers(ONo 100) -> [1,2,4]
+  // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification> [1,2,4]
   auto r3 = cmd(3, 100,
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
   {
     oca::ocp1::Reader r(r3.paramData, r3.paramBytes);
-    BOOST_CHECK_EQUAL(r.u16(), 3u);
+    BOOST_CHECK_EQUAL(r.u16(), 3u);  // 3 members
+    // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion;只校验 ONo
     BOOST_CHECK_EQUAL(r.u32(), 1u);
+    r.u16();  // skip ClassID fieldCount
+    r.u16();
+    r.u16();
+    r.u16();  // skip 3 ClassID levels
+    r.u16();  // skip ClassVersion
     BOOST_CHECK_EQUAL(r.u32(), 2u);
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
     BOOST_CHECK_EQUAL(r.u32(), 4u);
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
   }
 
   // 5) 订阅:AddSubscription2(emitter=1, OperationalState)

@@ -67,10 +67,18 @@ ExecResult OcaBlock::GetMembers(ocp1::Writer& rsp, Session& sess) {
   if (!reg)
     return {Status::DeviceError, 0};
   auto objs = reg->objects_in_range(1, 99);  // 管理器成员
+  // Ocp1List<OcaObjectIdentification>,每个元素 = {ONo, ClassIdentification}
+  // ClassIdentification = {ClassID(fieldCount+levels), ClassVersion}
   rsp.u16(static_cast<uint16_t>(objs.size()));
-  for (auto* o : objs)
+  for (auto* o : objs) {
     rsp.u32(o->ono());
-  return {Status::OK, 1};  // 成员 ONo 列表 = 1 个参数
+    const auto& ci = o->class_id();
+    rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
+    for (auto lvl : ci.classID.levels)
+      rsp.u16(lvl);
+    rsp.u16(o->class_version());
+  }
+  return {Status::OK, 1};  // 成员 ObjectIdentification 列表 = 1 个参数
 }
 
 }  // namespace oca

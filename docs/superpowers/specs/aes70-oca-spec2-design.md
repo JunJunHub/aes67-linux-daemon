@@ -392,7 +392,27 @@ T1-T5 全部实现,T6 Step1-4(oca-probe 探测 + tcpdump 字节验证)完成。o
 2. SetEnabled(12):2018 工具探测发空体(paramBytes=0),计划原写法 `(void)req.u8()` 会 OOB 崩溃。改为 `if (req.remaining()>=1) (void)req.u8();` 空体安全。
 3. T4 NetMgr 三方法采用 fallthrough 而非三私有方法(三方法语义/返回结构与 GetNetworks 完全一致,fallthrough 更简洁)。
 
-**待办(T6 Step5,用户 Win 环境):** 真实 Aes70CompliancyTestTool 重跑 + tcpdump 抓包,预期 OCC Object Compliancy(test 5)从 Failed 转 Passed -> **4/5**;Minimum object compliancy(test 4)仍 Failed(缺 CM3 对象,Option A 接受)。
+### 阶段二真实控制器验收结果(2026-07-10,T6 Step5,Aes70CompliancyTestTool v2.0.1 AES70-2018,Win 172.16.1.211)
+
+**4/5 PASSED ✅(Spec1 2/5 → 阶段一 3/5 → 阶段二 4/5)。** OCC Object Compliancy(test5)从 Failed 转 **Passed**。
+
+| 测试 | 结果 | 说明 |
+|------|------|------|
+| OCA Service Discovery | Passed | GetMembers+GetManagers status 0 |
+| OCP.1 device reset | Passed | SetResetKey NotImplemented -> 跳过成功(G9) |
+| OCP.1 KeepAlive | Passed | 3000ms(2500-3500) |
+| Minimum object compliancy(test4) | **Failed** | 仅缺 CM3 对象 OcaBlock/OcaNetwork/OcaControlNetwork(Option A 接受) |
+| OCC Object Compliancy(test5) | **Passed** ✅ | 12 目标方法全 implements(result≠8) |
+
+test5 字节级核对(`captures/realtool-phase2-v2.pcap`,111 cmd/111 rsp,状态分布 OK=84/NotImpl=23/BadFormat=4):
+- DevMgr 10 强制方法 + OcaRoot Lock/Unlock 全 result=0(OK)。
+- SubMgr AddSubscription/RemoveSubscription/AddPropertyChangeSubscription/RemovePropertyChangeSubscription 空体探测返 **result=4(BadFormat)**(4≠8 -> implements 通过)。
+- SubMgr 事件 PropertyChanged(对象 1/4/6)/NotificationDisabled/SynchronizeState 全 result=0。
+- NetMgr GetNetworks/GetStreamNetworks/GetControlNetworks/GetMediaTransportNetworks 全 result=0。
+
+**★ 关键修复(transport 单命令异常处理,commit 5ca5a74):** 首次 T6 验收 test5 Failed,根因为 AddSubscription(ONo 4) result=13(Timeout) + 后续全 result=2。tcpdump 坐实:Win 工具 test5 方法存在性探测阶段对 SubMgr 发**空体 AddSubscription**(nrParams 字段填 0x64 但 paramBytes=0),EV1 AddSubscription 第一行 req.u32() 越界抛异常;transport.cpp 曾整个 PDU 一个 try/catch(阶段一 ac9e33a 防畸形 PDU 崩溃),单命令 exec 异常即 catch->break 断整条连接 -> 该命令 Timeout + 后续全 Failed to send。修复:per-command try/catch,仅包裹 obj->exec(),单命令参数越界/方法异常 -> 该命令返 {BadFormat,0},连接存活。协议正确(参数不符应返 BadFormat 非断连)。回归测试 `transport_empty_body_probe_keeps_connection` 守护。
+
+**test4 失败根因(Option A 接受范围):** 仅 "Missing mandatory object OcaBlock/OcaNetwork/OcaControlNetwork" - 2018 完整对象模型 vs 2023 Annex B 最小模型差异。CM3 网络对象 2023 弃用,Option A 不新增。5/5 需新增弃用对象,不在本阶段。oca-test 26/26 全绿。
 
 ### 已定稿(2026-07-10 用户确认)
 

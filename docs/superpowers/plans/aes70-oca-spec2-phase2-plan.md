@@ -417,15 +417,15 @@ make oca-test oca-probe && ./tests/oca-test -p
 - GetManufacturer/GetProduct 字段顺序正确。
 - 新方法 status=0(非 8)。
 
-- [ ] **Step 5: 真实控制器重跑(用户执行)**
+- [x] **Step 5: 真实控制器重跑(用户执行)**
 
 用户在 Win 跑 Aes70CompliancyTestTool,MITM 抓包。预期:**OCC Object Compliancy(test 5)从 Failed 转 Passed**(强制方法 result≠8 + EV1 订阅 OK + 事件订阅 OK)-> **4/5**。Minimum object compliancy(test 4)仍 Failed(缺 CM3 对象,Option A 接受)。记录通过项数与剩余失败根因。
 
-- [ ] **Step 6: 记录验证结果到设计文档 + 记忆**
+- [x] **Step 6: 记录验证结果到设计文档 + 记忆**
 
 更新 `aes70-oca-spec2-design.md` §C5(阶段二验证结果表);更新记忆 `aes70-oca-spec1.md`。
 
-- [ ] **Step 7: commit** `test(oca): Spec2 阶段二验证 - OCC Object Compliancy 转过(4/5)`
+- [x] **Step 7: commit** `test(oca): Spec2 阶段二验证 - OCC Object Compliancy 转过(4/5)`
 
 ---
 

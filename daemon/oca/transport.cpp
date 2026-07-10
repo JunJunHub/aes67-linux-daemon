@@ -204,8 +204,14 @@ void Transport::conn_loop(int fd, ONo session_id) {
           Object* obj = registry_->find(c.targetONo);
           ExecResult er{Status::BadONo, 0};
           if (obj) {
-            ocp1::Reader pr(c.paramData, c.paramBytes);
-            er = obj->exec(c.methodID, pr, params, sess);
+            // 单条命令的参数解析/方法执行异常(如控制器发空体探测致 Reader 越界)
+            // 不得逃逸致整条连接断开:捕获后对该命令返 BadFormat,连接存活。
+            try {
+              ocp1::Reader pr(c.paramData, c.paramBytes);
+              er = obj->exec(c.methodID, pr, params, sess);
+            } catch (const std::exception&) {
+              er = {Status::BadFormat, 0};
+            }
           }
           ocp1::write_response(rspAcc, c.handle, er.status, params.data(),
                                static_cast<uint32_t>(params.size()),

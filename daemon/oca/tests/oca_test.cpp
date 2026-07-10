@@ -1274,6 +1274,105 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   server.stop();
 }
 
+BOOST_AUTO_TEST_CASE(transport_empty_body_probe_keeps_connection) {
+  // 回归(阶段二真实控制器抓包坐实):2018 工具在 OCC Object Compliancy test5
+  // 方法存在性探测阶段,对 SubscriptionManager 发空体 AddSubscription(nrParams
+  // 字段填 0x64 但 paramBytes=0)。EV1 AddSubscription 第一行 req.u32() 越界抛
+  // 异常;transport 曾整个 PDU 一个 try/catch,单命令异常即 break 断连,致后续
+  // 所有命令 "Failed to send result=2"、AddSubscription 报 Timeout(13)。
+  // 修复:per-command try/catch,单命令异常返 BadFormat,连接存活。
+  oca::OcaServerConfig cfg;
+  cfg.port = 0;
+  cfg.node_id = "AES67 daemon probe";
+  cfg.daemon_version = "v1";
+  oca::OcaServer server(cfg);
+  BOOST_REQUIRE(server.start());
+  uint16_t port = server.port();
+
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  auto sendPdu = [&](const std::vector<uint8_t>& p) {
+    BOOST_REQUIRE_EQUAL(::send(sock, p.data(), p.size(), 0), (ssize_t)p.size());
+  };
+  auto recvPdu = [&](std::vector<uint8_t>& out) -> bool {
+    uint8_t sync;
+    if (::recv(sock, &sync, 1, 0) != 1 || sync != 0x3B)
+      return false;
+    uint8_t hdr[9];
+    size_t got = 0;
+    while (got < 9) {
+      ssize_t r = ::recv(sock, hdr + got, 9 - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    auto h = oca::ocp1::PduReader::try_parse_header(hdr, 9);
+    if (!h)
+      return false;
+    size_t plen = h->pduSize - 9;
+    out.assign(hdr, hdr + 9);
+    out.resize(9 + plen);
+    got = 0;
+    while (got < plen) {
+      ssize_t r = ::recv(sock, out.data() + 9 + got, plen - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    out.insert(out.begin(), 0x3B);
+    return true;
+  };
+
+  // KeepAlive 握手
+  sendPdu(oca::ocp1::PduWriter::build_keepalive_pdu(5));
+  std::vector<uint8_t> ka;
+  BOOST_REQUIRE(recvPdu(ka));
+
+  // 空体 AddSubscription(target=4, {3,1}, 无参数块) - 模拟工具探测
+  oca::ocp1::Writer cw;
+  oca::ocp1::write_command(
+      cw, 1, 4,
+      {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription},
+      nullptr, 0, 0);
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+
+  // 关键断言 1:必须收到响应(连接未断),status=BadFormat(4)(非 Timeout/断连)
+  std::vector<uint8_t> rsp;
+  BOOST_REQUIRE(recvPdu(rsp));
+  auto rh =
+      oca::ocp1::PduReader::try_parse_header(rsp.data() + 1, rsp.size() - 1);
+  auto rsps = oca::ocp1::PduReader::parse_responses(
+      rsp.data() + 1 + 9, rh->pduSize - 9, rh->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+  BOOST_CHECK(rsps[0].statusCode == oca::Status::BadFormat);
+
+  // 关键断言 2:连接存活 - 后续 GetOcaVersion 正常返回 OK
+  oca::ocp1::Writer cw2;
+  oca::ocp1::write_command(
+      cw2, 2, 1,
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion},
+      nullptr, 0, 0);
+  sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw2.data(), cw2.size()));
+  std::vector<uint8_t> rsp2;
+  BOOST_REQUIRE(recvPdu(rsp2));
+  auto rh2 =
+      oca::ocp1::PduReader::try_parse_header(rsp2.data() + 1, rsp2.size() - 1);
+  auto rsps2 = oca::ocp1::PduReader::parse_responses(
+      rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
+  BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
+  BOOST_CHECK(rsps2[0].statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(rsps2[0].paramBytes, 2u);
+
+  ::close(sock);
+  server.stop();
+}
+
 BOOST_AUTO_TEST_CASE(transport_rejects_oversized_pdu) {
   // 回归:畸形 pduSize(0xFFFFFFFF)不得触发超大 payload 分配致 daemon 崩溃。
   // 服务端应在分配前因 pduSize 越界关闭该连接,测试进程存活。

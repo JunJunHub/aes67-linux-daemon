@@ -426,14 +426,20 @@ int main(int argc, char** argv) {
       oca::ocp1::Reader pr(r.params.data(), r.params.size());
       uint16_t count = pr.u16();
       std::cout << OK() << "  [OK] 根块成员数 = " << count << OFF() << "\n";
-      std::cout << "        members: ";
+      // db371a2 起 GetMembers 返回 List<OcaObjectIdentification>,
+      // 每个元素 = ONo(u32) + ClassIdentification(fieldCount u16 + levels +
+      // ClassVersion u16)。逐元素解析,与 GetManagers/GetClassIdentification
+      // 交叉验证 ClassID。
       for (uint16_t i = 0; i < count; ++i) {
         uint32_t ono = pr.u32();
-        if (i)
-          std::cout << ", ";
-        std::cout << ono;
+        uint16_t fc = pr.u16();
+        std::vector<uint16_t> levels(fc);
+        for (uint16_t j = 0; j < fc; ++j)
+          levels[j] = pr.u16();
+        uint16_t ver = pr.u16();
+        std::cout << "        #" << i << " ONo=" << ono
+                  << " classID=" << classid_str(levels) << " v" << ver << "\n";
       }
-      std::cout << "\n";
     } else {
       std::cout << ERR()
                 << "  [FAIL] GetMembers status=" << status_name(r.status)

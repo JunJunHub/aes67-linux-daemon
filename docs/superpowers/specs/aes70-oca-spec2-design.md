@@ -369,6 +369,31 @@ EV1 AddSubscription 命令参数字节确认:`emitterONo u32=1 + EventID{defLeve
 
 **★ 协议事实(本次抓包坐实,影响实现):** Win 工具在 Root Lock/Unlock 等命令的 `nrParameters` 字段填 `0x64=100`(非真实参数个数 0)。查 OCAMicro `Ocp1LiteMessageCommand::Unmarshal` 确认:接收方用 `commandSize - 已读字节数` 推算 paramBytes,**完全忽略 nrParameters 字段**。daemon `parse_commands` 已是此实现(`paramBytes = commandSize - 17`,commit ef19171),能正确处理 nrParameters=100 的命令,**无需改动**。响应端仍写真实参数个数(ef19171 修正,继续有效)。
 
+### 阶段二实现与 oca-probe 验证结果(2026-07-10,SDD T1-T6 Step1-4)
+
+T1-T5 全部实现,T6 Step1-4(oca-probe 探测 + tcpdump 字节验证)完成。oca-test **25/25 全绿**;oca-probe e2e(对运行中 daemon,新二进制)**全部探测通过**。tcpdump 抓 oca-probe 流量(`captures/probe-t6.pcap`,260 帧)经 `oca-parse-pcap.py` 解析,**字节级核对全部符合 OCAMicro/sphinx**:
+
+| 方法 | 实现提交 | 响应字节验证(oca-probe 抓包) |
+|------|---------|---------------------------|
+| EV1 AddSubscription(1)/RemoveSubscription(2) | 82e66cd | OK + nrParams=0 + params=[](**0 参无 subID**,区别 EV2 mi=8 的 1 参+subID) |
+| EV1 AddPropertyChangeSubscription(5)/Remove(6) | 82e66cd | OK + 0 参(oca-test 验) |
+| EV2 AddPropertyChangeSubscription2(10)/Remove(11) | 82e66cd | OK + 0 参(sphinx:仅返 OcaStatus) |
+| OcaRoot Lock(3)/Unlock(4) | b55b814 | OK + 0 参(空体 no-op) |
+| DevMgr GetModelGUID(2) | 47246bc | OK + nrParams=1 + **8 字节全 0**(OcaModelGUID BlobFixedLen 无前缀) |
+| DevMgr GetEnabled(11) | 47246bc | OK + u8=1 |
+| DevMgr SetEnabled(12) | 47246bc | OK + 0 参(**空体安全**:2018 工具 nrParams=0x64 但 paramBytes=0,仅在 remaining≥1 时读取) |
+| DevMgr GetDeviceRevisionID(20) | 47246bc | OK + OcaString(model_version) |
+| NetMgr GetStreamNetworks(2)/GetControlNetworks(3)/GetMediaTransportNetworks(4) | 83e5258 | OK + u16(0) 空列表(各 2 字节) |
+| DevMgr GetManufacturer(21) | c4e7134 | OK + 29 字节 = Name(18B)+OrgID(3 零字节)+Website/BusinessContact/TechnicalContact(3 空串)。**计划勘误**:OcaManufacturer 实为 5 字段(sphinx 2024),非计划旧版 3 字段 |
+| DevMgr GetProduct(22) | c4e7134 | OK + 72 字节 = 6 OcaString(Name/ModelID/RevisionLevel/BrandName/UUID/Description) |
+
+**计划勘误汇总:**
+1. OcaManufacturer = 5 字段(Name+OrganizationID+Website+BusinessContact+TechnicalContact),非计划 §T5 旧版 3 字段。OcaOrganizationID = OcaBlobFixedLen<3> = 3 原始字节(Class Management Datatypes.rst 坐实)。实现写全 5 字段。
+2. SetEnabled(12):2018 工具探测发空体(paramBytes=0),计划原写法 `(void)req.u8()` 会 OOB 崩溃。改为 `if (req.remaining()>=1) (void)req.u8();` 空体安全。
+3. T4 NetMgr 三方法采用 fallthrough 而非三私有方法(三方法语义/返回结构与 GetNetworks 完全一致,fallthrough 更简洁)。
+
+**待办(T6 Step5,用户 Win 环境):** 真实 Aes70CompliancyTestTool 重跑 + tcpdump 抓包,预期 OCC Object Compliancy(test 5)从 Failed 转 Passed -> **4/5**;Minimum object compliancy(test 4)仍 Failed(缺 CM3 对象,Option A 接受)。
+
 ### 已定稿(2026-07-10 用户确认)
 
 1. **阶段一范围**:只做有硬证据项 G0/G1/G2/G9/G10,先把对象合规测试跑通;G3-G8(2023 新增方法)等文本源到位再做(决策 #7)。

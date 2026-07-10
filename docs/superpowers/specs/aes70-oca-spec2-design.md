@@ -290,7 +290,22 @@ Phase 0 分两步:(1) OCAMicro 源码(本地,2018 版)坐实 ClassID 类树与 2
 - MITM 字节级裁决(权威):GetManagers 与 GetMembers 均返回 `ONo=1{1,3,1}v2 / ONo=4{1,3,4}v2 / ONo=6{1,3,6}v2`;GetClassIdentification(target=1)返回 `{1,3,1} v2`;AddSubscription2 命令 `target=4 dl=3 mi=8 nr=3`->OK 返回 subscriptionID;旧索引 `target=4 mi=1`->**NotImplemented**(自测盲点消除)。
 - 附带修复 `e087df9`:oca-probe GetMembers 解析对齐 List<OcaObjectIdentification>(db371a2 改返回结构后 oca-probe 解析陈旧,T8 暴露)。
 
-**待用户执行(Step4):** 在 Win 重跑 Aes70CompliancyTestTool(MITM 抓包),确认对象合规测试从 Spec1 的 2/5 改善。预期:G0 修正后 DeviceManager 不再被误读为 OcaNetwork,G11 修正后订阅测试转通过。剩余失败应经 MITM 坐实为 G3/G4/G6/G7/G8(2023 方法缺失,归阶段二)。
+**真实控制器验证结果(2026-07-10 Step4,Aes70CompliancyTestTool v2.0.1 AES70-2018,Win 172.16.1.211,MITM 抓包 3 连接 236 PDU):3/5 通过(Spec1 2/5,进步 1 项)。**
+
+| 测试 | Spec1 | Spec2 | 关键 |
+|------|-------|-------|------|
+| OCA Service Discovery | ❌ | ✅ | GetMembers+GetManagers status 0(db371a2+ef19171) |
+| OCP.1 device reset | ❌ SetResetKey result 11 | ✅ | **G9 直接生效**:NotImplemented->工具"skip with success" |
+| OCP.1 KeepAlive | ✅ | ✅ | 3000ms 在区间内 |
+
+**字节级裁决(工具流量,全对齐):** GetClassIdentification ONo=1{1,3,1}v2 / ONo=4{1,3,4}v2 / ONo=6{1,3,6}v2(G0/G3/G10 PASS);GetMembers(100,mi=5) OK 3 members;GetState(mi=13)/GetManagers(mi=19) OK;未实现方法(mi=11/12/14/20)返回 NotImplemented 非 BadMethod(G9 PASS);旧 EV2 索引 mi=1 -> NotImpl(G11 自测盲点修复)。
+
+**剩余 2 项失败根因(MITM 坐实,均为阶段二范围,非阶段一遗漏):**
+1. **强制方法未实现**:DeviceManager GetModelGUID(2)/GetEnabled(11)/SetEnabled(12)/GetDeviceRevisionID(20);OcaRoot Lock(3)/Unlock(4);NetworkManager GetStreamNetworks(2)/GetControlNetworks(3)/GetMediaTransportNetworks(4)。均正确返回 NotImplemented(2018 工具对 mandatory 方法要求实现,非 skip)。
+2. **★★ 事件 PropertyChanged 订阅失败(新发现,原阶段二 G6/G7 计划未覆盖)**:MITM 显示 2018 工具用 **EV1 AddSubscription(mi=1,5 参数:emitter+EventID+subscriberONo+ctx+subctx)** 订阅 PropertyChanged,**非 EV2**(mi=8/10)。daemon 只实现 EV2(mi=8/9),EV1 订阅方法(mi=1/2)未实现->NotImpl。**阶段二须实现 EV1 AddSubscription/RemoveSubscription(mi=1/2)**,而非仅 EV2 PropertyChange 变体。
+3. Missing mandatory object OcaBlock/OcaNetwork/OcaControlNetwork(724-726):2018 工具"完整对象模型"要求;Block 实际在 ONo=100 已存在,工具可能按 ONo>=4096 遍历(2018 约定);CM3 网络类 2023 弃用,需权衡 2018 兼容。
+
+**阶段一目标达成**:G0/G1/G2/G9/G10/G11/G12 全部字节级验证生效,Service Discovery(核心)稳定通过。MITM 日志 /tmp/spec2-realcap-mitm.log,测试日志 /tmp/oca_test_log.txt(均 /tmp,重启失效,结论已固化本文)。
 
 **阶段二(补 2023 强制方法/事件,索引已坐实可立即实施):**
 

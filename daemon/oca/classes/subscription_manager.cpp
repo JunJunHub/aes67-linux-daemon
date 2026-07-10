@@ -37,33 +37,44 @@ ExecResult OcaSubscriptionManager::exec(MethodID m,
 ExecResult OcaSubscriptionManager::AddSubscription2(ocp1::Reader& req,
                                                     ocp1::Writer& rsp,
                                                     Session& sess) {
+  // sphinx 2024 §C.1: OcaEvent{EmitterONo + EventID}
+  //                    + NotificationDeliveryMode + NetworkAddress
   ONo emitter = req.u32();
   EventID eid{req.u16(), req.u16()};
-  OcaBlob ctx = req.blob();  // subscriberContext(未使用,仅消费)
+  (void)req.u8();    // NotificationDeliveryMode(Normal=1,同会话回送)
+  (void)req.blob();  // NetworkAddress(OcaBlob 编码,仅消费)
 
   uint32_t id = next_id_.fetch_add(1);
   {
     std::lock_guard<std::mutex> lk(mutex_);
     entries_.push_back({id, &sess, emitter, eid});
   }
-  sess.add_subscription({emitter, eid, std::move(ctx)});
-  rsp.u32(id);             // 返回 subscriptionID
-  return {Status::OK, 1};  // subscriptionID = 1 个参数
+  sess.add_subscription({emitter, eid});  // EV2 无 subscriberContext
+  rsp.u32(id);                            // 返回 subscriptionID
+  return {Status::OK, 1};                 // subscriptionID = 1 个参数
 }
 
 ExecResult OcaSubscriptionManager::RemoveSubscription2(ocp1::Reader& req,
                                                        ocp1::Writer& rsp,
                                                        Session& sess) {
-  uint32_t id = req.u32();
+  // sphinx 2024 §C.1: OcaEvent + NotificationDeliveryMode + NetworkAddress
+  // 语义 = 移除所有匹配 event 的订阅(非按 subscriptionID);幂等
+  ONo emitter = req.u32();
+  EventID eid{req.u16(), req.u16()};
+  (void)req.u8();    // NotificationDeliveryMode(仅消费)
+  (void)req.blob();  // NetworkAddress(仅消费)
+
   std::lock_guard<std::mutex> lk(mutex_);
-  for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-    if (it->id == id) {
-      sess.remove_subscription(it->emitterONo, it->eventID);
-      entries_.erase(it);
-      return {Status::OK, 0};  // 无返回参数
-    }
-  }
-  return {Status::BadONo, 0};  // 未知 subscriptionID
+  entries_.erase(std::remove_if(entries_.begin(), entries_.end(),
+                                [&](const Entry& e) {
+                                  return e.sess == &sess &&
+                                         e.emitterONo == emitter &&
+                                         e.eventID.defLevel == eid.defLevel &&
+                                         e.eventID.eventIndex == eid.eventIndex;
+                                }),
+                 entries_.end());
+  sess.remove_subscription(emitter, eid);
+  return {Status::OK, 0};  // 无返回参数(幂等:无匹配也 OK)
 }
 
 void OcaSubscriptionManager::trigger_event(ONo emitterONo,

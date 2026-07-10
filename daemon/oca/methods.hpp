@@ -50,11 +50,11 @@ constexpr uint16_t kBlockGetMembers           = 5;
 // OcaNetworkManager methods (DefLevel 3)
 constexpr uint16_t kNetGetNetworks            = 1;  // 候选,需 XMI 校验
 
-// OcaSubscriptionManager EV2 methods (DefLevel 3) - 候选值,需 XMI 校验
-constexpr uint16_t kSubAddSubscription2                = 1;  // 候选
-constexpr uint16_t kSubRemoveSubscription2             = 2;  // 候选
-constexpr uint16_t kSubAddPropertyChangeSubscription2  = 3;  // 候选
-constexpr uint16_t kSubRemovePropertyChangeSubscription2 = 4;  // 候选
+// OcaSubscriptionManager EV2 methods (DefLevel 3) - sphinx 2024 校验
+constexpr uint16_t kSubAddSubscription2                = 8;   // sphinx 2024 3.8
+constexpr uint16_t kSubRemoveSubscription2             = 9;   // 3.9
+constexpr uint16_t kSubAddPropertyChangeSubscription2  = 10;  // 3.10
+constexpr uint16_t kSubRemovePropertyChangeSubscription2 = 11; // 3.11
 
 // OcaRoot events (DefLevel 1)
 constexpr uint16_t kEventPropertyChanged = 1;

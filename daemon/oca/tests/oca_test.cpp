@@ -477,12 +477,15 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   oca::ObjectRegistry reg;
   sess.set_registry(&reg);
 
-  // 构造 AddSubscription2 请求:emitter=1, event={3,1}, ctx=空
+  // 构造 AddSubscription2 请求(sphinx 2024 §C.1):
+  //   OcaEvent{EmitterONo(u32) + EventID(u16,u16)}
+  //   + NotificationDeliveryMode(u8, Normal=1) + NetworkAddress(blob)
   oca::ocp1::Writer reqw;
   reqw.u32(1);  // EmitterONo
   reqw.u16(oca::methods::kDefLevelDeviceMngr);
   reqw.u16(oca::methods::kEventOperationalState);
-  reqw.u16(0);  // 空 subscriberContext
+  reqw.u8(1);   // NotificationDeliveryMode = Normal
+  reqw.u16(0);  // 空 NetworkAddress
   oca::ocp1::Reader req(reqw.data(), reqw.size());
 
   oca::ocp1::Writer rspw;
@@ -520,9 +523,15 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   BOOST_CHECK_EQUAL(ntfs[0].data[0], evdata);
   BOOST_CHECK(!sess.take_notification(pdu));  // 队列已空
 
-  // RemoveSubscription2
+  // RemoveSubscription2(sphinx 2024 §C.1):
+  //   OcaEvent + NotificationDeliveryMode + NetworkAddress
+  //   语义 = 移除所有匹配 event 的订阅(非按 subscriptionID)
   oca::ocp1::Writer reqw2;
-  reqw2.u32(subId);
+  reqw2.u32(1);  // EmitterONo
+  reqw2.u16(oca::methods::kDefLevelDeviceMngr);
+  reqw2.u16(oca::methods::kEventOperationalState);
+  reqw2.u8(1);   // NotificationDeliveryMode = Normal
+  reqw2.u16(0);  // 空 NetworkAddress
   oca::ocp1::Reader req2(reqw2.data(), reqw2.size());
   oca::ocp1::Writer rspw2;
   st = sm.exec(
@@ -533,6 +542,21 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   BOOST_CHECK(
       !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
                                  oca::methods::kEventOperationalState}));
+
+  // 自测盲点回归:错误索引(methodIndex=1,即 Spec1 旧 kSubAddSubscription2)
+  // 不应误命中 EV1 默认分支之外的任何方法,必须返回非 OK。
+  // 用 != OK 而非 == BadMethod,以兼容 Task 6 将默认分支改为 NotImplemented。
+  oca::ocp1::Writer badw;
+  badw.u32(1);
+  badw.u16(oca::methods::kDefLevelDeviceMngr);
+  badw.u16(oca::methods::kEventOperationalState);
+  badw.u8(1);
+  badw.u16(0);
+  oca::ocp1::Reader badreq(badw.data(), badw.size());
+  oca::ocp1::Writer badrsp;
+  auto badst =
+      sm.exec({oca::methods::kDefLevelSubMngr, 1}, badreq, badrsp, sess);
+  BOOST_CHECK(badst.status != oca::Status::OK);
 }
 
 BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
@@ -881,14 +905,16 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();
   }
 
-  // 5) 订阅:AddSubscription2(emitter=1, OperationalState)
-  //    命令参数:emitterONo(u32) + eventID(u16,u16) + subscriberContext(blob)
+  // 5) 订阅:AddSubscription2(emitter=1, OperationalState) (sphinx 2024 §C.1)
+  //    命令参数:OcaEvent{emitterONo(u32) + eventID(u16,u16)}
+  //            + NotificationDeliveryMode(u8, Normal=1) + NetworkAddress(blob)
   //    = 3 个参数
   oca::ocp1::Writer params;
   params.u32(1);  // EmitterONo
   params.u16(oca::methods::kDefLevelDeviceMngr);
   params.u16(oca::methods::kEventOperationalState);
-  params.u16(0);  // 空 context
+  params.u8(1);   // NotificationDeliveryMode = Normal
+  params.u16(0);  // 空 NetworkAddress
   oca::ocp1::Writer cw;
   oca::ocp1::write_command(
       cw, 5, 4,

@@ -32,6 +32,11 @@ ExecResult OcaRoot::handle_root(uint16_t idx, ocp1::Writer& rsp) {
     case methods::kRootGetRole:
       rsp.string(role());
       return {Status::OK, 1};
+    case methods::kRootLock:
+      // daemon 不可锁(GetLockable=0),Lock/Unlock 为 no-op;返回 OK
+      return {Status::OK, 0};
+    case methods::kRootUnlock:
+      return {Status::OK, 0};
     default:
       return {Status::NotImplemented, 0};
   }

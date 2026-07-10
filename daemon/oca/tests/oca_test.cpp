@@ -726,6 +726,37 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev1_ev2_propertychange) {
   BOOST_CHECK_EQUAL(st8.nrParameters, 1u);  // EV2 mi=8
 }
 
+BOOST_AUTO_TEST_CASE(dispatch_root_lock_unlock) {
+  // OcaRoot Lock(3)/Unlock(4):daemon 不可锁(GetLockable=0),no-op 返回 {OK,0}。
+  // 2018 工具对 DeviceManager(1)/SubscriptionManager(4)/NetworkManager(6)
+  // 均测。
+  oca::OcaDeviceIdentity id;
+  id.model_name = "dm";
+  oca::OcaDeviceManager dm(1, id);
+  oca::OcaSubscriptionManager sm(4);
+  oca::OcaNetworkManager nm(6);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  for (oca::Object* obj :
+       {static_cast<oca::Object*>(&dm), static_cast<oca::Object*>(&sm),
+        static_cast<oca::Object*>(&nm)}) {
+    oca::ocp1::Writer rsp;
+    auto st = obj->exec({oca::methods::kDefLevelRoot, oca::methods::kRootLock},
+                        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(st.nrParameters, 0);
+    BOOST_CHECK_EQUAL(rsp.size(), 0u);  // 无响应参数
+
+    oca::ocp1::Writer rsp2;
+    st = obj->exec({oca::methods::kDefLevelRoot, oca::methods::kRootUnlock},
+                   empty, rsp2, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(st.nrParameters, 0);
+    BOOST_CHECK_EQUAL(rsp2.size(), 0u);
+  }
+}
+
 BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
   // 构造对象树
   oca::OcaDeviceIdentity id;

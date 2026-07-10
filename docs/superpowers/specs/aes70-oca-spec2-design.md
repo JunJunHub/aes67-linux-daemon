@@ -307,17 +307,28 @@ Phase 0 分两步:(1) OCAMicro 源码(本地,2018 版)坐实 ClassID 类树与 2
 
 **阶段一目标达成**:G0/G1/G2/G9/G10/G11/G12 全部字节级验证生效,Service Discovery(核心)稳定通过。MITM 日志 /tmp/spec2-realcap-mitm.log,测试日志 /tmp/oca_test_log.txt(均 /tmp,重启失效,结论已固化本文)。
 
-**阶段二(补 2023 强制方法/事件,索引已坐实可立即实施):**
+**阶段二(补 2018 强制方法 + EV1/EV2 订阅 + 2023 GetProduct/GetManufacturer,Option A):**
 
-| 缺口 | 改动 | 索引/结构(已坐实) |
-|------|------|--------------------|
-| G3 | DeviceManager 补 GetProduct | 3.22,返回 OcaProduct{Name,ModelID,RevisionLevel,...} |
-| G4 | DeviceManager 补 GetManufacturer | 3.21,返回 OcaManufacturer{Name,OrganizationID} |
-| G6 | SubscriptionManager 补 AddPropertyChangeSubscription2 | 3.10 |
-| G7 | SubscriptionManager 补 RemovePropertyChangeSubscription2 | 3.11 |
-| G8 | 所有对象支持 event PropertyChanged | 订阅=3.10,Notification2 投递(Spec1 帧格式已实现) |
+> 修订(2026-07-10,阶段一真实控制器验证后):原阶段二表仅列 G3/G4/G6/G7/G8,经 §C5 MITM 实测坐实,2018 工具实际强制项远超此(EV1 订阅 mi=1/2/5/6、Root Lock/Unlock、DeviceManager GetModelGUID/GetEnabled/SetEnabled/GetDeviceRevisionID、NetworkManager 三方法)。下表为扩展后口径,实施计划见 `docs/superpowers/plans/aes70-oca-spec2-phase2-plan.md`。用户定 Option A:补方法 + EV1 订阅,目标 OCC Object Compliancy 转过(4/5),**不新增 CM3 弃用对象**。
 
-阶段二完成标志:达 AES70-2023 Annex B 完整最低合规。G5 已确认非缺口(3.5 已实现)。
+| 类别 | 方法(索引) | 来源 | 2018工具 | 2023 Annex B |
+|------|------------|------|---------|-------------|
+| EV1 订阅(新) | AddSubscription/RemoveSubscription(1/2) | OCAMicro | ✓Mandatory | deprecated |
+| EV1 订阅(新) | AddPropertyChangeSubscription/Remove(5/6) | OCAMicro | ✓Mandatory | deprecated |
+| G6 | AddPropertyChangeSubscription2(3.10) | sphinx | 工具用EV1 | ✓Mandatory |
+| G7 | RemovePropertyChangeSubscription2(3.11) | sphinx | 工具用EV1 | ✓Mandatory |
+| 新 | OcaRoot Lock/Unlock(1.3/1.4) | OCAMicro | ✓Mandatory | ✓Mandatory |
+| 新 | DeviceManager GetModelGUID/GetEnabled/SetEnabled/GetDeviceRevisionID(3.2/3.11/3.12/3.20) | OCAMicro+sphinx | ✓Mandatory | 部分deprecated |
+| G3 | DeviceManager GetProduct(3.22) | sphinx | 2018无 | ✓Mandatory |
+| G4 | DeviceManager GetManufacturer(3.21) | sphinx | 2018无 | ✓Mandatory |
+| 新 | NetworkManager GetStreamNetworks/GetControlNetworks/GetMediaTransportNetworks(3.2/3.3/3.4) | OCAMicro | ✓Mandatory | ✓Mandatory(返空) |
+| G8 | event PropertyChanged | - | EV1 订阅 OK 即过 | 实际投递顺延 |
+
+**★ 阶段二关键发现(§C5 MITM 坐实):** (1) 2018 工具用 **EV1 AddSubscription(mi=1)** 订阅 PropertyChanged(及 SubscriptionManager 的 NotificationDisabled/SynchronizeState),非 EV2;实现 EV1 mi=1/2/5/6 是事件测试通过的枢纽。(2) 通过判据:mandatory 方法 `result≠8` 即"implements";事件 Add*Subscription 返 OK 即"事件已实现"。(3) OCC Object Compliancy(test 5)无 missing-object 错误,补齐即转 4/5;Minimum object compliancy(test 4)缺 CM3 对象,Option A 接受失败。
+
+阶段二完成标志:OCC Object Compliancy 通过(4/5),达 2023 Annex B 订阅 + 强制方法最低合规(除 CM3 对象 + Worker defLevel 2 顺延)。G5 已确认非缺口(3.5 已实现)。
+
+**不在阶段二范围:** CM3 网络对象(2023 弃用,Option A 不新增);Minimum object compliancy 5/5;OcaWorker defLevel 2(GetEnabled/SetEnabled/GetPorts,工具未测);PropertyChanged 实际通知投递(bonus)。均顺延 Spec3。
 
 ### 已定稿(2026-07-10 用户确认)
 

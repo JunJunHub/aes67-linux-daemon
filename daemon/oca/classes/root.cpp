@@ -33,7 +33,7 @@ ExecResult OcaRoot::handle_root(uint16_t idx, ocp1::Writer& rsp) {
       rsp.string(role());
       return {Status::OK, 1};
     default:
-      return {Status::BadMethod, 0};
+      return {Status::NotImplemented, 0};
   }
 }
 
@@ -56,7 +56,7 @@ ExecResult OcaBlock::exec(MethodID m,
       case methods::kBlockGetMembers:
         return GetMembers(rsp, sess);
       default:
-        return {Status::BadMethod, 0};
+        return {Status::NotImplemented, 0};
     }
   }
   return OcaWorker::exec(m, req, rsp, sess);  // 委托 DefLevel 1 -> OcaRoot

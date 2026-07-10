@@ -36,7 +36,7 @@ ExecResult OcaDeviceManager::exec(MethodID m,
       case methods::kDevGetManagers:
         return GetManagers(rsp, sess);
       default:
-        return {Status::BadMethod, 0};
+        return {Status::NotImplemented, 0};
     }
   }
   return OcaManager::exec(m, req, rsp, sess);  // DefLevel 1 -> OcaRoot

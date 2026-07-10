@@ -360,10 +360,10 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
     BOOST_CHECK_EQUAL(r2.u16(), 1u);  // ClassVersion = 1 (StubObject)
   }
 
-  // 未知方法 -> BadMethod
+  // 未知方法 -> NotImplemented
   oca::ocp1::Writer rsp3;
   st = root.exec({oca::methods::kDefLevelBlock, 99}, empty, rsp3, sess);
-  BOOST_CHECK(st.status == oca::Status::BadMethod);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
 
   // 未知 defLevel -> BadMethod
   oca::ocp1::Writer rsp4;
@@ -450,9 +450,9 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
     BOOST_CHECK_EQUAL(r.u16(), 2u);  // classVersion
   }
 
-  // 未实现方法 -> BadMethod
+  // 未实现方法 -> NotImplemented
   auto [st6, b6] = call(oca::methods::kDevSetDeviceName);
-  BOOST_CHECK(st6.status == oca::Status::BadMethod);
+  BOOST_CHECK(st6.status == oca::Status::NotImplemented);
 }
 
 BOOST_AUTO_TEST_CASE(dispatch_network_manager) {

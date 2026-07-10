@@ -28,7 +28,8 @@ ExecResult OcaSubscriptionManager::exec(MethodID m,
       case methods::kSubRemoveSubscription2:
         return RemoveSubscription2(req, rsp, sess);
       default:
-        return {Status::BadMethod, 0};  // PropertyChange 变体 Spec1 不实现
+        return {Status::NotImplemented,
+                0};  // PropertyChange 变体/未实现方法 -> NotImplemented
     }
   }
   return OcaManager::exec(m, req, rsp, sess);

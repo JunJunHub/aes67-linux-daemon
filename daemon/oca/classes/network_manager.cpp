@@ -24,7 +24,7 @@ ExecResult OcaNetworkManager::exec(MethodID m,
         rsp.u16(0);              // 空 Ocp1List<ONo>(Spec1 无网络对象)
         return {Status::OK, 1};  // 网络列表 = 1 个参数
       default:
-        return {Status::BadMethod, 0};
+        return {Status::NotImplemented, 0};
     }
   }
   return OcaManager::exec(m, req, rsp, sess);  // DefLevel 1 -> OcaRoot

@@ -432,10 +432,10 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
     BOOST_CHECK_EQUAL(r.u32(), 1u);                  // first manager ONo
     BOOST_CHECK_EQUAL(r.string(), "DeviceManager");  // Name = Role
     uint16_t levels = r.u16();                       // ClassID level count
-    BOOST_CHECK_EQUAL(levels, 3u);                   // {1,2,1}
+    BOOST_CHECK_EQUAL(levels, 3u);                   // {1,3,1}
     r.u16();
     r.u16();
-    r.u16();                         // skip 1,2,1
+    r.u16();                         // skip 1,3,1
     BOOST_CHECK_EQUAL(r.u16(), 4u);  // classVersion
   }
 
@@ -457,7 +457,7 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   oca::ocp1::Reader r(rsp.data(), rsp.size());
   BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空网络列表
 
-  // GetClassIdentification(继承自 Root) -> {1,2,3} v3
+  // GetClassIdentification(继承自 Root) -> {1,3,6} v3
   oca::ocp1::Writer rsp2;
   st = nm.exec(
       {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
@@ -466,8 +466,8 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
   BOOST_CHECK_EQUAL(r2.u16(), 3u);
   BOOST_CHECK_EQUAL(r2.u16(), 1u);
-  BOOST_CHECK_EQUAL(r2.u16(), 2u);
   BOOST_CHECK_EQUAL(r2.u16(), 3u);
+  BOOST_CHECK_EQUAL(r2.u16(), 6u);
   BOOST_CHECK_EQUAL(r2.u16(), 3u);  // classVersion
 }
 
@@ -728,25 +728,25 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
   oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // 3 members
-  // ONo=1 DeviceManager {1,2,1} v4
+  // ONo=1 DeviceManager {1,3,1} v4
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 4u);  // ClassVersion
-  // ONo=2 NetworkManager {1,2,3} v3
+  // ONo=2 NetworkManager {1,3,6} v3
   BOOST_CHECK_EQUAL(pr2.u32(), 2u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 6u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
-  // ONo=4 SubscriptionManager {1,2,4} v2
+  // ONo=4 SubscriptionManager {1,3,4} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 4u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 4u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);
 

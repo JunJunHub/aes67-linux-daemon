@@ -7,7 +7,7 @@
 namespace oca {
 
 namespace {
-const ClassIdentification kNetworkManagerClassId = {{{1, 2, 3}}, 3};
+const ClassIdentification kNetworkManagerClassId = {{{1, 3, 6}}, 3};
 }  // namespace
 
 const ClassIdentification& OcaNetworkManager::class_id() const {

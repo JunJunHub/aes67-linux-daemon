@@ -8,7 +8,7 @@
 namespace oca {
 
 namespace {
-const ClassIdentification kDeviceManagerClassId = {{{1, 2, 1}}, 4};
+const ClassIdentification kDeviceManagerClassId = {{{1, 3, 1}}, 4};
 }  // namespace
 
 const ClassIdentification& OcaDeviceManager::class_id() const {

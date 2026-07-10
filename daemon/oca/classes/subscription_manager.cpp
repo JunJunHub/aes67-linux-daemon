@@ -10,7 +10,7 @@
 namespace oca {
 
 namespace {
-const ClassIdentification kSubscriptionManagerClassId = {{{1, 2, 4}}, 2};
+const ClassIdentification kSubscriptionManagerClassId = {{{1, 3, 4}}, 2};
 }  // namespace
 
 const ClassIdentification& OcaSubscriptionManager::class_id() const {

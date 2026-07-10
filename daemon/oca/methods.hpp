@@ -19,12 +19,12 @@ constexpr uint8_t kPduKeepAlive  = 4;  // Ocp1KeepAlive
 constexpr uint8_t kPduNtf2       = 5;  // Ocp1Notification2 (EV2)
 
 // Definition levels (ClassID 深度)
-constexpr uint16_t kDefLevelRoot       = 1;  // OcaRoot {1,1}
-constexpr uint16_t kDefLevelManager    = 2;  // OcaManager {1,2} / OcaWorker {1,1,1}
-constexpr uint16_t kDefLevelDeviceMngr = 3;  // OcaDeviceManager {1,2,1}
+constexpr uint16_t kDefLevelRoot       = 1;  // OcaRoot {1}
+constexpr uint16_t kDefLevelManager    = 2;  // OcaManager {1,3} / OcaWorker {1,1}
+constexpr uint16_t kDefLevelDeviceMngr = 3;  // OcaDeviceManager {1,3,1}
 constexpr uint16_t kDefLevelBlock      = 3;  // OcaBlock {1,1,3}
-constexpr uint16_t kDefLevelNetworkMngr = 3; // OcaNetworkManager {1,2,3}
-constexpr uint16_t kDefLevelSubMngr    = 3;  // OcaSubscriptionManager {1,2,4}
+constexpr uint16_t kDefLevelNetworkMngr = 3; // OcaNetworkManager {1,3,6}
+constexpr uint16_t kDefLevelSubMngr    = 3;  // OcaSubscriptionManager {1,3,4}
 
 // OcaRoot methods (DefLevel 1) - ocac 核对
 constexpr uint16_t kRootGetClassIdentification = 1;

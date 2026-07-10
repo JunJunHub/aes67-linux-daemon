@@ -159,16 +159,18 @@ Root      = {1}
 | # | 缺口 | 类别 | 依据 | 风险 |
 |---|------|------|------|------|
 | **G0** | **三个 Manager ClassID 标到 Agent 子树**({1,2,x}->应为 {1,3,x}) | ClassID 错误 | A.1.1 | **极高:对象合规测试首要根因** |
+| **G11** | **EV2 订阅方法索引全错**({1,2,3,4}->应为 {8,9,10,11}) | 方法索引错误 | C.1/§C | **高:Spec1 第三个被自测掩盖的协议 bug** |
 | G1 | ONo 2 错放 NetworkManager(应为 SecurityManager) | ONo↔ClassID 错配 | A.2 Table 3 | 高(次于 G0) |
 | G2 | NetworkManager 应迁 ONo 6(若保留)或删除 | ONo 分配 | A.2 | 中 |
-| G3 | DeviceManager 缺 GetProduct | 强制方法(2023) | A.3/A.5 | 高,但 OCAMicro(2018)无此方法,索引无文本源 |
-| G4 | DeviceManager 缺 GetManufacturer | 强制方法(2023) | A.3/A.5 | 高,同上 |
-| G5 | Root Block 缺 GetControlObjects | 强制方法(2023) | A.3/A.6 | 高,OCAMicro(2018)无此方法,索引无文本源 |
-| G6 | SubscriptionManager 缺 AddPropertyChangeSubscription2 | 强制方法(EV2) | A.3 | 中,OCAMicro(2018)仅 EV1,索引无文本源 |
-| G7 | SubscriptionManager 缺 RemovePropertyChangeSubscription2 | 强制方法(EV2) | A.3 | 中,同上 |
+| G3 | DeviceManager 缺 GetProduct(3.22) | 强制方法(2023) | C.1 | 高,sphinx 2024 已坐实索引/结构 |
+| G4 | DeviceManager 缺 GetManufacturer(3.21) | 强制方法(2023) | C.1 | 高,已坐实 |
+| G5 | Root Block 缺 GetControlObjects | ~~强制方法~~ | C.1 | **降级:已实现(3.5,GetMembers 改名链),非缺口** |
+| G6 | SubscriptionManager 缺 AddPropertyChangeSubscription2(3.10) | 强制方法(EV2) | C.1 | 中,已坐实 |
+| G7 | SubscriptionManager 缺 RemovePropertyChangeSubscription2(3.11) | 强制方法(EV2) | C.1 | 中,已坐实 |
 | G8 | 所有对象缺 event PropertyChanged | 强制事件 | A.3 | 中:基集要求 |
 | G9 | 非强制方法返回 BadMethod 而非 NotImplemented | 方法语义 | B.3.0/决策4 | 低:细节合规 |
-| G10 | 类版本号(DeviceManager=4/NetworkManager=3)未经 2023 校验 | 类版本 | A.1.1 | 待查:OCAMicro(2018)均为 2,2023 值需 AES70-2A |
+| G10 | 类版本号(DeviceManager=4/NetworkManager=3)-> 暂用 2018 值 2 | 类版本 | A.1.1/决策9 | 低:用户已定暂用 2 |
+| G12 | GetState(3.13,deprecated)应迁移到 GetOperationalState(3.23) | deprecated 方法 | C.1 | 中:2018 工具可能探测 |
 
 **不在 Spec2 范围**(确认弃用或属 Spec3):
 - OcaControlNetwork/ApplicationNetwork/MediaTransportNetwork(CM3 弃用,A.4)
@@ -178,26 +180,68 @@ Root      = {1}
 
 ---
 
-## §C Phase 0 坐实状态(2026-07-10 更新)
+## §C Phase 0 坐实状态(2026-07-10,sphinx 2024 考证后定稿)
 
-Phase 0 已用 OCAMicro 源码考证。**关键限制:本地 OCAMicro(`oca-tools-probe`)是 2018 版**--2023 新增方法(GetProduct/GetManufacturer/GetControlObjects/EV2 四方法)在其源码中**不存在**,无法从 OCAMicro 坐实这些方法的方法索引/签名。逐项状态:
+Phase 0 分两步:(1) OCAMicro 源码(本地,2018 版)坐实 ClassID 类树与 2018 方法;(2) 联网克隆 OCAAlliance/AES70-OCC-sphinx(2024 版,RST 含明确方法 id ``LL.N``),坐实 2023/2024 新增方法索引。**sphinx 2024 是目前最权威的方法索引文本源**(RST 明文标注 method id,优于 PDF 正文)。
 
-| # | 开放问题 | 状态 | 证据/出路 |
-|---|---------|------|----------|
-| C1 | GetProduct/GetManufacturer 方法索引与签名 | ✗ OCAMicro 无此方法 | 2018 OCAMicro 仅有 GetModelDescription(index=6,返回 {manufacturer,name,version})。2023 方法索引无文本源(AES70-2A/XMI)。出路:获 AES70-2-2023 XMI,或 MITM 抓 2023 控制器 |
-| C2 | GetControlObjects 方法索引与返回结构 | ✗ OCAMicro 无此方法 | 2018 OCAMicro Block 仅有 GetMembers(index=5)、GetMembersRecursive(index=6)。GetControlObjects 全局搜索 0 命中,疑为 2023 新增。出路同 C1 |
-| C3 | AddPropertyChangeSubscription2 / Remove 索引 | ✗ OCAMicro 仅 EV1 | 2018 OCAMicro SubscriptionManager 是 EV1:AddSubscription=1、RemoveSubscription=2、AddPropertyChangeSubscription=5、RemovePropertyChangeSubscription=6。EV2 四方法不存在。Spec1 methods.hpp 的 EV2 候选索引仍需 AES70-2A XMI 校验 |
-| C4 | 类版本号(DeviceManager=4/NetworkManager=3) | ⚠ 部分 | OCAMicro(2018)四类均为 2。Spec1 SubscriptionManager/Block=2 与之一致;DeviceManager=4/NetworkManager=3 偏高(疑反映更晚 spec)。2023 当前版本需 AES70-2A |
-| C5 | 2018 工具实际拒了什么 | ⏳ 待重跑 | 需重跑官方工具 + MITM 抓包。现强烈怀疑首要拒因是 **G0 ClassID 错误**(DeviceManager 自报 {1,2,1}=OcaNetwork),而非 G1 ONo |
-| C6 | PropertyChanged 事件投递路径 | ⏳ 待设计 | EV2 机制已确认(AES70-3 §9.4,Spec1 已用)。PropertyChange 订阅编码待 C3 坐实后设计 |
+### C.1 OCAMicro(2018)+ sphinx(2024)坐实结果
+
+**类树 ClassID(OCAMicro 编译期常量,见 §A.1.1):** 1.2=Agent、1.3=Manager、1.1=Worker。三 Manager 须 {1,2,x}->{1,3,x}。
+
+**OcaRoot 方法索引(sphinx 2024,与我们 methods.hpp 一致 ✓):** GetClassIdentification=1.1、GetLockable=1.2、SetLockNoReadWrite=1.3、Unlock=1.4、GetRole=1.5、SetLockNoWrite=1.6、GetLockState=1.7。event PropertyChanged 存在(1.e)。
+
+**OcaDeviceManager 方法索引(sphinx 2024):**
+
+| 方法 | 索引 | 返回 | Spec1 现状 |
+|------|------|------|-----------|
+| GetModelDescription | 3.6 | OcaModelDescription{mfr,name,ver} | ✓ 但 v3 **deprecated** |
+| GetState | 3.13 | OcaDeviceState | ✓ 但 v3 **deprecated** |
+| GetManagers | 3.19 | List<ManagerDescriptor> | ✓ |
+| **GetManufacturer** | **3.21** | OcaManufacturer{Name,OrganizationID} | ✗ 缺(G3) |
+| **GetProduct** | **3.22** | OcaProduct{Name,ModelID,RevisionLevel,...} | ✗ 缺(G4) |
+| **GetOperationalState** | **3.23** | OcaDeviceOperationalState | ✗ 我们用 deprecated 的 GetState(3.13)顶替 |
+| SetResetKey | 3.14 | - | ✗ 缺(device reset,2018 工具测过) |
+
+**OcaBlock 方法索引(sphinx 2024):** 关键发现--`GetMembers`(2018,OCAMicro,3.5)-> `GetControlObjects`(2023,PDF)-> `GetActionObjects`(2024,sphinx,3.5)**是同一索引 3.5 的三次改名**,返回均为 `List<OcaObjectIdentification>`。sphinx 原文:"GetActionObjects... Previously named GetMembers."。
+
+| 方法 | 索引 | Spec1 现状 |
+|------|------|-----------|
+| GetMembers/GetControlObjects/GetActionObjects | 3.5 | ✓ **已实现**(Spec1 db371a2,索引+返回结构均对) |
+| GetMembersRecursive/GetActionObjectsRecursive | 3.6 | 返回 BadMethod(spec-allowed) |
+
+**★ G5 降级:Root Block 并不缺方法**--我们已实现索引 3.5(名 GetMembers),对 2018(GetMembers)/2023(GetControlObjects)/2024(GetActionObjects)工具均应识别(索引同)。G5 从"高优先缺口"降为"已实现"。
+
+**OcaSubscriptionManager EV2 方法索引(sphinx 2024):**
+
+| 方法 | sphinx 2024 索引 | Spec1 methods.hpp 候选值 | 判定 |
+|------|-----------------|------------------------|------|
+| AddSubscription2 | **3.8** | kSubAddSubscription2=1 | **❌ 错(应 8)** |
+| RemoveSubscription2 | **3.9** | kSubRemoveSubscription2=2 | **❌ 错(应 9)** |
+| AddPropertyChangeSubscription2 | **3.10** | kSubAddPropertyChangeSubscription2=3 | **❌ 错(应 10)** |
+| RemovePropertyChangeSubscription2 | **3.11** | kSubRemovePropertyChangeSubscription2=4 | **❌ 错(应 11)** |
+
+**★ 新增缺口 G11:Spec1 EV2 订阅方法索引全错。** 我们用 {1,2,3,4}(疑似误抄 EV1 的 3.1-3.4 或自造),正确为 {8,9,10,11}。AddSubscription2 入参(sphinx 2024):`OcaEvent{EmitterONo,EventID}, NotificationDeliveryMode, NetworkAddress`(比 EV1 少了 Subscriber/Context)。**Spec1 验证"AddSubscription2 通过真实控制器"的结论存疑**--oca-probe 与 daemon 共用错误常量自洽通过(自测盲点),真实控制器(2018)若调 EV2 AddSubscription2 用 methodIndex=8 会落入 default->BadMethod;真实控制器 5 项测试 3 项失败,订阅很可能是其中之一。这是 Spec1 第三个被自测掩盖的协议 bug(继 NrParameters、GetMembers 之后),归入 Spec2 阶段一(G11)。
+
+### C.2 开放问题状态
+
+| # | 问题 | 状态 | 结论 |
+|---|------|------|------|
+| C1 | GetProduct/GetManufacturer 索引+结构 | ✅ 坐实 | GetManufacturer=3.21{Name,OrgID}、GetProduct=3.22{Name,ModelID,RevisionLevel,...}(sphinx 2024) |
+| C2 | GetControlObjects 索引+结构 | ✅ 坐实 | =GetMembers=3.5,已实现。G5 降级 |
+| C3 | EV2 四方法索引 | ✅ 坐实 | AddSub2=3.8、RemoveSub2=3.9、AddPropChgSub2=3.10、RemovePropChgSub2=3.11。Spec1 全错,新增 G11 |
+| C4 | 类版本号 | ⚠ 部分 | OCAMicro(2018)四类均 2;用户定暂用 2018 值(决策 #9) |
+| C5 | 2018 工具实际拒了什么 | ⏳ 待重跑 | 首要嫌疑仍是 G0(ClassID);G11(EV2 索引)是新增嫌疑 |
+| C6 | PropertyChanged 事件投递 | ⏳ 待设计 | EV2 帧格式已确认;PropertyChange 订阅=3.10,投递路径阶段二设计 |
 
 **Phase 0 已坐实的硬结论(可直接用于实施):**
-- ✅ ClassID 类树结构(A.1.1):1.2=Agent、1.3=Manager。三 Manager ClassID 必须从 {1,2,x} 改 {1,3,x}。
-- ✅ GetMembers 索引=5、返回 `List<ObjectIdentification{ONo,ClassID,ClassVersion}>`(Spec1 db371a2 已正确)。
-- ✅ EV2 是 2023 现行机制(AES70-3 §9.4),Spec1 方向正确。
+- ✅ ClassID 类树(A.1.1):1.2=Agent、1.3=Manager。三 Manager {1,2,x}->{1,3,x}。
+- ✅ OcaRoot 方法索引与我们一致(1.1-1.7)。
+- ✅ DeviceManager:GetManufacturer=3.21、GetProduct=3.22、GetOperationalState=3.23(GetState=3.13 deprecated,应迁移)。
+- ✅ Block:GetMembers/GetControlObjects/GetActionObjects=3.5,已实现,G5 降级。
+- ✅ EV2 订阅:3.8/3.9/3.10/3.11。Spec1 用 1/2/3/4 全错 -> G11。
 - ✅ EV2 Notification2 帧格式(AES70-3 §9.4.4),Spec1 已实现。
 
-**Phase 0 暴露的考证能力边界:** 2023 新增方法(G3-G7)的方法索引在 OCAMicro(2018)和 PDF 正文均无文本源,只在 AES70-2A 注册表/Annex A XMI 中。当前无该文本源,这构成"2023 Annex B 完整合规"的客观障碍。
+**sphinx 2024 仓库:** 已克隆至 `/tmp/AES70-OCC-sphinx`(OCAAlliance/AES70-OCC-sphinx,最新提交 "Update OCC to 2024")。关键 RST:`source/Control Classes/{OcaDeviceManager,OcaBlock,OcaSubscriptionManager,OcaRoot}.rst`。**考证能力边界已突破**--2023/2024 方法索引均有文本源,阶段二不再阻塞。
 
 ---
 
@@ -205,38 +249,38 @@ Phase 0 已用 OCAMicro 源码考证。**关键限制:本地 OCAMicro(`oca-tools
 
 > **修订背景:** Phase 0 揭示两件事,需对原定稿(决策 #5/#6)做调整:(1) Spec1 失败首要根因是 **G0 ClassID 错误**(原误判为 G1 ONo);(2) 本地 OCAMicro 是 2018 版,2023 新增方法(G3-G7)无文本源坐实,与"2023 Annex B 完整合规"目标存在客观障碍。下列 §D 反映修订,口径调整点待用户确认(见末尾"待用户确认")。
 
-### 合规基准:以 AES70-2023 Annex B 为权威(原则保留,实施分层)
+### 合规基准:以 AES70-2023 Annex B 为权威(sphinx 2024 作方法索引文本源)
 
-- 长期目标仍是对齐 AES70-2023 Annex B。
-- **但 2023 新增方法(G3-G7)的方法索引当前无文本源**,需先获 AES70-2-2023 XMI 或 MITM 抓 2023 控制器才能正确实现。在此之前,先闭环**有硬证据的项**(G0/G1/G2/G9/G10)。
-- 2018 官方工具作为可用验证手段;G0 修正后预期对象合规测试大幅改善(因 DeviceManager 不再自报为 OcaNetwork)。
+- 长期目标对齐 AES70-2023 Annex B;sphinx 2024 RST(明文 method id)为方法索引权威文本源,Phase 0 已坐实全部所需索引。
+- 2018 官方工具作为可用验证手段;G0+G11 修正后预期对象合规测试大幅改善。
 
-### 范围边界:分两阶段(修订)
+### 范围边界:分两阶段(sphinx 2024 坐实后修订)
 
-**阶段一(有硬证据的项,先过对象合规测试):**
+**阶段一(修 Spec1 协议 bug + 有硬证据的项,先过对象合规测试):**
 
 | 缺口 | 改动 | 证据 | 验证 |
 |------|------|------|------|
 | **G0** | **三 Manager ClassID {1,2,x}->{1,3,x}**(DeviceManager->{1,3,1}、SubscriptionManager->{1,3,4}、NetworkManager->{1,3,6});methods.hpp DefLevel 注释更正 | A.1.1 OCAMicro 编译期常量 | oca-test + MITM + 2018 工具 |
+| **G11** | **EV2 订阅方法索引 {1,2,3,4}->{8,9,10,11}**(methods.hpp kSub* 常量);AddSubscription2 入参对齐 sphinx 2024(OcaEvent+DeliveryMode+NetworkAddress,去 Subscriber/Context) | C.1 sphinx 2024 | oca-test + oca-probe + 2018 工具 |
 | G1 | ONo 2 错配修正:NetworkManager 迁出 ONo 2(迁 ONo 6 或删除) | A.2 Table 3 | MITM + 2018 工具 |
 | G2 | 与 G1 一并处理 | A.2 | 同上 |
 | G9 | 非强制方法返回 NotImplemented(而非 BadMethod) | B.3.0 | oca-test 单测 |
-| G10 | 类版本号:DeviceManager/NetworkManager 降到与证据一致(暂用 OCAMicro 2018 值 2,或保留待 2A 确认) | A.1.1 | oca-test |
+| G10 | 类版本号:DeviceManager/NetworkManager 降到 2(暂用 OCAMicro 2018 值) | A.1.1/决策9 | oca-test |
+| G12 | GetState(3.13 deprecated)-> GetOperationalState(3.23) | C.1 | oca-test |
 
-阶段一完成标志:G0/G1/G2/G9/G10 闭环,官方工具对象合规测试通过(或经 MITM 坐实剩余失败为 2023 方法缺失/2018 工具局限)。
+阶段一完成标志:G0/G11/G1/G2/G9/G10/G12 闭环,官方工具对象合规测试通过(或经 MITM 坐实剩余失败为 2023 方法缺失 G3/G4/G6/G7/G8)。
 
-**阶段二(2023 新增方法,需先补文本源):**
+**阶段二(补 2023 强制方法/事件,索引已坐实可立即实施):**
 
-| 缺口 | 改动 | 前置条件 |
-|------|------|----------|
-| G3 | DeviceManager 补 GetProduct | 获 AES70-2-2023 XMI 或抓 2023 控制器定索引/签名 |
-| G4 | DeviceManager 补 GetManufacturer | 同上 |
-| G5 | Root Block 补 GetControlObjects | 同上 |
-| G6 | SubscriptionManager 补 AddPropertyChangeSubscription2 | 获 EV2 方法索引(2A XMI) |
-| G7 | SubscriptionManager 补 RemovePropertyChangeSubscription2 | 同上 |
-| G8 | 所有对象支持 event PropertyChanged | C3 坐实后设计投递路径 |
+| 缺口 | 改动 | 索引/结构(已坐实) |
+|------|------|--------------------|
+| G3 | DeviceManager 补 GetProduct | 3.22,返回 OcaProduct{Name,ModelID,RevisionLevel,...} |
+| G4 | DeviceManager 补 GetManufacturer | 3.21,返回 OcaManufacturer{Name,OrganizationID} |
+| G6 | SubscriptionManager 补 AddPropertyChangeSubscription2 | 3.10 |
+| G7 | SubscriptionManager 补 RemovePropertyChangeSubscription2 | 3.11 |
+| G8 | 所有对象支持 event PropertyChanged | 订阅=3.10,Notification2 投递(Spec1 帧格式已实现) |
 
-阶段二完成标志:达 AES70-2023 Annex B 完整最低合规(需 2023 文本源到位)。
+阶段二完成标志:达 AES70-2023 Annex B 完整最低合规。G5 已确认非缺口(3.5 已实现)。
 
 ### 已定稿(2026-07-10 用户确认)
 

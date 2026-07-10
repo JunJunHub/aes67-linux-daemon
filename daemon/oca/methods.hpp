@@ -50,6 +50,8 @@ constexpr uint16_t kDevGetState =
     13;  // deprecated (v3), 被 GetOperationalState 取代
 constexpr uint16_t kDevGetOperationalState = 23;  // sphinx 2024
 constexpr uint16_t kDevGetManagers = 19;
+constexpr uint16_t kDevGetManufacturer = 21;  // sphinx 3.21,2023 Mandatory G4
+constexpr uint16_t kDevGetProduct = 22;       // sphinx 3.22,2023 Mandatory G3
 
 // OcaBlock methods (DefLevel 3) - ocac 核对
 constexpr uint16_t kBlockGetMembers = 5;

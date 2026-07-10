@@ -508,6 +508,54 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager_2018_methods) {
                     "bondagit-3.1.0");
 }
 
+BOOST_AUTO_TEST_CASE(dispatch_device_manager_2023_methods) {
+  // DeviceManager 2023 Mandatory 方法:GetManufacturer(3.21)/GetProduct(3.22)。
+  // 2018 工具不测(2023 新增),实现达 2023 Annex B 合规(G3/G4)。
+  oca::OcaDeviceIdentity id;
+  id.manufacturer = "Acme";
+  id.model_name = "AES67-daemon";
+  id.model_version = "bondagit-3.1.0";
+  oca::OcaDeviceManager dm(1, id);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // GetManufacturer(21) -> OcaManufacturer:
+  //   Name(str) + OrganizationID(3 raw bytes) + Website(str)
+  //   + BusinessContact(str) + TechnicalContact(str)
+  oca::ocp1::Writer w21;
+  auto st21 = dm.exec(
+      {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetManufacturer},
+      empty, w21, sess);
+  BOOST_CHECK(st21.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st21.nrParameters, 1);
+  {
+    oca::ocp1::Reader r(w21.data(), w21.size());
+    BOOST_CHECK_EQUAL(r.string(), "Acme");  // Name
+    BOOST_CHECK_EQUAL(r.u8(), 0u);          // OrganizationID byte 0
+    BOOST_CHECK_EQUAL(r.u16(), 0u);         // OrganizationID bytes 1-2
+    BOOST_CHECK_EQUAL(r.string(), "");      // Website
+    BOOST_CHECK_EQUAL(r.string(), "");      // BusinessContact
+    BOOST_CHECK_EQUAL(r.string(), "");      // TechnicalContact
+  }
+
+  // GetProduct(22) -> OcaProduct = 6 个 OcaString
+  oca::ocp1::Writer w22;
+  auto st22 =
+      dm.exec({oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetProduct},
+              empty, w22, sess);
+  BOOST_CHECK(st22.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st22.nrParameters, 1);
+  {
+    oca::ocp1::Reader r(w22.data(), w22.size());
+    BOOST_CHECK_EQUAL(r.string(), "AES67-daemon");    // Name
+    BOOST_CHECK_EQUAL(r.string(), "AES67-daemon");    // ModelID
+    BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");  // RevisionLevel
+    BOOST_CHECK_EQUAL(r.string(), "Acme");            // BrandName
+    BOOST_CHECK_EQUAL(r.string(), "");                // UUID
+    BOOST_CHECK_EQUAL(r.string(), "");                // Description
+  }
+}
+
 BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   oca::OcaNetworkManager nm(2);
   oca::Session sess(1);

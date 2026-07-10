@@ -39,6 +39,8 @@ class OcaDeviceManager : public OcaManager {
   ExecResult GetEnabled(ocp1::Writer& rsp);
   ExecResult SetEnabled(ocp1::Reader& req);
   ExecResult GetDeviceRevisionID(ocp1::Writer& rsp);
+  ExecResult GetManufacturer(ocp1::Writer& rsp);
+  ExecResult GetProduct(ocp1::Writer& rsp);
   ExecResult GetState(ocp1::Writer& rsp);
   ExecResult GetOperationalState(ocp1::Writer& rsp);
   ExecResult GetManagers(ocp1::Writer& rsp, Session& sess);

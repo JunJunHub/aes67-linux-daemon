@@ -37,6 +37,10 @@ ExecResult OcaDeviceManager::exec(MethodID m,
         return SetEnabled(req);
       case methods::kDevGetDeviceRevisionID:
         return GetDeviceRevisionID(rsp);
+      case methods::kDevGetManufacturer:
+        return GetManufacturer(rsp);
+      case methods::kDevGetProduct:
+        return GetProduct(rsp);
       case methods::kDevGetState:
         return GetState(rsp);
       case methods::kDevGetOperationalState:
@@ -102,6 +106,33 @@ ExecResult OcaDeviceManager::GetDeviceRevisionID(ocp1::Writer& rsp) {
   // 取代)。
   rsp.string(identity_.model_version);
   return {Status::OK, 1};
+}
+
+ExecResult OcaDeviceManager::GetManufacturer(ocp1::Writer& rsp) {
+  // sphinx 3.21(2023 Mandatory G4):返 OcaManufacturer。
+  // OcaManufacturer = Name(OcaString) + OrganizationID(OcaBlobFixedLen<3> = 3
+  // 原始字节,0=未定义) + Website(OcaString) + BusinessContact(OcaString)
+  // + TechnicalContact(OcaString)。后三联系字段无值,空串合规。
+  rsp.string(identity_.manufacturer);  // Name
+  rsp.u8(0);               // OrganizationID 3 零字节(未定义 OUI)
+  rsp.u16(0);              //   (BlobFixedLen<3>,无长度前缀)
+  rsp.string("");          // Website
+  rsp.string("");          // BusinessContact
+  rsp.string("");          // TechnicalContact
+  return {Status::OK, 1};  // 1 个结构化参数
+}
+
+ExecResult OcaDeviceManager::GetProduct(ocp1::Writer& rsp) {
+  // sphinx 3.22(2023 Mandatory G3):返 OcaProduct。
+  // OcaProduct = Name + ModelID + RevisionLevel + BrandName + UUID(OcaString)
+  // + Description,共 6 个 OcaString。UUID 空串合规(未分配,OcaUUID=OcaString)。
+  rsp.string(identity_.model_name);     // Name
+  rsp.string(identity_.model_name);     // ModelID(无独立值,用 model_name)
+  rsp.string(identity_.model_version);  // RevisionLevel
+  rsp.string(identity_.manufacturer);   // BrandName
+  rsp.string("");                       // UUID(空)
+  rsp.string("");                       // Description
+  return {Status::OK, 1};               // 1 个结构化参数
 }
 
 ExecResult OcaDeviceManager::GetState(ocp1::Writer& rsp) {

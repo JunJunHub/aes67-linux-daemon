@@ -505,16 +505,173 @@ int main(int argc, char** argv) {
                 << OFF() << "\n";
     }
 
-    // 自测盲点回归:旧 EV2 索引(methodIndex=1,即 Spec1 旧 kSubAddSubscription2)
-    // 不应被当作订阅方法 - 必须返回非 OK(BadMethod 或 Task6 后的
-    // NotImplemented)。
-    auto rb = probe.cmd0(4, {m::kDefLevelSubMngr, 1});
+    // 自测盲点回归:未实现的订阅方法索引(7)不应返回 OK。
+    // (mi=1 现为 EV1 AddSubscription 已实现,故改用 7;与 oca_test 一致。)
+    auto rb = probe.cmd0(4, {m::kDefLevelSubMngr, 7});
     if (rb.ok && rb.status != o::Status::OK) {
-      std::cout << OK() << "  [OK] 旧索引 1 返回 " << status_name(rb.status)
+      std::cout << OK() << "  [OK] 未实现索引 7 返回 " << status_name(rb.status)
                 << " (非 OK,自测盲点已消除)" << OFF() << "\n";
     } else {
-      std::cout << ERR() << "  [FAIL] 旧索引 1 返回 OK - 自测盲点仍存在"
-                << " (daemon 误把旧索引当订阅方法)" << OFF() << "\n";
+      std::cout << ERR() << "  [FAIL] 未实现索引 7 返回 OK - 自测盲点仍存在"
+                << " (daemon 误把未实现索引当订阅方法)" << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
+  // --- 7. 阶段二强制方法(EV1 订阅 + Lock + DevMgr 2018 + NetMgr + 2023)---
+  section("阶段二强制方法 (EV1/Lock/DevMgr 2018/NetMgr/DevMgr 2023)");
+
+  // 7a. EV1 AddSubscription(mi=1,订阅 PropertyChanged:emitter=1, EventID{1,1})
+  //   参数(OCAMicro 3.1):OcaEvent{emitter u32 + EventID u16,u16}
+  //   + OcaMethod{ono u32 + mid u16,u16} + OcaBlob ctx + DeliveryMode u8
+  //   + OcaBlob NetworkAddress。响应 0 参(无 subID,区别 EV2 mi=8 的 1 参)。
+  {
+    oca::ocp1::Writer p;
+    p.u32(1);                         // EmitterONo
+    p.u16(m::kDefLevelRoot);          // EventID defLevel(PropertyChanged)
+    p.u16(m::kEventPropertyChanged);  // EventID eventIndex
+    p.u32(7);                         // subscriber ONo(忽略)
+    p.u16(m::kDefLevelRoot);          // subscriber MethodID defLevel
+    p.u16(m::kRootGetRole);           // subscriber MethodID methodIndex
+    p.u16(0);                         // 空 context
+    p.u8(1);                          // DeliveryMode Normal
+    p.u16(0);                         // 空 NetworkAddress
+    auto r = probe.cmd(4, {m::kDefLevelSubMngr, m::kSubAddSubscription},
+                       p.data(), static_cast<uint32_t>(p.size()), 5);
+    if (r.ok && r.status == o::Status::OK && r.params.empty()) {
+      std::cout << OK() << "  [OK] EV1 AddSubscription(1) -> OK,0 参(无 subID)"
+                << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] EV1 AddSubscription(1) status="
+                << status_name(r.status) << " params=" << r.params.size()
+                << "B (期望 OK + 0 参)" << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  // 7b. EV1 RemoveSubscription(mi=2):OcaEvent + OcaMethod
+  {
+    oca::ocp1::Writer p;
+    p.u32(1);
+    p.u16(m::kDefLevelRoot);
+    p.u16(m::kEventPropertyChanged);
+    p.u32(7);
+    p.u16(m::kDefLevelRoot);
+    p.u16(m::kRootGetRole);
+    auto r = probe.cmd(4, {m::kDefLevelSubMngr, m::kSubRemoveSubscription},
+                       p.data(), static_cast<uint32_t>(p.size()), 2);
+    if (r.ok && r.status == o::Status::OK && r.params.empty()) {
+      std::cout << OK() << "  [OK] EV1 RemoveSubscription(2) -> OK,0 参"
+                << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] EV1 RemoveSubscription(2) status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
+  // 7c. OcaRoot Lock(3)/Unlock(4) on DeviceManager(1)
+  for (auto [mi, name] :
+       std::initializer_list<std::pair<uint16_t, const char*>>{
+           {m::kRootLock, "Lock"}, {m::kRootUnlock, "Unlock"}}) {
+    auto r = probe.cmd0(1, {m::kDefLevelRoot, mi});
+    if (r.ok && r.status == o::Status::OK && r.params.empty()) {
+      std::cout << OK() << "  [OK] " << name << "(" << mi << ") -> OK,0 参"
+                << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] " << name << "(" << mi
+                << ") status=" << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
+  // 7d. DeviceManager 2018 强制方法
+  {
+    auto r = probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevGetModelGUID});
+    if (r.ok && r.status == o::Status::OK && r.params.size() == 8) {
+      std::cout << OK() << "  [OK] GetModelGUID(2) -> OK,8 字节" << OFF()
+                << "\n";
+    } else {
+      std::cout << ERR()
+                << "  [FAIL] GetModelGUID(2) status=" << status_name(r.status)
+                << " params=" << r.params.size() << "B" << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  {
+    auto r = probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevGetEnabled});
+    if (r.ok && r.status == o::Status::OK && r.params.size() == 1 &&
+        r.params[0] == 1) {
+      std::cout << OK() << "  [OK] GetEnabled(11) -> OK,u8=1" << OFF() << "\n";
+    } else {
+      std::cout << ERR()
+                << "  [FAIL] GetEnabled(11) status=" << status_name(r.status)
+                << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  {
+    auto r = probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevSetEnabled});
+    if (r.ok && r.status == o::Status::OK && r.params.empty()) {
+      std::cout << OK() << "  [OK] SetEnabled(12) 空体 -> OK,0 参" << OFF()
+                << "\n";
+    } else {
+      std::cout << ERR()
+                << "  [FAIL] SetEnabled(12) status=" << status_name(r.status)
+                << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  {
+    auto r =
+        probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevGetDeviceRevisionID});
+    if (r.ok && r.status == o::Status::OK) {
+      oca::ocp1::Reader pr(r.params.data(), r.params.size());
+      std::cout << OK() << "  [OK] GetDeviceRevisionID(20) -> \"" << pr.string()
+                << "\"" << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] GetDeviceRevisionID(20) status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
+  // 7e. NetworkManager(6) 三方法(返空 List<ONo>)
+  for (auto [mi, name] :
+       std::initializer_list<std::pair<uint16_t, const char*>>{
+           {m::kNetGetStreamNetworks, "GetStreamNetworks"},
+           {m::kNetGetControlNetworks, "GetControlNetworks"},
+           {m::kNetGetMediaTransportNetworks, "GetMediaTransportNetworks"}}) {
+    auto r = probe.cmd0(6, {m::kDefLevelNetworkMngr, mi});
+    if (r.ok && r.status == o::Status::OK && r.params.size() == 2 &&
+        r.params[0] == 0 && r.params[1] == 0) {
+      std::cout << OK() << "  [OK] " << name << "(" << mi << ") -> OK,空列表"
+                << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] " << name << "(" << mi
+                << ") status=" << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
+  // 7f. DeviceManager 2023 方法(GetManufacturer 21 / GetProduct 22)
+  {
+    auto r = probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevGetManufacturer});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] GetManufacturer(21) -> OK" << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] GetManufacturer(21) status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  {
+    auto r = probe.cmd0(1, {m::kDefLevelDeviceMngr, m::kDevGetProduct});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] GetProduct(22) -> OK" << OFF() << "\n";
+    } else {
+      std::cout << ERR()
+                << "  [FAIL] GetProduct(22) status=" << status_name(r.status)
+                << OFF() << "\n";
       probe.failures++;
     }
   }

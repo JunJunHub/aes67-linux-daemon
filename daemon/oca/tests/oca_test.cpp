@@ -521,6 +521,19 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   oca::ocp1::Reader r(rsp.data(), rsp.size());
   BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空网络列表
 
+  // GetStreamNetworks(2)/GetControlNetworks(3)/GetMediaTransportNetworks(4):
+  // 各返空 List<ONo>(u16(0)),{OK,1}(2018 强制方法,CM3 网络对象弃用故空)。
+  for (uint16_t mid : {oca::methods::kNetGetStreamNetworks,
+                       oca::methods::kNetGetControlNetworks,
+                       oca::methods::kNetGetMediaTransportNetworks}) {
+    oca::ocp1::Writer rr;
+    auto s =
+        nm.exec({oca::methods::kDefLevelNetworkMngr, mid}, empty, rr, sess);
+    BOOST_CHECK(s.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(s.nrParameters, 1);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rr.data(), rr.size()).u16(), 0u);
+  }
+
   // GetClassIdentification(继承自 Root) -> {1,3,6} v2
   oca::ocp1::Writer rsp2;
   st = nm.exec(

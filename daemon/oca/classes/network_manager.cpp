@@ -7,7 +7,7 @@
 namespace oca {
 
 namespace {
-const ClassIdentification kNetworkManagerClassId = {{{1, 3, 6}}, 3};
+const ClassIdentification kNetworkManagerClassId = {{{1, 3, 6}}, 2};
 }  // namespace
 
 const ClassIdentification& OcaNetworkManager::class_id() const {
@@ -21,7 +21,13 @@ ExecResult OcaNetworkManager::exec(MethodID m,
   if (m.defLevel == methods::kDefLevelNetworkMngr) {
     switch (m.methodIndex) {
       case methods::kNetGetNetworks:
-        rsp.u16(0);              // 空 Ocp1List<ONo>(Spec1 无网络对象)
+      case methods::kNetGetStreamNetworks:
+      case methods::kNetGetControlNetworks:
+      case methods::kNetGetMediaTransportNetworks:
+        // CM3 网络对象 2023 弃用,daemon 无网络对象;返空 List<ONo>(u16(0))。
+        // 方法仍 mandatory(返网络对象 ONo 列表,可为空),既合规又过工具(result
+        // OK≠8)。
+        rsp.u16(0);              // 空 Ocp1List<ONo>
         return {Status::OK, 1};  // 网络列表 = 1 个参数
       default:
         return {Status::NotImplemented, 0};

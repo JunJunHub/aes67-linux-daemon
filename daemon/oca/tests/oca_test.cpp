@@ -455,6 +455,59 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   BOOST_CHECK(st6.status == oca::Status::NotImplemented);
 }
 
+BOOST_AUTO_TEST_CASE(dispatch_device_manager_2018_methods) {
+  // DeviceManager 2018 强制方法:GetModelGUID(2)/GetEnabled(11)/
+  // SetEnabled(12)/GetDeviceRevisionID(20)。phase-1 返 NotImplemented(8)。
+  oca::OcaDeviceIdentity id;
+  id.manufacturer = "Acme";
+  id.model_name = "AES67-daemon";
+  id.model_version = "bondagit-3.1.0";
+  oca::OcaDeviceManager dm(1, id);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  auto call = [&](uint16_t idx, oca::ocp1::Reader& req) {
+    oca::ocp1::Writer w;
+    auto st = dm.exec({oca::methods::kDefLevelDeviceMngr, idx}, req, w, sess);
+    return std::make_pair(st, w.take());
+  };
+
+  // GetModelGUID(2) -> 8 原始字节全 0(OcaModelGUID BlobFixedLen 无前缀)
+  auto [st2, b2] = call(oca::methods::kDevGetModelGUID, empty);
+  BOOST_CHECK(st2.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st2.nrParameters, 1);
+  BOOST_CHECK_EQUAL(b2.size(), 8u);
+  for (uint8_t c : b2)
+    BOOST_CHECK_EQUAL(c, 0u);
+
+  // GetEnabled(11) -> u8(1)
+  auto [st11, b11] = call(oca::methods::kDevGetEnabled, empty);
+  BOOST_CHECK(st11.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st11.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(b11.data(), b11.size()).u8(), 1u);
+
+  // SetEnabled(12):发空体(模拟 2018 工具探测 nrParameters=0x64 但 paramBytes=0)
+  //    + 发 u8(1) 两种,均 OK + 0 参
+  auto [st12a, b12a] = call(oca::methods::kDevSetEnabled, empty);
+  BOOST_CHECK(st12a.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st12a.nrParameters, 0);
+  oca::ocp1::Writer sw;
+  sw.u8(1);
+  oca::ocp1::Reader sreq(sw.data(), sw.size());
+  auto [st12b, b12b] = call(oca::methods::kDevSetEnabled, sreq);
+  BOOST_CHECK(st12b.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st12b.nrParameters, 0);
+  (void)b12a;
+  (void)b12b;
+
+  // GetDeviceRevisionID(20) -> OcaString == model_version
+  auto [st20, b20] = call(oca::methods::kDevGetDeviceRevisionID, empty);
+  BOOST_CHECK(st20.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st20.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(b20.data(), b20.size()).string(),
+                    "bondagit-3.1.0");
+}
+
 BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   oca::OcaNetworkManager nm(2);
   oca::Session sess(1);

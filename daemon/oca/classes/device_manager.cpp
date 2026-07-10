@@ -8,7 +8,7 @@
 namespace oca {
 
 namespace {
-const ClassIdentification kDeviceManagerClassId = {{{1, 3, 1}}, 4};
+const ClassIdentification kDeviceManagerClassId = {{{1, 3, 1}}, 2};
 }  // namespace
 
 const ClassIdentification& OcaDeviceManager::class_id() const {
@@ -29,6 +29,14 @@ ExecResult OcaDeviceManager::exec(MethodID m,
         return GetDeviceName(rsp);
       case methods::kDevGetModelDescription:
         return GetModelDescription(rsp);
+      case methods::kDevGetModelGUID:
+        return GetModelGUID(rsp);
+      case methods::kDevGetEnabled:
+        return GetEnabled(rsp);
+      case methods::kDevSetEnabled:
+        return SetEnabled(req);
+      case methods::kDevGetDeviceRevisionID:
+        return GetDeviceRevisionID(rsp);
       case methods::kDevGetState:
         return GetState(rsp);
       case methods::kDevGetOperationalState:
@@ -61,6 +69,37 @@ ExecResult OcaDeviceManager::GetModelDescription(ocp1::Writer& rsp) {
   // OcaModelDescription = 1 个结构化参数(Manufacturer+Name+Version)
   rsp.string(identity_.manufacturer);
   rsp.string(identity_.model_name);
+  rsp.string(identity_.model_version);
+  return {Status::OK, 1};
+}
+
+ExecResult OcaDeviceManager::GetModelGUID(ocp1::Writer& rsp) {
+  // OcaModelGUID = BlobFixedLen<1>(reserved)+BlobFixedLen<3>(mfrCode)
+  //                +BlobFixedLen<4>(modelCode) = 8 原始字节,无长度前缀
+  // (OCAMicro OcaLiteModelGUID::Marshal)。最小写 8 零字节(未定义厂商,合规)。
+  rsp.u64(0);
+  return {Status::OK, 1};  // 1 个结构化参数
+}
+
+ExecResult OcaDeviceManager::GetEnabled(ocp1::Writer& rsp) {
+  // OcaBoolean(u8):daemon 总 enabled。OCAMicro GET_ENABLED 响应
+  // NrParameters=1。
+  rsp.u8(1);
+  return {Status::OK, 1};
+}
+
+ExecResult OcaDeviceManager::SetEnabled(ocp1::Reader& req) {
+  // OCAMicro SET_ENABLED 读 OcaBoolean(u8)。2018 工具探测时发空体(nrParameters
+  // 字段填 0x64 但 paramBytes=0),daemon 仅在存在字节时读取,空体视为 no-op;
+  // daemon 总 enabled,SetEnabled 为 no-op,返回 {OK,0}。
+  if (req.remaining() >= 1)
+    (void)req.u8();  // OcaBoolean(忽略,daemon 总 enabled)
+  return {Status::OK, 0};
+}
+
+ExecResult OcaDeviceManager::GetDeviceRevisionID(ocp1::Writer& rsp) {
+  // sphinx 3.20:返 OcaString(daemon 版本号)。deprecated v3(被 GetProduct
+  // 取代)。
   rsp.string(identity_.model_version);
   return {Status::OK, 1};
 }

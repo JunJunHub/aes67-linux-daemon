@@ -35,6 +35,10 @@ class OcaDeviceManager : public OcaManager {
   ExecResult GetSerialNumber(ocp1::Writer& rsp);
   ExecResult GetDeviceName(ocp1::Writer& rsp);
   ExecResult GetModelDescription(ocp1::Writer& rsp);
+  ExecResult GetModelGUID(ocp1::Writer& rsp);
+  ExecResult GetEnabled(ocp1::Writer& rsp);
+  ExecResult SetEnabled(ocp1::Reader& req);
+  ExecResult GetDeviceRevisionID(ocp1::Writer& rsp);
   ExecResult GetState(ocp1::Writer& rsp);
   ExecResult GetOperationalState(ocp1::Writer& rsp);
   ExecResult GetManagers(ocp1::Writer& rsp, Session& sess);

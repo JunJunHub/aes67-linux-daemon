@@ -25,7 +25,7 @@ OcaServer::OcaServer(const OcaServerConfig& cfg) : cfg_(cfg) {
   id.device_name = cfg_.device_name.empty() ? cfg_.node_id : cfg_.device_name;
 
   auto* dm = new OcaDeviceManager(1, id);
-  auto* nm = new OcaNetworkManager(2);
+  auto* nm = new OcaNetworkManager(6);
   auto* sm = new OcaSubscriptionManager(4);
   auto* root = new OcaBlock(100);
   sub_mgr_ = sm;

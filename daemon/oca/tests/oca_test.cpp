@@ -568,7 +568,7 @@ BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
   id.device_name = "dev";
   oca::ObjectRegistry reg;
   auto* dm = new oca::OcaDeviceManager(1, id);
-  auto* nm = new oca::OcaNetworkManager(2);
+  auto* nm = new oca::OcaNetworkManager(6);
   auto* sm = new oca::OcaSubscriptionManager(4);
   auto* root = new oca::OcaBlock(100);
   reg.register_object(std::unique_ptr<oca::Object>(dm));
@@ -735,7 +735,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramBytes);
   BOOST_CHECK_EQUAL(pr.string(), "AES67 daemon abc123");
 
-  // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification> [1,2,4]
+  // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification> [1,4,6]
   // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion
   oca::ocp1::Writer cw2;
   oca::ocp1::write_command(
@@ -759,13 +759,6 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 4u);  // ClassVersion
-  // ONo=2 NetworkManager {1,3,6} v3
-  BOOST_CHECK_EQUAL(pr2.u32(), 2u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 6u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   // ONo=4 SubscriptionManager {1,3,4} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 4u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
@@ -773,6 +766,13 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 4u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  // ONo=6 NetworkManager {1,3,6} v3
+  BOOST_CHECK_EQUAL(pr2.u32(), 6u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 6u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
 
   ::close(sock);
   server.stop();
@@ -877,7 +877,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
   }
 
-  // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification> [1,2,4]
+  // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification> [1,4,6]
   auto r3 = cmd(3, 100,
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
@@ -891,13 +891,13 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();
     r.u16();  // skip 3 ClassID levels
     r.u16();  // skip ClassVersion
-    BOOST_CHECK_EQUAL(r.u32(), 2u);
-    r.u16();
-    r.u16();
-    r.u16();
-    r.u16();
-    r.u16();
     BOOST_CHECK_EQUAL(r.u32(), 4u);
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    BOOST_CHECK_EQUAL(r.u32(), 6u);
     r.u16();
     r.u16();
     r.u16();

@@ -201,16 +201,15 @@ void Transport::conn_loop(int fd, ONo session_id) {
         ocp1::Writer rspAcc;
         for (const auto& c : cmds) {
           ocp1::Writer params;
-          Status st;
           Object* obj = registry_->find(c.targetONo);
-          if (!obj) {
-            st = Status::BadONo;
-          } else {
-            ocp1::Reader pr(c.paramData, c.paramCount);
-            st = obj->exec(c.methodID, pr, params, sess);
+          ExecResult er{Status::BadONo, 0};
+          if (obj) {
+            ocp1::Reader pr(c.paramData, c.paramBytes);
+            er = obj->exec(c.methodID, pr, params, sess);
           }
-          ocp1::write_response(rspAcc, c.handle, st, params.data(),
-                               static_cast<uint8_t>(params.size()));
+          ocp1::write_response(rspAcc, c.handle, er.status, params.data(),
+                               static_cast<uint32_t>(params.size()),
+                               er.nrParameters);
         }
         send_pdu(ocp1::PduWriter::build_response_pdu(
             static_cast<uint16_t>(cmds.size()), rspAcc.data(), rspAcc.size()));

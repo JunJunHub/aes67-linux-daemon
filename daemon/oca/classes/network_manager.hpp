@@ -13,10 +13,10 @@ class OcaNetworkManager : public OcaManager {
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 3; }
   std::string role() const override { return "NetworkManager"; }
-  Status exec(MethodID m,
-              ocp1::Reader& req,
-              ocp1::Writer& rsp,
-              Session& sess) override;
+  ExecResult exec(MethodID m,
+                  ocp1::Reader& req,
+                  ocp1::Writer& rsp,
+                  Session& sess) override;
 };
 
 }  // namespace oca

@@ -25,11 +25,11 @@ class StubObject : public oca::Object {
   explicit StubObject(oca::ONo ono) : oca::Object(ono) {}
   const oca::ClassIdentification& class_id() const override { return id_; }
   uint16_t class_version() const override { return 1; }
-  oca::Status exec(oca::MethodID,
-                   oca::ocp1::Reader&,
-                   oca::ocp1::Writer&,
-                   oca::Session&) override {
-    return oca::Status::OK;
+  oca::ExecResult exec(oca::MethodID,
+                       oca::ocp1::Reader&,
+                       oca::ocp1::Writer&,
+                       oca::Session&) override {
+    return {oca::Status::OK, 0};
   }
 
  private:
@@ -164,7 +164,7 @@ BOOST_AUTO_TEST_CASE(ocp1_command_pdu_roundtrip) {
   oca::ocp1::write_command(
       cw, 42, 1,
       {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion},
-      nullptr, 0);
+      nullptr, 0, 0);
   auto pdu = oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size());
 
   // 校验 sync + header
@@ -189,14 +189,15 @@ BOOST_AUTO_TEST_CASE(ocp1_command_pdu_roundtrip) {
                     oca::methods::kDefLevelDeviceMngr);
   BOOST_CHECK_EQUAL(cmds[0].methodID.methodIndex,
                     oca::methods::kDevGetOcaVersion);
-  BOOST_CHECK_EQUAL(cmds[0].paramCount, 0);
+  BOOST_CHECK_EQUAL(cmds[0].nrParameters, 0);
+  BOOST_CHECK_EQUAL(cmds[0].paramBytes, 0u);
 }
 
 BOOST_AUTO_TEST_CASE(ocp1_response_and_notification2_roundtrip) {
   // response: handle=7, status=OK, params={0x00,0x01} (u16 OcaVersion=1)
   uint8_t params[2] = {0x00, 0x01};
   oca::ocp1::Writer rw;
-  oca::ocp1::write_response(rw, 7, oca::Status::OK, params, 2);
+  oca::ocp1::write_response(rw, 7, oca::Status::OK, params, 2, 1);
   auto pdu = oca::ocp1::PduWriter::build_response_pdu(1, rw.data(), rw.size());
   auto hdr =
       oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
@@ -205,7 +206,8 @@ BOOST_AUTO_TEST_CASE(ocp1_response_and_notification2_roundtrip) {
   BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
   BOOST_CHECK_EQUAL(rsps[0].handle, 7u);
   BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
-  BOOST_CHECK_EQUAL(rsps[0].paramCount, 2);
+  BOOST_CHECK_EQUAL(rsps[0].nrParameters, 1);
+  BOOST_CHECK_EQUAL(rsps[0].paramBytes, 2u);
   BOOST_CHECK_EQUAL(rsps[0].paramData[1], 0x01);
 
   // notification2: emitter=1, event {3,1}, type=0(event),
@@ -329,7 +331,8 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   auto st = root.exec(
       {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
       empty, rsp, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
   // ClassID = u16 count(3) + 1,1,3 + u16 version(2)
   oca::ocp1::Reader r(rsp.data(), rsp.size());
   BOOST_CHECK_EQUAL(r.u16(), 3u);  // 3 levels
@@ -342,7 +345,8 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   oca::ocp1::Writer rsp2;
   st = root.exec({oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers},
                  empty, rsp2, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
   oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
   BOOST_CHECK_EQUAL(r2.u16(), 3u);  // 3 members
   BOOST_CHECK_EQUAL(r2.u32(), 1u);
@@ -352,12 +356,12 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   // 未知方法 -> BadMethod
   oca::ocp1::Writer rsp3;
   st = root.exec({oca::methods::kDefLevelBlock, 99}, empty, rsp3, sess);
-  BOOST_CHECK(st == oca::Status::BadMethod);
+  BOOST_CHECK(st.status == oca::Status::BadMethod);
 
   // 未知 defLevel -> BadMethod
   oca::ocp1::Writer rsp4;
   st = root.exec({99, 1}, empty, rsp4, sess);
-  BOOST_CHECK(st == oca::Status::BadMethod);
+  BOOST_CHECK(st.status == oca::Status::BadMethod);
 }
 
 BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
@@ -385,18 +389,20 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
 
   // GetOcaVersion -> 1
   auto [st1, b1] = call(oca::methods::kDevGetOcaVersion);
-  BOOST_CHECK(st1 == oca::Status::OK);
+  BOOST_CHECK(st1.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st1.nrParameters, 1);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(b1.data(), b1.size()).u16(), 1u);
 
   // GetDeviceName -> "Studio A"
   auto [st2, b2] = call(oca::methods::kDevGetDeviceName);
-  BOOST_CHECK(st2 == oca::Status::OK);
+  BOOST_CHECK(st2.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(b2.data(), b2.size()).string(),
                     "Studio A");
 
   // GetModelDescription -> {Acme, AES67-daemon, bondagit-3.1.0}
   auto [st3, b3] = call(oca::methods::kDevGetModelDescription);
-  BOOST_CHECK(st3 == oca::Status::OK);
+  BOOST_CHECK(st3.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st3.nrParameters, 1);  // 1 个结构化参数
   {
     oca::ocp1::Reader r(b3.data(), b3.size());
     BOOST_CHECK_EQUAL(r.string(), "Acme");
@@ -406,13 +412,14 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
 
   // GetState -> Operational(2)
   auto [st4, b4] = call(oca::methods::kDevGetState);
-  BOOST_CHECK(st4 == oca::Status::OK);
+  BOOST_CHECK(st4.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(b4.data(), b4.size()).u8(),
                     static_cast<uint8_t>(oca::DeviceState::Operational));
 
   // GetManagers -> 3 descriptors, first is ONo 1 / Role "DeviceManager"
   auto [st5, b5] = call(oca::methods::kDevGetManagers);
-  BOOST_CHECK(st5 == oca::Status::OK);
+  BOOST_CHECK(st5.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st5.nrParameters, 1);
   {
     oca::ocp1::Reader r(b5.data(), b5.size());
     BOOST_CHECK_EQUAL(r.u16(), 3u);
@@ -428,7 +435,7 @@ BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
 
   // 未实现方法 -> BadMethod
   auto [st6, b6] = call(oca::methods::kDevSetDeviceName);
-  BOOST_CHECK(st6 == oca::Status::BadMethod);
+  BOOST_CHECK(st6.status == oca::Status::BadMethod);
 }
 
 BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
@@ -439,7 +446,8 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   auto st = nm.exec(
       {oca::methods::kDefLevelNetworkMngr, oca::methods::kNetGetNetworks},
       empty, rsp, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
   oca::ocp1::Reader r(rsp.data(), rsp.size());
   BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空网络列表
 
@@ -448,7 +456,7 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   st = nm.exec(
       {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
       empty, rsp2, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
   oca::ocp1::Reader r2(rsp2.data(), rsp2.size());
   BOOST_CHECK_EQUAL(r2.u16(), 3u);
   BOOST_CHECK_EQUAL(r2.u16(), 1u);
@@ -475,7 +483,8 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   auto st = sm.exec(
       {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription2}, req,
       rspw, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
   oca::ocp1::Reader rspr(rspw.data(), rspw.size());
   uint32_t subId = rspr.u32();
   BOOST_CHECK(subId != 0);
@@ -513,7 +522,8 @@ BOOST_AUTO_TEST_CASE(dispatch_subscription_ev2) {
   st = sm.exec(
       {oca::methods::kDefLevelSubMngr, oca::methods::kSubRemoveSubscription2},
       req2, rspw2, sess);
-  BOOST_CHECK(st == oca::Status::OK);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
   BOOST_CHECK(
       !sess.has_subscription(1, {oca::methods::kDefLevelDeviceMngr,
                                  oca::methods::kEventOperationalState}));
@@ -597,7 +607,7 @@ BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
   oca::ocp1::write_command(
       cw, 7, 1,
       {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion},
-      nullptr, 0);
+      nullptr, 0, 0);
   sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
   std::vector<uint8_t> rsp;
   BOOST_CHECK(recvPdu(rsp));
@@ -610,7 +620,8 @@ BOOST_AUTO_TEST_CASE(transport_keepalive_and_command) {
   BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
   BOOST_CHECK_EQUAL(rsps[0].handle, 7u);
   BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
-  BOOST_CHECK_EQUAL(rsps[0].paramCount, 2);
+  BOOST_CHECK_EQUAL(rsps[0].nrParameters, 1);  // OcaVersion = 1 个参数
+  BOOST_CHECK_EQUAL(rsps[0].paramBytes, 2u);   // 2 字节参数块
   // OcaVersion=1 big-endian
   BOOST_CHECK_EQUAL(rsps[0].paramData[0], 0x00);
   BOOST_CHECK_EQUAL(rsps[0].paramData[1], 0x01);
@@ -681,7 +692,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   oca::ocp1::write_command(
       cw, 1, 1,
       {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetDeviceName},
-      nullptr, 0);
+      nullptr, 0, 0);
   sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
   std::vector<uint8_t> rsp;
   BOOST_CHECK(recvPdu(rsp));
@@ -691,7 +702,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
       rsp.data() + 1 + 9, rh->pduSize - 9, rh->messageCount);
   BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
   BOOST_CHECK(rsps[0].statusCode == oca::Status::OK);
-  oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramCount);
+  oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramBytes);
   BOOST_CHECK_EQUAL(pr.string(), "AES67 daemon abc123");
 
   // GetMembers(5) on Root Block(ONo 100) -> [1,2,4]
@@ -699,7 +710,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   oca::ocp1::write_command(
       cw2, 2, 100,
       {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers}, nullptr,
-      0);
+      0, 0);
   sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw2.data(), cw2.size()));
   std::vector<uint8_t> rsp2;
   BOOST_CHECK(recvPdu(rsp2));
@@ -708,7 +719,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   auto rsps2 = oca::ocp1::PduReader::parse_responses(
       rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
-  oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramCount);
+  oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
   BOOST_CHECK_EQUAL(pr2.u32(), 2u);
@@ -780,7 +791,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   auto cmd = [&](uint32_t handle, oca::ONo target,
                  oca::MethodID mid) -> oca::ocp1::Response {
     oca::ocp1::Writer cw;
-    oca::ocp1::write_command(cw, handle, target, mid, nullptr, 0);
+    oca::ocp1::write_command(cw, handle, target, mid, nullptr, 0, 0);
     sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
     std::vector<uint8_t> rsp;
     BOOST_REQUIRE(recvPdu(rsp));
@@ -802,7 +813,8 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
       cmd(1, 1,
           {oca::methods::kDefLevelDeviceMngr, oca::methods::kDevGetOcaVersion});
   BOOST_CHECK(r1.statusCode == oca::Status::OK);
-  BOOST_CHECK_EQUAL(oca::ocp1::Reader(r1.paramData, r1.paramCount).u16(), 1u);
+  BOOST_CHECK_EQUAL(r1.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(r1.paramData, r1.paramBytes).u16(), 1u);
 
   // 3) 身份:GetModelDescription -> {mfr, model=version, version}
   auto r2 = cmd(2, 1,
@@ -810,7 +822,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
                  oca::methods::kDevGetModelDescription});
   BOOST_CHECK(r2.statusCode == oca::Status::OK);
   {
-    oca::ocp1::Reader r(r2.paramData, r2.paramCount);
+    oca::ocp1::Reader r(r2.paramData, r2.paramBytes);
     BOOST_CHECK_EQUAL(r.string(), "AES67-Linux-Daemon");
     BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
     BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
@@ -821,7 +833,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
   {
-    oca::ocp1::Reader r(r3.paramData, r3.paramCount);
+    oca::ocp1::Reader r(r3.paramData, r3.paramBytes);
     BOOST_CHECK_EQUAL(r.u16(), 3u);
     BOOST_CHECK_EQUAL(r.u32(), 1u);
     BOOST_CHECK_EQUAL(r.u32(), 2u);
@@ -829,6 +841,8 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   }
 
   // 5) 订阅:AddSubscription2(emitter=1, OperationalState)
+  //    命令参数:emitterONo(u32) + eventID(u16,u16) + subscriberContext(blob)
+  //    = 3 个参数
   oca::ocp1::Writer params;
   params.u32(1);  // EmitterONo
   params.u16(oca::methods::kDefLevelDeviceMngr);
@@ -838,7 +852,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   oca::ocp1::write_command(
       cw, 5, 4,
       {oca::methods::kDefLevelSubMngr, oca::methods::kSubAddSubscription2},
-      params.data(), static_cast<uint8_t>(params.size()));
+      params.data(), static_cast<uint32_t>(params.size()), 3);
   sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
   std::vector<uint8_t> rspsub;
   BOOST_REQUIRE(recvPdu(rspsub));
@@ -849,7 +863,7 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   BOOST_REQUIRE_EQUAL(subrsps.size(), 1u);
   BOOST_CHECK(subrsps[0].statusCode == oca::Status::OK);
   uint32_t subId =
-      oca::ocp1::Reader(subrsps[0].paramData, subrsps[0].paramCount).u32();
+      oca::ocp1::Reader(subrsps[0].paramData, subrsps[0].paramBytes).u32();
 
   // 6) 触发事件,然后发一个 ping 让传输层排空通知队列
   uint8_t evdata = static_cast<uint8_t>(oca::DeviceState::Operational);

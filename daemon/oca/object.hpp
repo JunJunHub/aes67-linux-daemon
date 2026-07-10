@@ -15,16 +15,22 @@ namespace oca {
 
 class Session;  // 前置声明,定义在 session.hpp
 
+// exec 返回:OCA 状态码 + 响应参数个数(NrParameters,AES70-3 §9)
+struct ExecResult {
+  Status status = Status::OK;
+  uint8_t nrParameters = 0;
+};
+
 class Object {
  public:
   virtual ~Object() = default;
   ONo ono() const { return ono_; }
   virtual const ClassIdentification& class_id() const = 0;
   virtual uint16_t class_version() const = 0;
-  virtual Status exec(MethodID method,
-                      ocp1::Reader& req,
-                      ocp1::Writer& rsp,
-                      Session& sess) = 0;
+  virtual ExecResult exec(MethodID method,
+                          ocp1::Reader& req,
+                          ocp1::Writer& rsp,
+                          Session& sess) = 0;
   // OcaRoot::GetRole 的默认实现:OCA 对象均有 Role,基类默认空串。
   // 置于 Object 以便注册表持有的 Object* 可取 Role(GetManagers 描述符 Name)。
   virtual std::string role() const { return {}; }

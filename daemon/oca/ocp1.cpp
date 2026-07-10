@@ -178,16 +178,17 @@ void write_command(Writer& w,
                    ONo targetONo,
                    MethodID methodID,
                    const uint8_t* params,
-                   uint8_t paramCount) {
-  // commandSize = 4+4+4+4+1 + paramCount = 17 + paramCount
-  uint32_t cmdSize = 17u + paramCount;
+                   uint32_t paramBytes,
+                   uint8_t nrParameters) {
+  // commandSize = 4+4+4+4+1 + paramBytes = 17 + paramBytes
+  uint32_t cmdSize = 17u + paramBytes;
   w.u32(cmdSize);
   w.u32(handle);
   w.u32(targetONo);
   w.u16(methodID.defLevel);
   w.u16(methodID.methodIndex);
-  w.u8(paramCount);
-  for (uint8_t i = 0; i < paramCount; ++i)
+  w.u8(nrParameters);  // NrParameters = 参数个数(AES70-3 §9)
+  for (uint32_t i = 0; i < paramBytes; ++i)
     w.u8(params[i]);
 }
 
@@ -195,14 +196,15 @@ void write_response(Writer& w,
                     uint32_t handle,
                     Status status,
                     const uint8_t* params,
-                    uint8_t paramCount) {
-  // responseSize = 4+4+1+1 + paramCount = 10 + paramCount
-  uint32_t rspSize = 10u + paramCount;
+                    uint32_t paramBytes,
+                    uint8_t nrParameters) {
+  // responseSize = 4+4+1+1 + paramBytes = 10 + paramBytes
+  uint32_t rspSize = 10u + paramBytes;
   w.u32(rspSize);
   w.u32(handle);
   w.u8(static_cast<uint8_t>(status));
-  w.u8(paramCount);
-  for (uint8_t i = 0; i < paramCount; ++i)
+  w.u8(nrParameters);  // NrParameters = 参数个数(AES70-3 §9)
+  for (uint32_t i = 0; i < paramBytes; ++i)
     w.u8(params[i]);
 }
 
@@ -250,11 +252,16 @@ std::vector<Command> PduReader::parse_commands(const uint8_t* data,
     c.targetONo = r.u32();
     c.methodID.defLevel = r.u16();
     c.methodID.methodIndex = r.u16();
-    c.paramCount = r.u8();
+    c.nrParameters = r.u8();
+    // 参数块字节数由 commandSize 隐式得出(头 17 字节:cmdSize4+handle4+
+    // target4+methodID4+nrParameters1)
+    if (c.commandSize < 17u)
+      throw std::runtime_error("ocp1: commandSize too small");
+    c.paramBytes = c.commandSize - 17u;
     size_t consumed = len - r.remaining();
-    c.paramData = data + consumed;  // 指向 buffer 内 params 起点
-    for (uint8_t p = 0; p < c.paramCount; ++p)
-      r.u8();  // 跳过 params
+    c.paramData = data + consumed;  // 指向 buffer 内参数块起点
+    for (uint32_t p = 0; p < c.paramBytes; ++p)
+      r.u8();  // 跳过参数字节(经 check() 防越界)
     out.push_back(c);
   }
   return out;
@@ -270,10 +277,15 @@ std::vector<Response> PduReader::parse_responses(const uint8_t* data,
     rsp.responseSize = r.u32();
     rsp.handle = r.u32();
     rsp.statusCode = static_cast<Status>(r.u8());
-    rsp.paramCount = r.u8();
+    rsp.nrParameters = r.u8();
+    // 参数块字节数由 responseSize 隐式得出(头 10 字节:rspSize4+handle4+
+    // status1+nrParameters1)
+    if (rsp.responseSize < 10u)
+      throw std::runtime_error("ocp1: responseSize too small");
+    rsp.paramBytes = rsp.responseSize - 10u;
     size_t consumed = len - r.remaining();
     rsp.paramData = data + consumed;
-    for (uint8_t p = 0; p < rsp.paramCount; ++p)
+    for (uint32_t p = 0; p < rsp.paramBytes; ++p)
       r.u8();
     out.push_back(rsp);
   }

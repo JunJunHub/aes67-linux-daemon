@@ -17,10 +17,10 @@ const ClassIdentification& OcaSubscriptionManager::class_id() const {
   return kSubscriptionManagerClassId;
 }
 
-Status OcaSubscriptionManager::exec(MethodID m,
-                                    ocp1::Reader& req,
-                                    ocp1::Writer& rsp,
-                                    Session& sess) {
+ExecResult OcaSubscriptionManager::exec(MethodID m,
+                                        ocp1::Reader& req,
+                                        ocp1::Writer& rsp,
+                                        Session& sess) {
   if (m.defLevel == methods::kDefLevelSubMngr) {
     switch (m.methodIndex) {
       case methods::kSubAddSubscription2:
@@ -28,15 +28,15 @@ Status OcaSubscriptionManager::exec(MethodID m,
       case methods::kSubRemoveSubscription2:
         return RemoveSubscription2(req, rsp, sess);
       default:
-        return Status::BadMethod;  // PropertyChange 变体 Spec1 不实现
+        return {Status::BadMethod, 0};  // PropertyChange 变体 Spec1 不实现
     }
   }
   return OcaManager::exec(m, req, rsp, sess);
 }
 
-Status OcaSubscriptionManager::AddSubscription2(ocp1::Reader& req,
-                                                ocp1::Writer& rsp,
-                                                Session& sess) {
+ExecResult OcaSubscriptionManager::AddSubscription2(ocp1::Reader& req,
+                                                    ocp1::Writer& rsp,
+                                                    Session& sess) {
   ONo emitter = req.u32();
   EventID eid{req.u16(), req.u16()};
   OcaBlob ctx = req.blob();  // subscriberContext(未使用,仅消费)
@@ -47,23 +47,23 @@ Status OcaSubscriptionManager::AddSubscription2(ocp1::Reader& req,
     entries_.push_back({id, &sess, emitter, eid});
   }
   sess.add_subscription({emitter, eid, std::move(ctx)});
-  rsp.u32(id);  // 返回 subscriptionID
-  return Status::OK;
+  rsp.u32(id);             // 返回 subscriptionID
+  return {Status::OK, 1};  // subscriptionID = 1 个参数
 }
 
-Status OcaSubscriptionManager::RemoveSubscription2(ocp1::Reader& req,
-                                                   ocp1::Writer& rsp,
-                                                   Session& sess) {
+ExecResult OcaSubscriptionManager::RemoveSubscription2(ocp1::Reader& req,
+                                                       ocp1::Writer& rsp,
+                                                       Session& sess) {
   uint32_t id = req.u32();
   std::lock_guard<std::mutex> lk(mutex_);
   for (auto it = entries_.begin(); it != entries_.end(); ++it) {
     if (it->id == id) {
       sess.remove_subscription(it->emitterONo, it->eventID);
       entries_.erase(it);
-      return Status::OK;
+      return {Status::OK, 0};  // 无返回参数
     }
   }
-  return Status::BadONo;  // 未知 subscriptionID
+  return {Status::BadONo, 0};  // 未知 subscriptionID
 }
 
 void OcaSubscriptionManager::trigger_event(ONo emitterONo,

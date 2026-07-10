@@ -172,7 +172,7 @@ struct Probe {
 
   // 发一条命令,循环接收直到拿到匹配 handle 的 Response。
   // 途中的 Notification2 / KeepAlive 单独打印,不与 Response 错配。
-  // 返回 Response(paramData/paramCount 指向内部缓冲,下次调用失效)。
+  // 返回 Response(paramData/paramBytes 指向内部缓冲,下次调用失效)。
   struct CmdResult {
     o::Status status = o::Status::OK;
     std::vector<uint8_t> params;
@@ -182,10 +182,12 @@ struct Probe {
   CmdResult cmd(o::ONo target,
                 o::MethodID mid,
                 const uint8_t* params = nullptr,
-                uint8_t paramCount = 0) {
+                uint32_t paramBytes = 0,
+                uint8_t nrParameters = 0) {
     uint32_t handle = next_handle++;
     oca::ocp1::Writer cw;
-    oca::ocp1::write_command(cw, handle, target, mid, params, paramCount);
+    oca::ocp1::write_command(cw, handle, target, mid, params, paramBytes,
+                             nrParameters);
     auto pdu = oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size());
     if (!send_all(fd, pdu.data(), pdu.size())) {
       std::cout << ERR() << "  [发送失败]" << OFF() << "\n";
@@ -208,8 +210,8 @@ struct Probe {
             CmdResult out;
             out.status = r.statusCode;
             out.ok = true;
-            if (r.paramCount && r.paramData)
-              out.params.assign(r.paramData, r.paramData + r.paramCount);
+            if (r.paramBytes && r.paramData)
+              out.params.assign(r.paramData, r.paramData + r.paramBytes);
             return out;
           }
           // 其它 handle 的响应(不应出现)忽略
@@ -471,7 +473,7 @@ int main(int argc, char** argv) {
     params.u16(0);  // 空 subscriberContext
 
     auto r = probe.cmd(4, {m::kDefLevelSubMngr, m::kSubAddSubscription2},
-                       params.data(), static_cast<uint8_t>(params.size()));
+                       params.data(), static_cast<uint32_t>(params.size()), 3);
     if (r.ok && r.status == o::Status::OK) {
       oca::ocp1::Reader pr(r.params.data(), r.params.size());
       uint32_t subId = pr.u32();

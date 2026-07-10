@@ -92,7 +92,8 @@ struct Command {
   ONo targetONo = 0;
   MethodID methodID{};
   const uint8_t* paramData = nullptr;
-  uint8_t paramCount = 0;  // Ocp1Parameters.ParameterCount
+  uint8_t nrParameters = 0;  // NrParameters = 参数个数(AES70-3 §9)
+  uint32_t paramBytes = 0;   // 参数块字节数(= commandSize - 17)
 };
 
 struct Response {
@@ -100,7 +101,8 @@ struct Response {
   uint32_t handle = 0;
   Status statusCode = Status::OK;
   const uint8_t* paramData = nullptr;
-  uint8_t paramCount = 0;
+  uint8_t nrParameters = 0;  // NrParameters = 参数个数(AES70-3 §9)
+  uint32_t paramBytes = 0;   // 参数块字节数(= responseSize - 10)
 };
 
 struct Notification2 {
@@ -140,17 +142,20 @@ struct PduWriter {
 };
 
 // 单条消息序列化(不含 sync/header,写入 Writer)
+// paramBytes = 参数块字节数;nrParameters = 参数个数(写入 NrParameters 字段)
 void write_command(Writer& w,
                    uint32_t handle,
                    ONo targetONo,
                    MethodID methodID,
                    const uint8_t* params,
-                   uint8_t paramCount);
+                   uint32_t paramBytes,
+                   uint8_t nrParameters);
 void write_response(Writer& w,
                     uint32_t handle,
                     Status status,
                     const uint8_t* params,
-                    uint8_t paramCount);
+                    uint32_t paramBytes,
+                    uint8_t nrParameters);
 void write_notification2(Writer& w,
                          ONo emitterONo,
                          EventID eventID,

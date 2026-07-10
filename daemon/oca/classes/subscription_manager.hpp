@@ -19,10 +19,10 @@ class OcaSubscriptionManager : public OcaManager {
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 2; }
   std::string role() const override { return "SubscriptionManager"; }
-  Status exec(MethodID m,
-              ocp1::Reader& req,
-              ocp1::Writer& rsp,
-              Session& sess) override;
+  ExecResult exec(MethodID m,
+                  ocp1::Reader& req,
+                  ocp1::Writer& rsp,
+                  Session& sess) override;
 
   // 触发事件:遍历订阅者,编码 Notification2 PDU 投递到各会话写队列
   void trigger_event(ONo emitterONo,
@@ -33,10 +33,12 @@ class OcaSubscriptionManager : public OcaManager {
   void remove_session(Session* sess);
 
  private:
-  Status AddSubscription2(ocp1::Reader& req, ocp1::Writer& rsp, Session& sess);
-  Status RemoveSubscription2(ocp1::Reader& req,
-                             ocp1::Writer& rsp,
-                             Session& sess);
+  ExecResult AddSubscription2(ocp1::Reader& req,
+                              ocp1::Writer& rsp,
+                              Session& sess);
+  ExecResult RemoveSubscription2(ocp1::Reader& req,
+                                 ocp1::Writer& rsp,
+                                 Session& sess);
 
   struct Entry {
     uint32_t id;

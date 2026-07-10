@@ -25,18 +25,18 @@ class OcaDeviceManager : public OcaManager {
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 4; }
   std::string role() const override { return "DeviceManager"; }
-  Status exec(MethodID m,
-              ocp1::Reader& req,
-              ocp1::Writer& rsp,
-              Session& sess) override;
+  ExecResult exec(MethodID m,
+                  ocp1::Reader& req,
+                  ocp1::Writer& rsp,
+                  Session& sess) override;
 
  private:
-  Status GetOcaVersion(ocp1::Writer& rsp);
-  Status GetSerialNumber(ocp1::Writer& rsp);
-  Status GetDeviceName(ocp1::Writer& rsp);
-  Status GetModelDescription(ocp1::Writer& rsp);
-  Status GetState(ocp1::Writer& rsp);
-  Status GetManagers(ocp1::Writer& rsp, Session& sess);
+  ExecResult GetOcaVersion(ocp1::Writer& rsp);
+  ExecResult GetSerialNumber(ocp1::Writer& rsp);
+  ExecResult GetDeviceName(ocp1::Writer& rsp);
+  ExecResult GetModelDescription(ocp1::Writer& rsp);
+  ExecResult GetState(ocp1::Writer& rsp);
+  ExecResult GetManagers(ocp1::Writer& rsp, Session& sess);
 
   OcaDeviceIdentity identity_;
 };

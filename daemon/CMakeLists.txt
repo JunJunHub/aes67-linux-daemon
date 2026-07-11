@@ -50,7 +50,8 @@ if(WITH_OCA)
   include_directories(${CMAKE_CURRENT_SOURCE_DIR})  # 让 #include "oca/..." 可解析
   list(APPEND SOURCES oca/ocp1.cpp oca/session.cpp oca/transport.cpp
        oca/oca_server.cpp oca/classes/root.cpp oca/classes/device_manager.cpp
-       oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp)
+       oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp
+       oca/classes/network.cpp oca/classes/control_network.cpp)
 endif()
 if(FAKE_DRIVER)
   MESSAGE(STATUS "FAKE_DRIVER")

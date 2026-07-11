@@ -2,7 +2,9 @@
 
 #include "oca/oca_server.hpp"
 
+#include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
+#include "oca/classes/network.hpp"
 #include "oca/classes/network_manager.hpp"
 #include "oca/classes/root.hpp"
 #include "oca/classes/subscription_manager.hpp"
@@ -28,11 +30,19 @@ OcaServer::OcaServer(const OcaServerConfig& cfg) : cfg_(cfg) {
   auto* nm = new OcaNetworkManager(6);
   auto* sm = new OcaSubscriptionManager(4);
   auto* root = new OcaBlock(100);
+  // CM3 网络对象(Spec3):为 AES70-2018 合规工具最小强制实例。
+  // OcaNetwork{1,2,1} DeprecatedSince 2018 / 2023 弃用;OcaControlNetwork{1,4.1}
+  // AvailableSince 2018。ONo >=4096(BlockMember 区段),加入根块 GetMembers/
+  // GetMembersRecursive 成员列表。详见 Spec3 计划与设计文档(2023 弃用立场)。
+  auto* net2 = new OcaNetwork(4097);
+  auto* ctrl_net = new OcaControlNetwork(4098);
   sub_mgr_ = sm;
   registry_.register_object(std::unique_ptr<Object>(dm));
   registry_.register_object(std::unique_ptr<Object>(nm));
   registry_.register_object(std::unique_ptr<Object>(sm));
   registry_.register_object(std::unique_ptr<Object>(root));
+  registry_.register_object(std::unique_ptr<Object>(net2));
+  registry_.register_object(std::unique_ptr<Object>(ctrl_net));
 
   transport_ = std::make_unique<Transport>(&registry_, sub_mgr_);
 }

@@ -49,6 +49,10 @@ class OcaBlock : public OcaWorker {
 
  private:
   ExecResult GetMembers(ocp1::Writer& rsp, Session& sess);
+  // 返回根块直系成员的 OcaBlockMember 列表(含 ContainerONo=100)。
+  // Spec3 Fix-A:实装此方法使合规工具 GetObjects 走非覆盖分支,
+  // 保留根块 {1,1,3}@100 进 deviceReportedObjects(见 Spec3 根因)。
+  ExecResult GetMembersRecursive(ocp1::Writer& rsp, Session& sess);
 };
 
 }  // namespace oca

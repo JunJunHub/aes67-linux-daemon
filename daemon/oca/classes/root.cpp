@@ -60,6 +60,8 @@ ExecResult OcaBlock::exec(MethodID m,
     switch (m.methodIndex) {
       case methods::kBlockGetMembers:
         return GetMembers(rsp, sess);
+      case methods::kBlockGetMembersRecursive:
+        return GetMembersRecursive(rsp, sess);
       default:
         return {Status::NotImplemented, 0};
     }
@@ -71,11 +73,21 @@ ExecResult OcaBlock::GetMembers(ocp1::Writer& rsp, Session& sess) {
   auto* reg = sess.registry();
   if (!reg)
     return {Status::DeviceError, 0};
-  auto objs = reg->objects_in_range(1, 99);  // 管理器成员
+  auto mgrs = reg->objects_in_range(1, 99);  // 管理器成员
+  auto cm =
+      reg->objects_in_range(4096, 65535);  // BlockMember 区段(CM3 网络对象)
   // Ocp1List<OcaObjectIdentification>,每个元素 = {ONo, ClassIdentification}
   // ClassIdentification = {ClassID(fieldCount+levels), ClassVersion}
-  rsp.u16(static_cast<uint16_t>(objs.size()));
-  for (auto* o : objs) {
+  rsp.u16(static_cast<uint16_t>(mgrs.size() + cm.size()));
+  for (auto* o : mgrs) {
+    rsp.u32(o->ono());
+    const auto& ci = o->class_id();
+    rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
+    for (auto lvl : ci.classID.levels)
+      rsp.u16(lvl);
+    rsp.u16(o->class_version());
+  }
+  for (auto* o : cm) {
     rsp.u32(o->ono());
     const auto& ci = o->class_id();
     rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
@@ -84,6 +96,40 @@ ExecResult OcaBlock::GetMembers(ocp1::Writer& rsp, Session& sess) {
     rsp.u16(o->class_version());
   }
   return {Status::OK, 1};  // 成员 ObjectIdentification 列表 = 1 个参数
+}
+
+ExecResult OcaBlock::GetMembersRecursive(ocp1::Writer& rsp, Session& sess) {
+  auto* reg = sess.registry();
+  if (!reg)
+    return {Status::DeviceError, 0};
+  // 根块直系成员 = 管理器 [1,99] + BlockMember 区段 [4096,65535](CM3
+  // 网络对象)。 根块自身 ONo=100 不列(合规工具 GetObjects 已单独 Add 根块)。
+  auto mgrs = reg->objects_in_range(1, 99);
+  auto cm = reg->objects_in_range(4096, 65535);
+  // Ocp1List<OcaBlockMember>,每元素 = {OcaObjectIdentification, ContainerONo}
+  // OcaObjectIdentification = {ONo u32, ClassIdentification}
+  // ClassIdentification = {ClassID(fieldCount u16 + levels u16*), ClassVersion
+  // u16} ContainerONo = u32(本块 ONo,根块=100)
+  rsp.u16(static_cast<uint16_t>(mgrs.size() + cm.size()));
+  for (auto* o : mgrs) {
+    rsp.u32(o->ono());
+    const auto& ci = o->class_id();
+    rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
+    for (auto lvl : ci.classID.levels)
+      rsp.u16(lvl);
+    rsp.u16(o->class_version());
+    rsp.u32(ono());  // ContainerONo = 根块 ONo(100)
+  }
+  for (auto* o : cm) {
+    rsp.u32(o->ono());
+    const auto& ci = o->class_id();
+    rsp.u16(static_cast<uint16_t>(ci.classID.levels.size()));
+    for (auto lvl : ci.classID.levels)
+      rsp.u16(lvl);
+    rsp.u16(o->class_version());
+    rsp.u32(ono());
+  }
+  return {Status::OK, 1};
 }
 
 }  // namespace oca

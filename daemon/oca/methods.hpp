@@ -55,6 +55,23 @@ constexpr uint16_t kDevGetProduct = 22;       // sphinx 3.22,2023 Mandatory G3
 
 // OcaBlock methods (DefLevel 3) - ocac 核对
 constexpr uint16_t kBlockGetMembers = 5;
+constexpr uint16_t kBlockGetMembersRecursive =
+    6;  // AES70-2015 起,2018 起非强制;
+        // 实装以让合规工具 GetObjects
+        // 走非覆盖分支(见 Spec3 根因)
+
+// OcaNetwork methods (DefLevel 3, classID{1,2,1}) - OCAMicro OcaLiteNetwork
+// DeprecatedSince AES70-2018 / 2023 进一步弃用;本实例仅为兼容 AES70-2018
+// 合规工具的最小强制实例(见 Spec3 计划、设计文档 2023 弃用立场)。
+constexpr uint16_t kNet2GetLinkType = 1;          // OCAMicro
+constexpr uint16_t kNet2GetIDAdvertised = 2;      // OCAMicro
+constexpr uint16_t kNet2GetControlProtocol = 4;   // OCAMicro
+constexpr uint16_t kNet2GetMediaProtocol = 5;     // OCAMicro
+constexpr uint16_t kNet2GetSystemInterfaces = 9;  // OCAMicro
+
+// OcaControlNetwork methods (DefLevel 3, classID{1,4,1}) - AES70-2018 mandatory
+// AvailableSince AES70-2018;无 DeviceType 门。唯一强制方法 GetControlProtocol。
+constexpr uint16_t kCtrlNetGetControlProtocol = 1;
 
 // OcaNetworkManager methods (DefLevel 3) - OCAMicro
 constexpr uint16_t kNetGetNetworks = 1;                // OCAMicro

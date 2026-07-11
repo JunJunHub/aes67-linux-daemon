@@ -676,6 +676,80 @@ int main(int argc, char** argv) {
     }
   }
 
+  // --- 8. 阶段三 CM3 对象 + GetMembersRecursive(Spec3:冲 5/5) ---------------
+  section("阶段三 CM3 (GetMembersRecursive + OcaNetwork/OcaControlNetwork)");
+  // 8a. GetMembersRecursive(6) on RootBlock:验证 Fix-A(OK + 非空,含
+  // ContainerONo)
+  {
+    auto r = probe.cmd0(100, {m::kDefLevelBlock, m::kBlockGetMembersRecursive});
+    if (r.ok && r.status == o::Status::OK) {
+      oca::ocp1::Reader pr(r.params.data(), r.params.size());
+      uint16_t count = pr.u16();
+      std::cout << OK()
+                << "  [OK] GetMembersRecursive(6) -> OK, 成员数 = " << count
+                << OFF() << "\n";
+      bool has_cm3 = false;
+      for (uint16_t i = 0; i < count; ++i) {
+        uint32_t ono = pr.u32();
+        auto cid = read_classid(pr);
+        uint16_t ver = pr.u16();
+        uint32_t cont = pr.u32();  // ContainerONo
+        std::cout << "        #" << i << " ONo=" << ono
+                  << " classID=" << classid_str(cid) << " v" << ver
+                  << " container=" << cont << "\n";
+        if (ono >= 4096)
+          has_cm3 = true;
+      }
+      if (count == 0) {
+        std::cout << ERR() << "  [FAIL] 成员数为 0(合规工具 GetObjects 会回退"
+                  << "到覆盖路径丢根块)" << OFF() << "\n";
+        probe.failures++;
+      }
+      if (!has_cm3) {
+        std::cout << ERR() << "  [FAIL] CM3 网络对象未在成员列表" << OFF()
+                  << "\n";
+        probe.failures++;
+      }
+    } else {
+      std::cout << ERR() << "  [FAIL] GetMembersRecursive status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  // 8b. OcaNetwork(4097) 强制方法
+  for (auto [mi, name] :
+       std::initializer_list<std::pair<uint16_t, const char*>>{
+           {m::kNet2GetLinkType, "OcaNetwork.GetLinkType"},
+           {m::kNet2GetIDAdvertised, "OcaNetwork.GetIDAdvertised"},
+           {m::kNet2GetControlProtocol, "OcaNetwork.GetControlProtocol"},
+           {m::kNet2GetMediaProtocol, "OcaNetwork.GetMediaProtocol"},
+           {m::kNet2GetSystemInterfaces, "OcaNetwork.GetSystemInterfaces"}}) {
+    auto r = probe.cmd0(4097, {m::kDefLevelBlock, mi});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] " << name << "(" << mi << ") -> OK" << OFF()
+                << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] " << name << "(" << mi
+                << ") status=" << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  // 8c. OcaControlNetwork(4098) GetControlProtocol(1)
+  {
+    auto r =
+        probe.cmd0(4098, {m::kDefLevelBlock, m::kCtrlNetGetControlProtocol});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK()
+                << "  [OK] OcaControlNetwork.GetControlProtocol(1) -> OK"
+                << OFF() << "\n";
+    } else {
+      std::cout << ERR()
+                << "  [FAIL] OcaControlNetwork.GetControlProtocol(1) status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+
   // --- 汇总 ------------------------------------------------------------------
   section("汇总");
   if (probe.failures == 0) {

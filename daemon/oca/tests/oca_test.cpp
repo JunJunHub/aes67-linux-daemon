@@ -11,7 +11,9 @@
 #include "oca/oca_server.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
+#include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
+#include "oca/classes/network.hpp"
 #include "oca/classes/network_manager.hpp"
 #include "oca/classes/root.hpp"
 #include "oca/classes/subscription_manager.hpp"
@@ -360,6 +362,26 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
     BOOST_CHECK_EQUAL(r2.u16(), 1u);  // ClassVersion = 1 (StubObject)
   }
 
+  // GetMembersRecursive {3,6} -> List<OcaBlockMember>;C=100, root 不在内
+  // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion +
+  // ContainerONo(u32)
+  oca::ocp1::Writer rsp_rec;
+  st = root.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembersRecursive},
+      empty, rsp_rec, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
+  oca::ocp1::Reader rrec(rsp_rec.data(), rsp_rec.size());
+  BOOST_CHECK_EQUAL(rrec.u16(), 3u);  // 3 members
+  for (int i = 0; i < 3; ++i) {
+    BOOST_CHECK_EQUAL(rrec.u32(), static_cast<uint32_t>(i == 0   ? 1
+                                                        : i == 1 ? 2
+                                                                 : 4));
+    BOOST_CHECK_EQUAL(rrec.u16(), 0u);    // ClassID fieldCount = 0 (StubObject)
+    BOOST_CHECK_EQUAL(rrec.u16(), 1u);    // ClassVersion = 1 (StubObject)
+    BOOST_CHECK_EQUAL(rrec.u32(), 100u);  // ContainerONo = root(100)
+  }
+
   // 未知方法 -> NotImplemented
   oca::ocp1::Writer rsp3;
   st = root.exec({oca::methods::kDefLevelBlock, 99}, empty, rsp3, sess);
@@ -369,6 +391,92 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
   oca::ocp1::Writer rsp4;
   st = root.exec({99, 1}, empty, rsp4, sess);
   BOOST_CHECK(st.status == oca::Status::BadMethod);
+}
+
+// Spec3 CM3 网络对象:OcaNetwork{1,2,1} / OcaControlNetwork{1,4,1}
+// 最小强制实例。 验证 classID 编码、2018 强制方法返值、OcaRoot
+// 基类方法委托(GetClassIdentification)。
+BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
+  oca::OcaNetwork net(4097);
+  oca::OcaControlNetwork ctrl(4098);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // OcaNetwork GetClassIdentification(defLevel 1 委托)-> {1,2,1} v1
+  oca::ocp1::Writer r1;
+  auto st = net.exec(
+      {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
+      empty, r1, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  oca::ocp1::Reader rd1(r1.data(), r1.size());
+  BOOST_CHECK_EQUAL(rd1.u16(), 3u);  // fieldCount
+  BOOST_CHECK_EQUAL(rd1.u16(), 1u);
+  BOOST_CHECK_EQUAL(rd1.u16(), 2u);
+  BOOST_CHECK_EQUAL(rd1.u16(), 1u);
+  BOOST_CHECK_EQUAL(rd1.u16(), 1u);  // ClassVersion=1
+
+  // OcaNetwork 强制方法(defLevel 3 == fieldCount)
+  oca::ocp1::Writer wLink;
+  st = net.exec({oca::methods::kDefLevelBlock, oca::methods::kNet2GetLinkType},
+                empty, wLink, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wLink.data(), wLink.size()).u8(), 1u);
+
+  oca::ocp1::Writer wCtrl;
+  st = net.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kNet2GetControlProtocol},
+      empty, wCtrl, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wCtrl.data(), wCtrl.size()).u8(), 1u);
+
+  oca::ocp1::Writer wMedia;
+  st = net.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kNet2GetMediaProtocol},
+      empty, wMedia, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wMedia.data(), wMedia.size()).u8(), 0u);
+
+  // OcaNetwork GetIDAdvertised -> OcaBlob:u16 len=0(空 NetworkNodeID)
+  oca::ocp1::Writer wId;
+  st = net.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kNet2GetIDAdvertised}, empty,
+      wId, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wId.data(), wId.size()).u16(), 0u);
+
+  // OcaNetwork GetSystemInterfaces -> 空 List(u16 count=0)
+  oca::ocp1::Writer wIf;
+  st = net.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kNet2GetSystemInterfaces},
+      empty, wIf, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wIf.data(), wIf.size()).u16(), 0u);
+
+  // OcaNetwork 未知方法 -> NotImplemented
+  oca::ocp1::Writer wUnk;
+  st = net.exec({oca::methods::kDefLevelBlock, 99}, empty, wUnk, sess);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
+
+  // OcaControlNetwork GetControlProtocol(1) -> OCP.1=1
+  oca::ocp1::Writer wCC;
+  st = ctrl.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kCtrlNetGetControlProtocol},
+      empty, wCC, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wCC.data(), wCC.size()).u8(), 1u);
+
+  // OcaControlNetwork GetClassIdentification -> {1,4,1} v1
+  oca::ocp1::Writer r2;
+  st = ctrl.exec(
+      {oca::methods::kDefLevelRoot, oca::methods::kRootGetClassIdentification},
+      empty, r2, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  oca::ocp1::Reader rd2(r2.data(), r2.size());
+  BOOST_CHECK_EQUAL(rd2.u16(), 3u);
+  BOOST_CHECK_EQUAL(rd2.u16(), 1u);
+  BOOST_CHECK_EQUAL(rd2.u16(), 4u);
+  BOOST_CHECK_EQUAL(rd2.u16(), 1u);
+  BOOST_CHECK_EQUAL(rd2.u16(), 1u);
 }
 
 BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
@@ -1047,7 +1155,8 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   oca::ocp1::Reader pr(rsps[0].paramData, rsps[0].paramBytes);
   BOOST_CHECK_EQUAL(pr.string(), "AES67 daemon abc123");
 
-  // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification> [1,4,6]
+  // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification>
+  //  [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
   // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion
   oca::ocp1::Writer cw2;
   oca::ocp1::write_command(
@@ -1063,7 +1172,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
       rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
   oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // 3 members
+  BOOST_CHECK_EQUAL(pr2.u16(), 5u);  // 5 members(3 管理器 + 2 CM3)
   // ONo=1 DeviceManager {1,3,1} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
@@ -1085,6 +1194,20 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 6u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  // ONo=4097 OcaNetwork {1,2,1} v1(Spec3 CM3,DeprecatedSince 2018)
+  BOOST_CHECK_EQUAL(pr2.u32(), 4097u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);  // ClassVersion=1
+  // ONo=4098 OcaControlNetwork {1,4,1} v1(Spec3 CM3,AvailableSince 2018)
+  BOOST_CHECK_EQUAL(pr2.u32(), 4098u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 4u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);  // ClassVersion=1
 
   ::close(sock);
   server.stop();
@@ -1189,13 +1312,14 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     BOOST_CHECK_EQUAL(r.string(), "bondagit-3.1.0");
   }
 
-  // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification> [1,4,6]
+  // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification>
+  //     [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
   auto r3 = cmd(3, 100,
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
   {
     oca::ocp1::Reader r(r3.paramData, r3.paramBytes);
-    BOOST_CHECK_EQUAL(r.u16(), 3u);  // 3 members
+    BOOST_CHECK_EQUAL(r.u16(), 5u);  // 5 members(3 管理器 + 2 CM3)
     // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion;只校验 ONo
     BOOST_CHECK_EQUAL(r.u32(), 1u);
     r.u16();  // skip ClassID fieldCount
@@ -1210,6 +1334,20 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();
     r.u16();
     BOOST_CHECK_EQUAL(r.u32(), 6u);
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    // ONo=4097 OcaNetwork {1,2,1} v1(CM3)
+    BOOST_CHECK_EQUAL(r.u32(), 4097u);
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    // ONo=4098 OcaControlNetwork {1,4,1} v1(CM3)
+    BOOST_CHECK_EQUAL(r.u32(), 4098u);
     r.u16();
     r.u16();
     r.u16();

@@ -23,13 +23,20 @@ Testing 0 mandatory object(s) for compliancy
 ```
 最后一行 `mandatoryObjects=0` 是关键:工具的 deviceReportedObjects 里有根块{1,1,3}@ONo 100(pcap 确认 GetClassIdentification 返回 `{1,1,3} v2`),但**所有** mandatory BlockMemberInfo(含 OcaBlock{1.1.3})在 TestObjects 第一个匹配循环中 `bFound=false`。
 
-### 调研结论(test4 匹配逻辑,MinimumObjectCompliancyTest.cpp TestObjects + BaseTestClass.cpp ParseObject)
-- 匹配条件:`xmlClassId.fieldCount == reported.fieldCount`(或 xml 更短基类前缀)+ `memcmp(fields)==0`。OcaBlock{1,1,3} vs 根块{1,1,3}:fieldCount 均为 3,字段相同 → **应匹配**。
-- AvailableSince 版本门:OcaBlock 无 AvailableSince(availableSince=0),OcaNetwork{1.2.1} DeprecatedSince=AES70-2018(但 ParseObject **未对 deprecatedSince 做排除**——只看 availableSince),OcaControlNetwork{1.4.1}/OcaApplicationNetwork{1.4}/OcaMediaTransportNetwork{1.4.2} AvailableSince=AES70-2018 → 测试 AES70-2018 下 bAvailable=true,均加入 m_blockMemberInfos。
-- **未解疑点**:mandatoryObjects=0 表明连 OcaBlock{1.1.3} 也未匹配到根块{1,1,3},与源码匹配逻辑表面矛盾。两种可能:
-  1. 根块 GetMembersRecursive(3,6)返 NotImplemented(6),回退 GetMembers(3,5)返 managers [1,4,6](**不含根块自身**),但 GetObjects line 255 显式补根块 → 应有 4 对象。
-  2. classID 比较存在未发现的语义差异(如 OcaLiteClassID 字段数/编码)。**需 T1 spec-0 阶段先复现确认**(见下)。
-- test5 OCC Compliancy(对象 1/4/6)**Passed** → 根块成员枚举与管理器对象在 test5 语境下可接受。test4 失败**仅**因 mandatory BlockMember 对象(OcaBlock/OcaNetwork/OcaControlNetwork),**非**强制方法实现问题(DevMgr/SubMgr/NetMgr 方法 test5 全 implements 通过)。
+### 根因已坐实(2026-07-10 精读 MinimumObjectCompliancyTest.cpp GetObjects line 246-291)
+`mandatoryObjects=0` / "Missing OcaBlock" **不是 classID 编码问题**,而是**工具侧 GetObjects 回退路径的赋值覆盖丢根块**:
+
+1. line 252 `GetClassIdentification(OCA_ROOT_BLOCK_ONO=100)` OK → line 255 `outputMembers.Add(根块{1,1,3}@100)`(根块已入列表)。
+2. line 260 `GetMembersRecursive(100)`:daemon 当前对 `kBlockGetMembersRecursive`(defLevel3 mi=6)返 **NotImplemented(6)** → `bTestRootBlockResult=false`。
+3. 走 else 回退(line 272-287):line 276 `GetMembers(100)` 返 OK + [1,4,6],line 279 **`outputMembers = members;`(赋值覆盖)** → **根块 100 被丢弃**,outputMembers 只剩 [1,4,6]。
+4. `HandleMembers` 递归(line 280)只对 classID 是 OcaBlock{1,1,3} 前缀的成员做 GetMembers 递归;DevMgr{1,3,1}/SubMgr{1,3,4}/NetMgr{1,3,6} 均非 Block 前缀 → 不递归。
+5. 最终 `deviceReportedObjects` = [1,4,6],**根块{1,1,3}@100 不在**。testObjects 第一个匹配循环遍历 m_blockMemberInfos,根块缺席 → OcaBlock{1.1.3} `bFound=false` → "Missing mandatory object OcaBlock";同理 OcaNetwork/OcaControlNetwork 不在 deviceReportedObjects(未实例化)→ 一起 Missing。`mandatoryObjects=0`。
+
+匹配逻辑本身(line 537-543)无 bug:OcaBlock{1,1,3} vs 根块{1,1,3} fieldCount 均 3、memcmp==0 → **本应匹配**。问题纯粹是根块没进 `deviceReportedObjects`。
+
+### daemon 侧解法(dual fix)
+- **Fix-A(消除"Missing OcaBlock"):实现 `OcaBlock::GetMembersRecursive`(defLevel3 mi=6)返 OK + 非空**。工具即走 GetObjects line 262 的 if 分支(累加到 outputMembers,**不覆盖**根块),deviceReportedObjects 含根块 100 → OcaBlock{1.1.3} 匹配命中。返回结构:Ocp1List<OcaBlockMember>,每元素 = {ONo u32 + ClassID(fieldCount u16+levels u16*)+ ClassVersion u16 + ContainerONo u32}。成员 = 根块直系 [1,4,6],ContainerONo=100。
+- **Fix-B(消除"Missing OcaNetwork/OcaControlNetwork"):实例化 CM3 网络对象**,加入 GetMembers / GetMembersRecursive 成员列表。OcaBlock 既已由 Fix-A 解决,无需新增 OcaBlock 实例(根块自身即 OcaBlock)。
 
 ### CM3 对象权威事实(ReferenceOCCMembers.xml 坐实)
 
@@ -43,19 +50,22 @@ Testing 0 mandatory object(s) for compliancy
 
 BlockMembers ONo 范围:**4096-4294967295**(非根块成员;根块自身 ONo=100 例外)。
 
-### Spec3 冲 5/5 路径(v1 草案)
-1. **spec-0 复现**:对当前 4/5 daemon 跑 test4 + tcpdump,逐字节核对 GetObjects 的 deviceReportedObjects 内容、TestObjects 匹配循环为何 bFound=0。**先解疑点**,避免补错对象。
-2. **新增 CM3 对象类**:在 `daemon/oca/classes/` 新增 `network.cpp/.hpp`(OcaNetwork{1.2.1})、`application_network.hpp`(OcaApplicationNetwork{1.4})、`control_network.hpp`(OcaControlNetwork{1.4.1})、`media_transport_network.hpp`(OcaMediaTransportNetwork{1.4.2})。源码/头注释**标注 `DeprecatedSince AES70-2018`(OcaNetwork)/ `2023 进一步弃用文档说明`**,保留 2023 立场(2018 先例:OcaNetwork 即 DeprecatedSince 2018 仍 mandatory)。
-3. **实例化**:给 4 个网络对象分配 ONo(>=4096,如 4096-4099),注册到 registry,加入根块 GetMembers 成员列表(让 deviceReportedObjects 含它们)。**根块自身**已 ONo 100 = OcaBlock{1.1.3},若 spec-0 确认根块匹配没问题则无需动。
-4. **实现 2018 强制方法**:OcaControlNetwork GetControlProtocol(1);OcaMediaTransportNetwork GetMediaProtocol(1)/GetPorts(2)/GetMax*(5/6/7);OcaNetwork 五个 2018 仍强制方法(最小返空/默认值合规)。ApplicationNetwork 若实例化实现 GetServiceID/GetSystemInterfaces。
-5. **DefLevel 常量**:OcaNetwork defLevel 4?需对照 OCAMicro `OcaLiteNetwork` 类树。OcaApplicationNetwork{1.4} defLevel 2,OcaControlNetwork{1.4.1}/MediaTransport{1.4.2} defLevel 3。
-6. **验证**:oca-test 加 CM3 对象用例;oca-probe 扩展;用户 Win 重跑 test4 → **5/5**(预期)。
+### Spec3 冲 5/5 路径(v2,根因坐实后收敛)
+**范围收敛**:日志只报 3 条 Missing(OcaBlock/OcaNetwork/OcaControlNetwork),**未报 OcaMediaTransportNetwork**。源码精读印证:MediaTransportNetwork 的 mandatory 受 `DeviceType=Streaming` 门控(BaseTestClass.cpp:499-504);用户运行工具时未传 `-t streaming` → `GetSupportedDeviceTypes()` 不含 OCA_STREAMING → 该 Mandatory 节不满足 → isMandatory 留 false → 不入 m_blockMemberInfos → 不报 Missing。同理 OcaApplicationNetwork 无 MandatoryMap=true 条目 → 非强制。**CM3 实例化范围收敛到 2 类:OcaNetwork{1.2.1} + OcaControlNetwork{1.4.1}**。
+1. **Fix-A(GetMembersRecursive 实装)**:`OcaBlock::exec` 新增 `kBlockGetMembersRecursive`(defLevel3 mi=6)分支,返 OK + Ocp1List<OcaBlockMember>。每元素 = `{ONo u32 + ClassID(fieldCount u16+levels u16*) + ClassVersion u16 + ContainerONo u32}`,成员 = 根块直系 [1,4,6, +CM3 ONo],ContainerONo=100。工具 GetObjects line 260 rc==OK && Count>0 → 走 if 累加分支(line 262-271),**不再赋值覆盖根块** → deviceReportedObjects 含根块 100 → OcaBlock{1.1.3} 匹配命中。**单此一项即消除 "Missing OcaBlock"**。
+2. **Fix-B(实例化 2 个 CM3 网络对象)**:新增 `network.cpp/.hpp`(OcaNetwork{1.2.1},defLevel 4)、`control_network.cpp/.hpp`(OcaControlNetwork{1.4.1},defLevel 3)。注释标注 **`DeprecatedSince AES70-2018` / `2023 立场:已弃用,本实例仅为兼容 AES70-2018 工具的最小强制实例`**。分配 ONo >=4096(network=4097,control_network=4098,避开 4096 边界),注册 registry,加入根块 GetMembers/GetMembersRecursive 成员列表。
+3. **实现 2018 强制方法(最小合规)**:
+   - OcaNetwork{1.2.1}:GetLinkType(1)/GetIDAdvertised(2)/GetControlProtocol(4)/GetMediaProtocol(5)/GetSystemInterfaces(9) 五个 2018 仍强制方法。最小返:LinkType 默认值(如 Ethernet=0)、IDAdvertised 空 string、ControlProtocol=OCP1(1)、MediaProtocol=Undefined(0)、SystemInterfaces 空 List<NetworkAddress>。
+   - OcaControlNetwork{1.4.1}:GetControlProtocol(1) 返 OCP1=1。
+   - **DefLevel 一致性**:OcaNetwork{1.2.1} defLevel 4(OcaNetwork 在 OcaAgent{1.2} 之下,OcaRoot{1}.OcaAgent{1.2}.OcaNetwork{1.2.1}),对照 OCAMicro `OcaLiteNetwork` 类树核定;OcaControlNetwork{1.4.1} defLevel 3。两者 exec 第一层按 defLevel 分派,非本层方法委托基类(OcaRoot.handle_root / Worker)以确保 GetClassIdentification 等 OcaRoot 方法仍工作。
+4. **DefLevel 常量**:在 `methods.hpp` 新增 `kDefLevelNetwork=4`、`kDefLevelControlNetwork=3`;方法索引 `kNet2GetLinkType=1`/`kNet2GetIDAdvertised=2`/`kNet2GetControlProtocol=4`/`kNet2GetMediaProtocol=5`/`kNet2GetSystemInterfaces=9`(OcaNetwork Agent 层级,需对照 OCAMicro `OcaLiteNetwork.defLevel` 核实,可能 defLevel=4 也可能继承 Agent 的 2,以上线协议无差别——exec 仅按 defLevel 分派到本类或委托)。
+5. **验证**:oca-test 加 GetMembersRecursive wire 用例 + CM3 对象 classID/方法用例;oca-probe 扩展;用户 Win 重跑 test4(确认未传 -t streaming)→ **5/5**(预期)。若仍缺,根据新日志的 Missing 条目二次收敛。
 
 ### 关键风险/开放问题
-- **spec-0 疑点未解**:mandatoryObjects=0 表明即使 OcaBlock{1.1.3} 也未匹配根块——若这是 classID 编码问题,补 CM3 对象也不一定能修。**必须先复现坐实**。
-- OcaNetwork{1.2.1} 在 2023 已弃用,但 2018 工具 mandatory → 补它有违 2023 Annex B 权威取舍(用户已明确"符合 2018 但标 2023 弃用",Acceptable)。
-- OcaMediaTransportNetwork Mandatory DeviceType=Streaming → daemon 是否算 streaming 设备需确认(TestContext::GetSupportedDeviceTypes)。
-- 补 CM3 后 test4 过 5/5,但 fork 的 2023 合规立场需在设计文档显式说明"为 2018 工具兼容添加 2023 弃用对象"。
+- **OcaNetwork defLevel 待核实**:OCAMicro `OcaLiteNetwork` 的 defLevel 是 4(Network 在 Agent{1.2} 之下)还是别的值。需读 `OcaLiteNetwork.h` 的 `static const OcaLiteClassID CLASS_ID` 与 defLevel 常量,确保 exec 分派层与 GetClassIdentification 返回的 classID 一致(**工具 memcmp 比较的是线端 classID 字段,defLevel 仅 daemon 内部分派用**——线端只看 classID{1,2,1} 三个字段)。
+- OcaNetwork{1.2.1} 在 2023 已弃用,但 2018 工具 mandatory → 补它有违 2023 Annex B 权威取舍(用户明确"符合 2018 但标 2023 已弃用",Acceptable)。源码注释与设计文档须显式声明"为 2018 工具兼容添加 2023 弃用对象"。
+- OcaMediaTransportNetwork/OcaApplicationNetwork **本次不实例化**:前者非 streaming 门控下非 mandatory(用户不传 -t streaming),后者永非 mandatory。若将来用户传 -t streaming,再评估 MediaTransportNetwork。
+- 补 CM3 后需重跑 oca-test 26/26 + test4 真机,确认无方法被工具判 BadMethod/NotImplemented(尤其 OcaNetwork 5 个强制方法的 status 不能是 BAD_METHOD/NOT_IMPLEMENTED,见 CheckMethods line 55-57)。
 
 ## 后续任务(Spec3 及之后,粗规划)
 

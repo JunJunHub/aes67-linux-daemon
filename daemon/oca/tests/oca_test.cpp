@@ -501,17 +501,18 @@ BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
 
   // OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对 4098 也
   // 测 GetServiceID(4)/GetSystemInterfaces(6)(Mandatory=true)。
+  // AppNet{1,4} defLevel=fieldCount=2,工具按 defLevel=2 调用。
   oca::ocp1::Writer wSvc;
   st = ctrl.exec(
-      {oca::methods::kDefLevelBlock, oca::methods::kAppNetGetServiceID}, empty,
-      wSvc, sess);
+      {oca::methods::kDefLevelManager, oca::methods::kAppNetGetServiceID},
+      empty, wSvc, sess);
   BOOST_CHECK(st.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(wSvc.data(), wSvc.size()).u16(), 0u);
 
   oca::ocp1::Writer wIf2;
-  st = ctrl.exec(
-      {oca::methods::kDefLevelBlock, oca::methods::kAppNetGetSystemInterfaces},
-      empty, wIf2, sess);
+  st = ctrl.exec({oca::methods::kDefLevelManager,
+                  oca::methods::kAppNetGetSystemInterfaces},
+                 empty, wIf2, sess);
   BOOST_CHECK(st.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(wIf2.data(), wIf2.size()).u16(), 0u);
 

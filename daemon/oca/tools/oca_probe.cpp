@@ -756,7 +756,8 @@ int main(int argc, char** argv) {
            {m::kAppNetGetServiceID, "OcaControlNetwork.GetServiceID"},
            {m::kAppNetGetSystemInterfaces,
             "OcaControlNetwork.GetSystemInterfaces"}}) {
-    auto r = probe.cmd0(4098, {m::kDefLevelBlock, mi});
+    auto r =
+        probe.cmd0(4098, {m::kDefLevelManager, mi});  // AppNet{1,4} defLevel=2
     if (r.ok && r.status == o::Status::OK) {
       std::cout << OK() << "  [OK] " << name << "(" << mi << ") -> OK" << OFF()
                 << "\n";

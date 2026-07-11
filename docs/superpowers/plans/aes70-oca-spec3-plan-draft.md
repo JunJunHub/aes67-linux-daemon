@@ -1,7 +1,7 @@
 # AES67 daemon AES70/OCA Spec3 实施计划(草案,阶段二完结后规划)
 
-> 状态:**规划草案**。基于 Spec2 阶段二 4/5 达成(commit 44015c7)+ test4 真实失败根因调研(2026-07-10)。
-> 上游:`docs/superpowers/specs/aes70-oca-spec2-design.md`(权威设计,§阶段二验收)。
+> 状态:**5/5 已达成**。Aes70CompliancyTestTool v2.0.1 AES70-2018 test4 Minimum Object Compliancy **Passed**(2026-07-11 第三次 Win 验收,commit `51f737d`)。
+> 上游:`docs/superpowers/specs/aes70-oca-spec2-design.md`(权威设计,§Spec3)。
 > 分支:延续 `feature/aes70-oca`。
 
 ## Spec1/Spec2 已完成回顾

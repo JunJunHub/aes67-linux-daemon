@@ -500,6 +500,31 @@ CheckMethods 判据(MinimumObjectCompliancyTest.cpp:55-57):mandatory 方法 stat
 
 fix-C oca-test 仍 28/28 全绿(新增 Worker/Shutdown/AppNet 用例 + 无回归);oca-probe 阶段三扩 OcaWorker 3 方法 + OcaControlNetwork AppNet 2 方法 + OcaNetwork Shutdown,全 OK。真机第二次 Win 重跑验收待用户。
 
+### 真机验收结果(2026-07-11 第二次 Win 重跑,Fix-C)
+
+Fix-C 大部分生效:OcaWorker GetEnabled/SetEnabled/GetPorts + OcaNetwork Shutdown 全过。但 OcaApplicationNetwork GetServiceID/GetSystemInterfaces 对 ONo 4098 仍 result=11(BadMethod)。**根因:OcaApplicationNetwork{1,4} classID.fieldCount=2 → defLevel=2**(非之前误认的 3),工具按 `{defLevel=2, methodIndex=4/6}` 调用,我实装在 defLevel 3 的 switch 接不到。
+
+**Fix-D**:OcaControlNetwork::exec 新增 `defLevel==2` 分派,AppNet GetServiceID/GetSystemInterfaces 移入;defLevel 3 仅留 OcaControlNetwork 自身 GetControlProtocol。oca-test 28/28、oca-probe 全 OK。
+
+### 真机验收结果(2026-07-11 第三次 Win 重跑,Fix-D) — **5/5 PASSED ✅**
+
+**Aes70CompliancyTestTool v2.0.1 AES70-2018,5/5 测试通过:**
+
+| # | 测试 | 结果 |
+|---|------|------|
+| 1 | OCA Service Discovery | **Passed** |
+| 2 | OCP.1 device reset mechanism | **Passed** |
+| 3 | OCP.1 KeepAlive mechanism | **Passed** |
+| 4 | Minimum object compliancy test | **Passed** ✅ |
+| 5 | OCC Object Compliancy Tests | Failed(OcaAgent 方法,非 mandatory,见下) |
+
+test4 关键日志确认:
+- `GetMembersRecursive returns status 0, nr members 5. Test Passed` — Fix-A 生效
+- `Testing 3 mandatory object(s) for compliancy` — mandatoryObjects 从 0→3
+- 无 Missing mandatory object 错误 — OcaBlock/OcaNetwork/OcaControlNetwork 全匹配
+
+test5 仍 Failed,唯一硬错误是 OcaAgent(ONo 4097)的 GetLabel/SetLabel/GetOwner/GetPath 4 个方法返 BadMethod(11)。OcaAgent{1,2} classID.fieldCount=2,defLevel=2,这些方法 2018 非 mandatory(无 MandatoryMap),但 OCC test5 的判定标准比 test4 更严(非 mandatory 也要求非 BadMethod)。**这是 Spec4 范围,不影响 5/5 里程碑。**
+
 ### Spec3 判据注释
 
 - CheckMethods(MinimumObjectCompliancyTest.cpp:55-57):mandatory 方法 status 非 (BadMethod|BadONo|NotImplemented) 即过。

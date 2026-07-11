@@ -328,6 +328,78 @@ conn_loop 内**栈上** `Session sess`。连接断开（循环退出）时 `sub_
 
 > **已知限制**：conn_threads_ 只增不减（已结束线程保留至 stop 统一 join），长运行 daemon 会累积线程句柄。
 
+### mDNS 服务发布（MdnsPublisher）
+
+OCA 设备通过 `_oca._tcp` mDNS 服务被控制器发现。实现位于 `daemon/oca/mdns_publisher.{hpp,cpp}`，整个类条件编译在 `#ifdef _USE_AVAHI_` 后，构建需同时启用 `WITH_OCA=ON` + `WITH_AVAHI=ON`。
+
+#### 注册流程
+
+```mermaid
+flowchart TB
+    A["OcaServer::start()"] --> B{"mdns_enabled?"}
+    B -->|是| C["MdnsPublisher(name, port)"]
+    C --> D["start()"]
+    D --> E["avahi_threaded_poll_new()"]
+    E --> F["avahi_client_new(client_cb)"]
+    F --> G["avahi_threaded_poll_start()"]
+    G --> H{"client_cb<br/>AVahiClientState"}
+    H -->|S_RUNNING| I["create_service()"]
+    I --> J["avahi_entry_group_add_service<br/>_oca._tcp / AVAHI_IF_UNSPEC"]
+    J --> K{"冲突?"}
+    K -->|是| L["avahi_alternative_service_name<br/>自动重命名"]
+    K -->|否| M["注册成功"]
+    L --> M
+```
+
+1. `OcaServer::start()` 检查 `cfg_.mdns_enabled`，为真时构造 `MdnsPublisher(device_name, port)` 并调用 `start()`
+2. `start()` 创建 Avahi 线程化 poll + Client，启动事件循环
+3. Client 达到 `AVAHI_CLIENT_S_RUNNING` 状态时回调 `client_cb` -> `create_service()`
+4. `create_service()` 调用 `avahi_entry_group_add_service()` 注册 `_oca._tcp` 服务，TXT 记录 `txtvers=1` + `protovers=1`
+5. 名称冲突时自动调用 `avahi_alternative_service_name()` 重命名
+
+#### 关键设计：全接口发布
+
+OCA mDNS 与主 daemon 的 `MDNSServer` 在接口选择上有关键差异：
+
+| 对比项 | MDNSServer（Ravenna 服务） | oca::MdnsPublisher（OCA 服务） |
+|--------|---------------------------|-------------------------------|
+| 接口参数 | `config->get_interface_idx()`（仅指定接口） | `AVAHI_IF_UNSPEC`（所有接口） |
+| 协议 | `AVAHI_PROTO_INET`（仅 IPv4） | `AVAHI_PROTO_UNSPEC`（IPv4 + IPv6） |
+| 服务类型 | `_http._tcp`、`_rtsp._tcp` + `_ravenna._sub` 子类型 | `_oca._tcp` |
+| TXT 记录 | 无 | `txtvers=1`、`protovers=1` |
+| 冲突处理 | 日志警告，不自动重命名 | `avahi_alternative_service_name()` 自动重命名 |
+
+**全接口发布是有意为之**：OCP.1 Transport 绑定 `INADDR_ANY`（所有接口监听），mDNS 在所有接口发布与之一致。主 daemon 的 `interface_name` 配置对 OCA mDNS **无影响**——OcaServerConfig 不传递接口索引，MdnsPublisher 构造函数仅接收 `name` + `port`。
+
+#### 状态查询命令
+
+```bash
+# 列出所有 _oca._tcp 服务（含接口、协议、解析地址）
+avahi-browse -rtp _oca._tcp
+
+# 过滤特定接口（如 ens160）
+avahi-browse -rtp _oca._tcp | grep ens160
+
+# 仅显示已解析的条目（= 开头为已解析，+ 为待解析）
+avahi-browse -rtp _oca._tcp | grep '^='
+
+# oca-dev.sh 内置检查（超时 5 秒，显示前 20 行）
+./oca-dev.sh status
+```
+
+> **注意**：`avahi-browse -r` 需要等待 DNS-SD 解析，多接口环境下耗时较长。`oca-dev.sh` 默认 `timeout 5`（此前为 `timeout 2 | head -5`，在多接口机器上容易截断遗漏）。
+
+#### 诊断清单
+
+mDNS 不出现时按以下步骤排查：
+
+1. **avahi-daemon 是否运行**：`systemctl status avahi-daemon`
+2. **构建是否启用 AVAHI**：检查 `daemon/build/CMakeCache.txt` 中 `WITH_AVAHI` 是否为 `ON`
+3. **配置是否启用 mDNS**：`cat /tmp/aes67-dev.*.conf | python3 -m json.tool | grep oca`，确认 `oca_enabled=true`
+4. **服务是否注册**：`avahi-browse -rtp _oca._tcp | grep Daemon`
+5. **端口是否监听**：`ss -tlnp | grep 65037`
+6. **防火墙**：mDNS 使用 UDP 5353 多播，确认 `iptables -L INPUT` 不阻断
+
 ## 门面与集成
 
 ### OcaServer

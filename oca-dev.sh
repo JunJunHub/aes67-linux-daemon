@@ -201,7 +201,7 @@ cmd_status() {
   # mDNS 发布检查(若 avahi-browse 可用)
   if command -v avahi-browse >/dev/null 2>&1; then
     echo "=== mDNS _oca._tcp (avahi-browse) ==="
-    timeout 2 avahi-browse -rtp _oca._tcp 2>/dev/null | head -5 || echo "  (no response)"
+    timeout 5 avahi-browse -rtp _oca._tcp 2>/dev/null | head -20 || echo "  (no response)"
   else
     echo "=== mDNS ==="
     echo "  avahi-browse 未安装(sudo apt install -y avahi-utils)"

@@ -4,7 +4,7 @@
 
 **Goal:** 在阶段一(真实控制器 3/5)基础上,补齐 2018 工具强制方法 + EV1/EV2 订阅 + 2023 GetProduct/GetManufacturer,使 **OCC Object Compliancy 测试转过(目标 4/5)**,坚守 AES70-2023 Annex B 基准(不新增 CM3 弃用对象)。
 
-**Scope:** 本计划覆盖**阶段二**(用户选定 Option A:补方法 + EV1 订阅,不加 CM3)。阶段一(G0/G11/G1/G2/G9/G10/G12)已完成,见 `aes70-oca-spec2-plan.md`。
+**Scope:** 本计划覆盖**阶段二**(用户选定 Option A:补方法 + EV1 订阅,不加 CM3)。阶段一(G0/G11/G1/G2/G9/G10/G12)已完成,见 `aes70-oca-spec2-phase1-plan.md`。
 
 **Architecture:** 不改 Spec1 四层架构,仅在现有 `daemon/oca/` 内新增方法分派 + 实现。无新文件、无新依赖。
 

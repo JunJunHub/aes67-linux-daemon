@@ -3721,7 +3721,7 @@ git commit -m "test(oca): Spec1 E2E 验收(发现/身份/订阅/事件)与真实
 
 ## 执行交接
 
-计划已保存到 `docs/superpowers/plans/aes70-oca-spec1-plan.md`。两种执行方式:
+计划已保存到 `docs/superpowers/plans/aes70-oca-spec1-phase1-plan.md`。两种执行方式:
 
 **1. Subagent 驱动(推荐)** - 每个 Task 派一个全新 subagent 实现,任务间做两阶段 review,迭代快。
 

@@ -52,6 +52,37 @@ ExecResult OcaRoot::exec(MethodID m,
   return {Status::BadMethod, 0};
 }
 
+ExecResult OcaWorker::exec(MethodID m,
+                           ocp1::Reader& req,
+                           ocp1::Writer& rsp,
+                           Session& sess) {
+  if (m.defLevel ==
+      methods::kDefLevelManager) {  // OcaWorker defLevel 2 ({1,1})
+    return handle_worker(m.methodIndex, req, rsp);
+  }
+  return OcaRoot::exec(m, req, rsp, sess);  // 委托 DefLevel 1 -> OcaRoot
+}
+
+ExecResult OcaWorker::handle_worker(uint16_t idx,
+                                    ocp1::Reader& req,
+                                    ocp1::Writer& rsp) {
+  switch (idx) {
+    case methods::kWorkerGetEnabled:
+      rsp.u8(1);  // Boolean: enabled(daemon 始终启用)
+      return {Status::OK, 1};
+    case methods::kWorkerSetEnabled:
+      // 工具探测可能发空体(paramBytes=0)或 1 字节 Boolean;忽略输入,no-op。
+      if (req.remaining() >= 1)
+        (void)req.u8();
+      return {Status::OK, 0};
+    case methods::kWorkerGetPorts:
+      rsp.u16(0);  // 空 Ocp1List<OcaPort>(根块无端口)
+      return {Status::OK, 1};
+    default:
+      return {Status::NotImplemented, 0};
+  }
+}
+
 ExecResult OcaBlock::exec(MethodID m,
                           ocp1::Reader& req,
                           ocp1::Writer& rsp,

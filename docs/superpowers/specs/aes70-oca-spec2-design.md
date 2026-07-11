@@ -481,3 +481,26 @@ CheckMethods 判据(MinimumObjectCompliancyTest.cpp:55-57):mandatory 方法 stat
 ### 待验收
 
 用户 Win 重跑 test4(Aes70CompliancyTestTool v2.0.1 AES70-2018,**保持未传 `-t streaming`**)→ 预期 "Missing OcaBlock/OcaNetwork/OcaControlNetwork" 三条消失,`mandatoryObjects>0`,Minimum object compliancy 转 **5/5**。
+
+### 真机验收结果(2026-07-11 第一次 Win 重跑)
+
+**结果:3 Passed(发现/Reset/KeepAlive)+ 2 Failed(test4 Minimum + test5 OCC)。** Fix-A/B 解决"Missing OcaBlock/OcaNetwork/OcaControlNetwork"(mandatoryObjects 0→3,3 mandatory 对象全命中,pcap 首命令 `target=100 method={3,6}` GetMembersRecursive 返 OK+5 成员含 ContainerONo=100 坐实)。但 CM3 对象暴露后,新的 mandatory 方法缺口显出:
+
+| 错误行 | 对象/类型 | 缺失方法 | result | 根因 |
+|--------|----------|---------|--------|------|
+| 723-725 | ONo 100 / OcaWorker | GetEnabled(1)/SetEnabled(2)/GetPorts(5) | 11(BadMethod) | 根块是 OcaWorker 子类,无 DefLevel-2 分派 |
+| 739 | ONo 4097 / OcaNetwork | Shutdown(13) | 8(NotImpl) | XML 2018 Mandatory=false 但工具仍判 mandatory(日志坐实,源码理论矛盾保留) |
+| 743-744 | ONo 4098 / OcaApplicationNetwork | GetServiceID(4)/GetSystemInterfaces(6) | 11 | OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对 4098 也测 |
+
+### Spec3 二次收敛补丁(Fix-C)
+
+1. **OcaWorker DefLevel-2 强制方法**:新增 `OcaWorker::exec` override + `handle_worker`,GetEnabled→u8(1)、SetEnabled(空体安全,0 params)、GetPorts→空 List。委托链 OcaBlock→OcaWorker→OcaRoot 补齐。test5 的 OcaWorker AddPort/DeletePort/GetPortName/GetLabel/SetLabel/GetOwner/GetLatency/SetLatency(XML 非 mandatory)报"may return not implemented",信息性非失败根因。
+2. **OcaNetwork Shutdown(13)**:no-op 返 OK 0 params。为何工具判 mandatory 而 XML=`Mandatory=false` 仍未解(BaseTestClass.cpp:497 后写覆盖理论应得 false,与日志矛盾),实证补齐。
+3. **OcaControlNetwork 实装 OcaApplicationNetwork 强制方法**:GetServiceID→空 OcaString、GetSystemInterfaces→空 List。因 classID 前缀匹配,工具对 4098 同时测两类型的方法。
+
+fix-C oca-test 仍 28/28 全绿(新增 Worker/Shutdown/AppNet 用例 + 无回归);oca-probe 阶段三扩 OcaWorker 3 方法 + OcaControlNetwork AppNet 2 方法 + OcaNetwork Shutdown,全 OK。真机第二次 Win 重跑验收待用户。
+
+### Spec3 判据注释
+
+- CheckMethods(MinimumObjectCompliancyTest.cpp:55-57):mandatory 方法 status 非 (BadMethod|BadONo|NotImplemented) 即过。
+- 工具 classID 匹配用**前缀**(`xml.fieldCount <= reported` + memcmp 较短前缀):OcaControlNetwork{1,4,1} 既匹配 OcaControlNetwork{1,4.1} 也匹配基类 OcaApplicationNetwork{1,4} → 两类型方法都得实装。同类 OcaNetwork{1,2,1} 匹配 OcaAgent{1,2}(Agent 方法 2018 非 mandatory,可跳过)。

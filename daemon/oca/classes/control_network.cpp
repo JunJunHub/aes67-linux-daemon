@@ -25,6 +25,15 @@ ExecResult OcaControlNetwork::exec(MethodID m,
         // OcaNetworkControlProtocol(u8):OCP.1=1
         rsp.u8(1);
         return {Status::OK, 1};
+      case methods::kAppNetGetServiceID:
+        // OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对
+        // 本实例也测 GetServiceID(Mandatory=true)。返空 OcaString(码点计数 0)。
+        rsp.string("");
+        return {Status::OK, 1};
+      case methods::kAppNetGetSystemInterfaces:
+        // 同上,返空 Ocp1List<OcaNetworkSystemInterfaceID>(u16 count=0)。
+        rsp.u16(0);
+        return {Status::OK, 1};
       default:
         return {Status::NotImplemented, 0};
     }

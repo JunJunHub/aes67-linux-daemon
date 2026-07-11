@@ -749,6 +749,51 @@ int main(int argc, char** argv) {
       probe.failures++;
     }
   }
+  // 8d. OcaControlNetwork 前缀匹配 OcaApplicationNetwork,工具强制
+  //     GetServiceID(4)/GetSystemInterfaces(6)
+  for (auto [mi, name] :
+       std::initializer_list<std::pair<uint16_t, const char*>>{
+           {m::kAppNetGetServiceID, "OcaControlNetwork.GetServiceID"},
+           {m::kAppNetGetSystemInterfaces,
+            "OcaControlNetwork.GetSystemInterfaces"}}) {
+    auto r = probe.cmd0(4098, {m::kDefLevelBlock, mi});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] " << name << "(" << mi << ") -> OK" << OFF()
+                << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] " << name << "(" << mi
+                << ") status=" << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  // 8e. OcaNetwork Shutdown(13)(XML 2018=false 但工具判 mandatory)
+  {
+    auto r = probe.cmd0(4097, {m::kDefLevelBlock, m::kNet2Shutdown});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] OcaNetwork.Shutdown(13) -> OK" << OFF()
+                << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] OcaNetwork.Shutdown(13) status="
+                << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
+  // 8f. OcaWorker(DefLevel 2) 强制方法:根块 100 是 OcaWorker 子类
+  for (auto [mi, name] :
+       std::initializer_list<std::pair<uint16_t, const char*>>{
+           {m::kWorkerGetEnabled, "OcaWorker.GetEnabled"},
+           {m::kWorkerSetEnabled, "OcaWorker.SetEnabled"},
+           {m::kWorkerGetPorts, "OcaWorker.GetPorts"}}) {
+    auto r = probe.cmd0(100, {m::kDefLevelManager, mi});
+    if (r.ok && r.status == o::Status::OK) {
+      std::cout << OK() << "  [OK] " << name << "(" << mi << ") on ONo 100"
+                << " -> OK" << OFF() << "\n";
+    } else {
+      std::cout << ERR() << "  [FAIL] " << name << "(" << mi
+                << ") status=" << status_name(r.status) << OFF() << "\n";
+      probe.failures++;
+    }
+  }
 
   // --- 汇总 ------------------------------------------------------------------
   section("汇总");

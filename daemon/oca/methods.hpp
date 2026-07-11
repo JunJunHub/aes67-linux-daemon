@@ -60,6 +60,21 @@ constexpr uint16_t kBlockGetMembersRecursive =
         // 实装以让合规工具 GetObjects
         // 走非覆盖分支(见 Spec3 根因)
 
+// OcaWorker methods (DefLevel 2, classID{1,1}) - OCAMicro OcaLiteWorker
+// 阶段二工具未测对象 Worker 顺延项,Spec3 实装后 test4 对根块(OcaWorker 子类)
+// 强制 GetEnabled/SetEnabled/GetPorts。最小返值合规(见设计文档 Spec3 节)。
+constexpr uint16_t kWorkerGetEnabled = 1;  // OCAMicro
+constexpr uint16_t kWorkerSetEnabled = 2;  // OCAMicro
+constexpr uint16_t kWorkerGetPorts = 5;    // OCAMicro
+// OcaAgent methods (DefLevel 2, classID{1,2}) - 2018
+// 非强制,跳过(GetLabel/SetLabel /GetOwner/GetPath tool 仅信息性报"may return
+// not implemented") OcaApplicationNetwork methods (DefLevel 2, classID{1,4})
+// OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对 4098 也测
+// GetServiceID/GetSystemInterfaces(Mandatory=true)。在 OcaControlNetwork
+// 实例上实装。
+constexpr uint16_t kAppNetGetServiceID = 4;         // ReferenceOCCMembers
+constexpr uint16_t kAppNetGetSystemInterfaces = 6;  // ReferenceOCCMembers
+
 // OcaNetwork methods (DefLevel 3, classID{1,2,1}) - OCAMicro OcaLiteNetwork
 // DeprecatedSince AES70-2018 / 2023 进一步弃用;本实例仅为兼容 AES70-2018
 // 合规工具的最小强制实例(见 Spec3 计划、设计文档 2023 弃用立场)。
@@ -68,6 +83,9 @@ constexpr uint16_t kNet2GetIDAdvertised = 2;      // OCAMicro
 constexpr uint16_t kNet2GetControlProtocol = 4;   // OCAMicro
 constexpr uint16_t kNet2GetMediaProtocol = 5;     // OCAMicro
 constexpr uint16_t kNet2GetSystemInterfaces = 9;  // OCAMicro
+constexpr uint16_t kNet2Shutdown =
+    13;  // OCAMicro;XML 2018 Mandatory=false 但工具
+         // 仍判 mandatory(日志坐实),实装以合规
 
 // OcaControlNetwork methods (DefLevel 3, classID{1,4,1}) - AES70-2018 mandatory
 // AvailableSince AES70-2018;无 DeviceType 门。唯一强制方法 GetControlProtocol。

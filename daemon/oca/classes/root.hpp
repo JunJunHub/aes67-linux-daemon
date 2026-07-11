@@ -24,9 +24,23 @@ class OcaRoot : public Object {
 };
 
 // OcaWorker {1,1,1} v2:Spec1 无自有 DefLevel-2 方法,委托 OcaRoot
+// Spec3:test4 对根块(OcaWorker 子类)强制 GetEnabled/SetEnabled/GetPorts,
+// 补 DefLevel-2 分派。
 class OcaWorker : public OcaRoot {
  public:
   using OcaRoot::OcaRoot;
+  ExecResult exec(MethodID m,
+                  ocp1::Reader& req,
+                  ocp1::Writer& rsp,
+                  Session& sess) override;
+
+ protected:
+  // OcaWorker DefLevel-2 强制方法:最小返值合规。
+  // GetEnabled->Boolean(1);SetEnabled 读 Boolean 返 0 params;GetPorts->空
+  // List。
+  ExecResult handle_worker(uint16_t methodIndex,
+                           ocp1::Reader& req,
+                           ocp1::Writer& rsp);
 };
 
 // OcaManager {1,2} v2:Spec1 无自有 DefLevel-2 方法,委托 OcaRoot

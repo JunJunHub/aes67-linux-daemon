@@ -382,6 +382,32 @@ BOOST_AUTO_TEST_CASE(dispatch_root_block) {
     BOOST_CHECK_EQUAL(rrec.u32(), 100u);  // ContainerONo = root(100)
   }
 
+  // OcaWorker(DefLevel 2)强制方法:根块是 OcaWorker 子类,test4 对其强制
+  // GetEnabled/SetEnabled/GetPorts(Spec3)。委托链
+  // OcaBlock->OcaWorker->OcaRoot。
+  oca::ocp1::Writer rspW1;
+  st = root.exec(
+      {oca::methods::kDefLevelManager, oca::methods::kWorkerGetEnabled}, empty,
+      rspW1, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(rspW1.data(), rspW1.size()).u8(), 1u);
+
+  // SetEnabled 空体探测安全(返 0 params,不越界)
+  oca::ocp1::Writer rspW2;
+  st = root.exec(
+      {oca::methods::kDefLevelManager, oca::methods::kWorkerSetEnabled}, empty,
+      rspW2, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
+  oca::ocp1::Writer rspW3;
+  st =
+      root.exec({oca::methods::kDefLevelManager, oca::methods::kWorkerGetPorts},
+                empty, rspW3, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(rspW3.data(), rspW3.size()).u16(), 0u);
+
   // 未知方法 -> NotImplemented
   oca::ocp1::Writer rsp3;
   st = root.exec({oca::methods::kDefLevelBlock, 99}, empty, rsp3, sess);
@@ -457,6 +483,14 @@ BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
   st = net.exec({oca::methods::kDefLevelBlock, 99}, empty, wUnk, sess);
   BOOST_CHECK(st.status == oca::Status::NotImplemented);
 
+  // OcaNetwork Shutdown(13) 空体探测安全 -> OK 0 params
+  // (XML 2018 Mandatory=false 但合规工具仍判 mandatory,实装以合规)
+  oca::ocp1::Writer wShut;
+  st = net.exec({oca::methods::kDefLevelBlock, oca::methods::kNet2Shutdown},
+                empty, wShut, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
   // OcaControlNetwork GetControlProtocol(1) -> OCP.1=1
   oca::ocp1::Writer wCC;
   st = ctrl.exec(
@@ -464,6 +498,22 @@ BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
       empty, wCC, sess);
   BOOST_CHECK(st.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(oca::ocp1::Reader(wCC.data(), wCC.size()).u8(), 1u);
+
+  // OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对 4098 也
+  // 测 GetServiceID(4)/GetSystemInterfaces(6)(Mandatory=true)。
+  oca::ocp1::Writer wSvc;
+  st = ctrl.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kAppNetGetServiceID}, empty,
+      wSvc, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wSvc.data(), wSvc.size()).u16(), 0u);
+
+  oca::ocp1::Writer wIf2;
+  st = ctrl.exec(
+      {oca::methods::kDefLevelBlock, oca::methods::kAppNetGetSystemInterfaces},
+      empty, wIf2, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wIf2.data(), wIf2.size()).u16(), 0u);
 
   // OcaControlNetwork GetClassIdentification -> {1,4,1} v1
   oca::ocp1::Writer r2;

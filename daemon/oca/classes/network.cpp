@@ -42,6 +42,9 @@ ExecResult OcaNetwork::exec(MethodID m,
         // Ocp1List<OcaNetworkSystemInterfaceID>:空列表(u16 count=0)
         rsp.u16(0);
         return {Status::OK, 1};
+      case methods::kNet2Shutdown:
+        // 工具探测发空体 Shutdown;daemon 不可停止,no-op 返 OK。
+        return {Status::OK, 0};
       default:
         return {Status::NotImplemented, 0};
     }

@@ -757,6 +757,79 @@ BOOST_AUTO_TEST_CASE(dispatch_property_changed_label_emit) {
   BOOST_CHECK(!sess.take_notification(pdu));  // 无新通知
 }
 
+BOOST_AUTO_TEST_CASE(dispatch_property_changed_enabled_emit) {
+  // Spec4:DeviceManager SetEnabled 发射链,对称于 label emit 用例。
+  // emitter=1(DevMgr ONo),PropertyID{3,1} + OcaBoolean(u8)。
+  oca::OcaDeviceIdentity id;
+  id.manufacturer = "Acme";
+  id.model_name = "AES67-daemon";
+  id.model_version = "bondagit-3.1.0";
+  oca::OcaDeviceManager dm(1, id);
+  oca::OcaSubscriptionManager sm(4);
+  dm.set_event_emitter(&sm);
+  oca::Session sess(1);
+  oca::ObjectRegistry reg;
+  sess.set_registry(&reg);
+  namespace m = oca::methods;
+
+  // 默认 enabled_=true -> GetEnabled=1
+  oca::ocp1::Reader empty(nullptr, 0);
+  oca::ocp1::Writer genrsp;
+  auto st =
+      dm.exec({m::kDefLevelDeviceMngr, m::kDevGetEnabled}, empty, genrsp, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(genrsp.data(), genrsp.size()).u8(), 1u);
+
+  // 订阅 PropertyChanged(emitter=1, PropertyID{3,1})
+  oca::ocp1::Writer reqw;
+  reqw.u32(1);                       // EmitterONo = DevMgr
+  reqw.u16(m::kDefLevelDeviceMngr);  // PropertyID defLevel=3
+  reqw.u16(m::kPropEnabled);         // PropertyID propertyIndex=1
+  reqw.u8(1);                        // DeliveryMode Normal
+  reqw.u16(0);                       // 空 NetworkAddress
+  oca::ocp1::Reader req(reqw.data(), reqw.size());
+  oca::ocp1::Writer rspw;
+  st = sm.exec({m::kDefLevelSubMngr, m::kSubAddPropertyChangeSubscription2},
+               req, rspw, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK(
+      sess.has_subscription(1, {m::kDefLevelRoot, m::kEventPropertyChanged}));
+
+  // SetEnabled(u8=0)->真存 enabled_=false + emit
+  oca::ocp1::Writer setw;
+  setw.u8(0);
+  oca::ocp1::Reader setreq(setw.data(), setw.size());
+  oca::ocp1::Writer setrsp;
+  st = dm.exec({m::kDefLevelDeviceMngr, m::kDevSetEnabled}, setreq, setrsp,
+               sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
+  // 解析 Notification2:data = PropertyID{3,1} + OcaBoolean u8
+  std::vector<uint8_t> pdu;
+  BOOST_REQUIRE(sess.take_notification(pdu));
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  BOOST_REQUIRE(hdr);
+  BOOST_CHECK_EQUAL(hdr->pduType, m::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      pdu.data() + 1 + 9, pdu.size() - 1 - 9, hdr->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 1u);
+  oca::ocp1::Reader dr(ntfs[0].data, ntfs[0].dataCount);
+  BOOST_CHECK_EQUAL(dr.u16(), m::kDefLevelDeviceMngr);
+  BOOST_CHECK_EQUAL(dr.u16(), m::kPropEnabled);
+  BOOST_CHECK_EQUAL(dr.u8(), 0u);
+  BOOST_CHECK(!sess.take_notification(pdu));
+
+  // GetEnabled 回读 == 0(enabled_ 已真存为 false)
+  oca::ocp1::Writer genrsp2;
+  st = dm.exec({m::kDefLevelDeviceMngr, m::kDevGetEnabled}, empty, genrsp2,
+               sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(genrsp2.data(), genrsp2.size()).u8(), 0u);
+}
+
 BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   oca::OcaDeviceIdentity id;
   id.manufacturer = "Acme";

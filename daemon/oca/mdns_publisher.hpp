@@ -16,9 +16,19 @@
 
 namespace oca {
 
+// Spec5:mDNS TXT 记录扩展(Fitcan 控制器期望的设备元数据)
+struct MdnsTxtRecords {
+  std::string ip_addr;
+  std::string ip_addr_sec;
+  std::string mac_addr;
+  std::string device_id;
+  uint32_t channels = 0;
+  std::string firmware;
+};
+
 class MdnsPublisher {
  public:
-  MdnsPublisher(std::string name, uint16_t port);
+  MdnsPublisher(std::string name, uint16_t port, MdnsTxtRecords txt = {});
   ~MdnsPublisher();
   bool start();
   void stop();
@@ -34,6 +44,7 @@ class MdnsPublisher {
 
   std::string name_;
   uint16_t port_;
+  MdnsTxtRecords txt_;
   struct AvahiThreadedPoll* poll_ = nullptr;
   struct AvahiClient* client_ = nullptr;
   struct AvahiEntryGroup* group_ = nullptr;

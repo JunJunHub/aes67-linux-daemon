@@ -21,14 +21,27 @@ ExecResult OcaNetworkManager::exec(MethodID m,
   if (m.defLevel == methods::kDefLevelNetworkMngr) {
     switch (m.methodIndex) {
       case methods::kNetGetNetworks:
+        // Spec5:返回 [4097, 4098, 8192]
+        rsp.u16(3);
+        rsp.u32(4097);  // OcaNetwork
+        rsp.u32(4098);  // OcaControlNetwork
+        rsp.u32(8192);  // OcaMediaTransportNetworkAES67
+        return {Status::OK, 1};
       case methods::kNetGetStreamNetworks:
+        // Spec5:返回 [8192]
+        rsp.u16(1);
+        rsp.u32(8192);
+        return {Status::OK, 1};
       case methods::kNetGetControlNetworks:
+        // Spec5:返回 [4098]
+        rsp.u16(1);
+        rsp.u32(4098);
+        return {Status::OK, 1};
       case methods::kNetGetMediaTransportNetworks:
-        // CM3 网络对象 2023 弃用,daemon 无网络对象;返空 List<ONo>(u16(0))。
-        // 方法仍 mandatory(返网络对象 ONo 列表,可为空),既合规又过工具(result
-        // OK≠8)。
-        rsp.u16(0);              // 空 Ocp1List<ONo>
-        return {Status::OK, 1};  // 网络列表 = 1 个参数
+        // Spec5:返回 [8192]
+        rsp.u16(1);
+        rsp.u32(8192);
+        return {Status::OK, 1};
       default:
         return {Status::NotImplemented, 0};
     }

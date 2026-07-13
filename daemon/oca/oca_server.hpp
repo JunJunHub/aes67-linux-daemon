@@ -13,6 +13,7 @@ namespace oca {
 
 class Transport;
 class OcaSubscriptionManager;
+class OcaAudioBridge;
 #ifdef _USE_AVAHI_
 class MdnsPublisher;
 #endif
@@ -27,11 +28,17 @@ struct OcaServerConfig {
   std::string node_id;        // device_name/serial 的回退
   std::string daemon_version;
   bool mdns_enabled = false;
+  // Spec5:mDNS TXT + OcaNetwork 现实化
+  std::string ip_addr;
+  std::string ip_addr_sec;
+  std::string mac_addr;
+  uint32_t channels = 0;
 };
 
 class OcaServer {
  public:
-  explicit OcaServer(const OcaServerConfig& cfg);
+  explicit OcaServer(const OcaServerConfig& cfg,
+                     OcaAudioBridge* bridge = nullptr);
   ~OcaServer();
   bool start();  // 在 cfg.port 监听(0=自动)
   void stop();
@@ -40,6 +47,7 @@ class OcaServer {
 
  private:
   OcaServerConfig cfg_;
+  OcaAudioBridge* bridge_;
   ObjectRegistry registry_;
   OcaSubscriptionManager* sub_mgr_ = nullptr;  // 归 registry_ 所有
   std::unique_ptr<Transport> transport_;

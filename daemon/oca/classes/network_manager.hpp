@@ -7,6 +7,8 @@
 
 namespace oca {
 
+class OcaAudioBridge;  // 前向声明
+
 class OcaNetworkManager : public OcaManager {
  public:
   explicit OcaNetworkManager(ONo ono) : OcaManager(ono) {}
@@ -17,6 +19,12 @@ class OcaNetworkManager : public OcaManager {
                   ocp1::Reader& req,
                   ocp1::Writer& rsp,
                   Session& sess) override;
+
+  // Spec5:注入 bridge(ONo 列表无需 bridge,但预留扩展)
+  void set_bridge(OcaAudioBridge* bridge) { bridge_ = bridge; }
+
+ private:
+  OcaAudioBridge* bridge_ = nullptr;
 };
 
 }  // namespace oca

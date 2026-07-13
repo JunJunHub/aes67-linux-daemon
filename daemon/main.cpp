@@ -37,6 +37,7 @@
 
 #ifdef _USE_OCA_
 #include "oca/oca_server.hpp"
+#include "oca/oca_session_manager_bridge.hpp"
 #endif
 
 #ifdef _USE_SYSTEMD_
@@ -208,6 +209,8 @@ int main(int argc, char* argv[]) {
 #ifdef _USE_OCA_
       std::unique_ptr<oca::OcaServer> oca_server;
       if (config->get_oca_enabled()) {
+        auto oca_bridge = std::make_shared<oca::OcaSessionManagerBridge>(
+            session_manager, config, driver);
         oca::OcaServerConfig ocacfg;
         ocacfg.port = config->get_oca_port();
         ocacfg.device_name = config->get_oca_device_name();
@@ -217,7 +220,13 @@ int main(int argc, char* argv[]) {
         ocacfg.node_id = config->get_node_id();
         ocacfg.daemon_version = get_version();
         ocacfg.mdns_enabled = config->get_mdns_enabled();
-        oca_server = std::make_unique<oca::OcaServer>(ocacfg);
+        // Spec5:设备元数据(mDNS TXT + OcaNetwork 现实化)
+        ocacfg.ip_addr = config->get_ip_addr_str();
+        ocacfg.mac_addr = config->get_mac_addr_str();
+        int32_t n_out = 0;
+        driver->get_number_of_outputs(n_out);
+        ocacfg.channels = static_cast<uint32_t>(n_out);
+        oca_server = std::make_unique<oca::OcaServer>(ocacfg, oca_bridge.get());
         if (!oca_server->start()) {
           throw std::runtime_error(std::string("OcaServer:: start failed"));
         }

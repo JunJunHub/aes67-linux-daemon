@@ -462,7 +462,7 @@ BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
       {oca::methods::kDefLevelBlock, oca::methods::kNet2GetMediaProtocol},
       empty, wMedia, sess);
   BOOST_CHECK(st.status == oca::Status::OK);
-  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wMedia.data(), wMedia.size()).u8(), 0u);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wMedia.data(), wMedia.size()).u8(), 3u);
 
   // OcaNetwork GetIDAdvertised -> OcaBlob:u16 len=0(空 NetworkNodeID)
   oca::ocp1::Writer wId;
@@ -1026,19 +1026,46 @@ BOOST_AUTO_TEST_CASE(dispatch_network_manager) {
   BOOST_CHECK(st.status == oca::Status::OK);
   BOOST_CHECK_EQUAL(st.nrParameters, 1);
   oca::ocp1::Reader r(rsp.data(), rsp.size());
-  BOOST_CHECK_EQUAL(r.u16(), 0u);  // 空网络列表
+  BOOST_CHECK_EQUAL(r.u16(), 3u);  // 3 networks(2 CM3 + 1 MTN_AES67)
+  BOOST_CHECK_EQUAL(r.u32(), 4097u);
+  BOOST_CHECK_EQUAL(r.u32(), 4098u);
+  BOOST_CHECK_EQUAL(r.u32(), 8192u);
 
-  // GetStreamNetworks(2)/GetControlNetworks(3)/GetMediaTransportNetworks(4):
-  // 各返空 List<ONo>(u16(0)),{OK,1}(2018 强制方法,CM3 网络对象弃用故空)。
-  for (uint16_t mid : {oca::methods::kNetGetStreamNetworks,
-                       oca::methods::kNetGetControlNetworks,
-                       oca::methods::kNetGetMediaTransportNetworks}) {
+  // GetStreamNetworks(2):1 MTN_AES67
+  {
     oca::ocp1::Writer rr;
-    auto s =
-        nm.exec({oca::methods::kDefLevelNetworkMngr, mid}, empty, rr, sess);
+    auto s = nm.exec({oca::methods::kDefLevelNetworkMngr,
+                      oca::methods::kNetGetStreamNetworks},
+                     empty, rr, sess);
     BOOST_CHECK(s.status == oca::Status::OK);
     BOOST_CHECK_EQUAL(s.nrParameters, 1);
-    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rr.data(), rr.size()).u16(), 0u);
+    oca::ocp1::Reader rr2(rr.data(), rr.size());
+    BOOST_CHECK_EQUAL(rr2.u16(), 1u);
+    BOOST_CHECK_EQUAL(rr2.u32(), 8192u);
+  }
+  // GetControlNetworks(3):1 CM3 control network
+  {
+    oca::ocp1::Writer rr;
+    auto s = nm.exec({oca::methods::kDefLevelNetworkMngr,
+                      oca::methods::kNetGetControlNetworks},
+                     empty, rr, sess);
+    BOOST_CHECK(s.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(s.nrParameters, 1);
+    oca::ocp1::Reader rr2(rr.data(), rr.size());
+    BOOST_CHECK_EQUAL(rr2.u16(), 1u);
+    BOOST_CHECK_EQUAL(rr2.u32(), 4098u);
+  }
+  // GetMediaTransportNetworks(4):1 MTN_AES67
+  {
+    oca::ocp1::Writer rr;
+    auto s = nm.exec({oca::methods::kDefLevelNetworkMngr,
+                      oca::methods::kNetGetMediaTransportNetworks},
+                     empty, rr, sess);
+    BOOST_CHECK(s.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(s.nrParameters, 1);
+    oca::ocp1::Reader rr2(rr.data(), rr.size());
+    BOOST_CHECK_EQUAL(rr2.u16(), 1u);
+    BOOST_CHECK_EQUAL(rr2.u32(), 8192u);
   }
 
   // GetClassIdentification(继承自 Root) -> {1,3,6} v2
@@ -1508,6 +1535,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
 
   // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification>
   //  [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
+  //  + [7,8192,8193,8194] Spec5 新增对象
   // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion
   oca::ocp1::Writer cw2;
   oca::ocp1::write_command(
@@ -1523,7 +1551,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
       rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
   oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
-  BOOST_CHECK_EQUAL(pr2.u16(), 5u);  // 5 members(3 管理器 + 2 CM3)
+  BOOST_CHECK_EQUAL(pr2.u16(), 9u);  // 9 members(3 管理器 + 2 CM3 + 4 Spec5)
   // ONo=1 DeviceManager {1,3,1} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
@@ -1545,6 +1573,13 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
   BOOST_CHECK_EQUAL(pr2.u16(), 6u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  // ONo=7 OcaMediaClockManager {1,3,7} v2(Spec5)
+  BOOST_CHECK_EQUAL(pr2.u32(), 7u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 7u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);  // ClassVersion
   // ONo=4097 OcaNetwork {1,2,1} v1(Spec3 CM3,DeprecatedSince 2018)
   BOOST_CHECK_EQUAL(pr2.u32(), 4097u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);
@@ -1559,6 +1594,32 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 4u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);  // ClassVersion=1
+  // ONo=8192 OcaMediaTransportNetworkAES67 {1,4,2,0xFFFF,0x00FA,0x2EE9,1}
+  // v1(Spec5)
+  BOOST_CHECK_EQUAL(pr2.u32(), 8192u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 7u);  // ClassID fieldCount
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 4u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 0xFFFFu);
+  BOOST_CHECK_EQUAL(pr2.u16(), 0x00FAu);
+  BOOST_CHECK_EQUAL(pr2.u16(), 0x2EE9u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);  // ClassVersion
+  // ONo=8193 OcaMediaClock3 {1,2,15} v2(Spec5)
+  BOOST_CHECK_EQUAL(pr2.u32(), 8193u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 15u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);  // ClassVersion
+  // ONo=8194 OcaMediaClock {1,2,6} v2(Spec5 废弃存根)
+  BOOST_CHECK_EQUAL(pr2.u32(), 8194u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
+  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 6u);
+  BOOST_CHECK_EQUAL(pr2.u16(), 2u);  // ClassVersion
 
   ::close(sock);
   server.stop();
@@ -1665,12 +1726,13 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
 
   // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification>
   //     [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
+  //     + [7,8192,8193,8194] Spec5 新增对象
   auto r3 = cmd(3, 100,
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
   {
     oca::ocp1::Reader r(r3.paramData, r3.paramBytes);
-    BOOST_CHECK_EQUAL(r.u16(), 5u);  // 5 members(3 管理器 + 2 CM3)
+    BOOST_CHECK_EQUAL(r.u16(), 9u);  // 9 members(3 管理器 + 2 CM3 + 4 Spec5)
     // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion;只校验 ONo
     BOOST_CHECK_EQUAL(r.u32(), 1u);
     r.u16();  // skip ClassID fieldCount
@@ -1690,6 +1752,13 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();
     r.u16();
     r.u16();
+    // ONo=7 OcaMediaClockManager {1,3,7} v2(Spec5)
+    BOOST_CHECK_EQUAL(r.u32(), 7u);
+    r.u16();  // ClassID fieldCount=3
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();  // ClassVersion
     // ONo=4097 OcaNetwork {1,2,1} v1(CM3)
     BOOST_CHECK_EQUAL(r.u32(), 4097u);
     r.u16();
@@ -1704,6 +1773,32 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();
     r.u16();
     r.u16();
+    // ONo=8192 OcaMediaTransportNetworkAES67 {1,4,2,0xFFFF,0x00FA,0x2EE9,1}
+    // v1(Spec5)
+    BOOST_CHECK_EQUAL(r.u32(), 8192u);
+    r.u16();  // ClassID fieldCount=7
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();  // 7 ClassID levels
+    r.u16();  // ClassVersion
+    // ONo=8193 OcaMediaClock3 {1,2,15} v2(Spec5)
+    BOOST_CHECK_EQUAL(r.u32(), 8193u);
+    r.u16();  // ClassID fieldCount=3
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();  // ClassVersion
+    // ONo=8194 OcaMediaClock {1,2,6} v2(Spec5 废弃存根)
+    BOOST_CHECK_EQUAL(r.u32(), 8194u);
+    r.u16();  // ClassID fieldCount=3
+    r.u16();
+    r.u16();
+    r.u16();
+    r.u16();  // ClassVersion
   }
 
   // 5) 订阅:AddSubscription2(emitter=1, OperationalState) (sphinx 2024 §C.1)

@@ -66,14 +66,32 @@ constexpr uint16_t kBlockGetMembersRecursive =
 constexpr uint16_t kWorkerGetEnabled = 1;  // OCAMicro
 constexpr uint16_t kWorkerSetEnabled = 2;  // OCAMicro
 constexpr uint16_t kWorkerGetPorts = 5;    // OCAMicro
-// OcaAgent methods (DefLevel 2, classID{1,2}) - 2018
-// 非强制,跳过(GetLabel/SetLabel /GetOwner/GetPath tool 仅信息性报"may return
-// not implemented") OcaApplicationNetwork methods (DefLevel 2, classID{1,4})
+
+// OcaAgent methods (DefLevel 2, classID{1,2}) - OCAMicro OcaLiteAgent
+// OcaNetwork{1,2,1} 继承 OcaAgent{1,2},工具对 ONo 4097 测 Agent 强制方法
+// (GetLabel/SetLabel/GetOwner/GetPath)。在 OcaAgent 中间类实装。
+constexpr uint16_t kAgentGetLabel = 1;  // OCAMicro
+constexpr uint16_t kAgentSetLabel = 2;  // OCAMicro
+constexpr uint16_t kAgentGetOwner = 3;  // OCAMicro
+constexpr uint16_t kAgentGetPath = 4;   // OCAMicro
+
+// OcaWorker additional methods (DefLevel 2, classID{1,1}) - OCAMicro
+// OcaLiteWorker
+constexpr uint16_t kWorkerGetLabel = 8;   // OCAMicro
+constexpr uint16_t kWorkerSetLabel = 9;   // OCAMicro
+constexpr uint16_t kWorkerGetOwner = 10;  // OCAMicro
+constexpr uint16_t kWorkerGetPath = 13;   // OCAMicro
+
+// OcaApplicationNetwork methods (DefLevel 2, classID{1,4})
 // OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4},工具对 4098 也测
 // GetServiceID/GetSystemInterfaces(Mandatory=true)。在 OcaControlNetwork
 // 实例上实装。
 constexpr uint16_t kAppNetGetServiceID = 4;         // ReferenceOCCMembers
 constexpr uint16_t kAppNetGetSystemInterfaces = 6;  // ReferenceOCCMembers
+constexpr uint16_t kAppNetGetLabel = 1;             // OCAMicro
+constexpr uint16_t kAppNetSetLabel = 2;             // OCAMicro
+constexpr uint16_t kAppNetGetOwner = 3;             // OCAMicro
+constexpr uint16_t kAppNetGetPath = 10;             // OCAMicro
 
 // OcaNetwork methods (DefLevel 3, classID{1,2,1}) - OCAMicro OcaLiteNetwork
 // DeprecatedSince AES70-2018 / 2023 进一步弃用;本实例仅为兼容 AES70-2018

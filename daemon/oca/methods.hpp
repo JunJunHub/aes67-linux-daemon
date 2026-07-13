@@ -140,6 +140,113 @@ constexpr uint16_t kEventOperationalState = 1;  // DeviceState 变化(演示事�
 constexpr uint16_t kPropLabel = 1;    // OcaAgent/OcaWorker/OcaAppNet 的 Label
 constexpr uint16_t kPropEnabled = 1;  // OcaDeviceManager 的 Enabled
 
+// ── OcaMediaClockManager methods (DefLevel 3, classID{1,3,7}) ──
+constexpr uint16_t kDefLevelMediaClockMngr = 3;
+constexpr uint16_t kMcmGetClocks = 1;                    // AES70-2018 Mandatory
+constexpr uint16_t kMcmGetMediaClockTypesSupported = 2;  // AES70-2018 Mandatory
+constexpr uint16_t kMcmGetClock3s = 3;                   // AES70-2018 Mandatory
+
+// OcaMediaClockManager Property indices
+constexpr uint16_t kMcmPropClockSourceTypesSupported = 1;
+constexpr uint16_t kMcmPropClocks = 2;
+constexpr uint16_t kMcmPropClock3s = 3;
+
+// ── OcaMediaClock3 methods (DefLevel 3, classID{1,2,15}) ──
+// AvailableSince AES70-2018,替代已废弃 OcaMediaClock{1,2,6}。
+constexpr uint16_t kDefLevelMediaClock3 = 3;
+constexpr uint16_t kMc3GetAvailability = 1;    // AES70-2018 Mandatory
+constexpr uint16_t kMc3SetAvailability = 2;    // Optional
+constexpr uint16_t kMc3GetCurrentRate = 3;     // AES70-2018 Mandatory
+constexpr uint16_t kMc3SetCurrentRate = 4;     // Optional
+constexpr uint16_t kMc3GetOffset = 5;          // AES70-2018 Mandatory
+constexpr uint16_t kMc3SetOffset = 6;          // Optional
+constexpr uint16_t kMc3GetSupportedRates = 7;  // AES70-2018 Mandatory
+constexpr uint16_t kMc3GetPTPStatus = 0x8002;  // Fitcan 私有
+
+// OcaMediaClock3 Property indices
+constexpr uint16_t kMc3PropAvailability = 1;
+constexpr uint16_t kMc3PropTimeSourceONo = 2;
+constexpr uint16_t kMc3PropOffset = 3;
+constexpr uint16_t kMc3PropCurrentRate = 4;
+
+// ── OcaMediaClock methods (DefLevel 3, classID{1,2,6}) ──
+// DeprecatedSince AES70-2018;合规工具仍检查,全部 NotImplemented。
+constexpr uint16_t kDefLevelMediaClock = 3;
+constexpr uint16_t kMcGetType = 1;
+constexpr uint16_t kMcSetType = 2;
+constexpr uint16_t kMcGetDomainID = 3;
+constexpr uint16_t kMcSetDomainID = 4;
+constexpr uint16_t kMcGetRatesSupported = 5;
+constexpr uint16_t kMcGetRate = 6;
+constexpr uint16_t kMcSetRate = 7;
+constexpr uint16_t kMcGetLockState = 8;
+constexpr uint16_t kMcGetTypesSupported = 9;
+
+// OcaMediaClock Property indices (废弃)
+constexpr uint16_t kMcPropType = 1;
+constexpr uint16_t kMcPropDomainID = 2;
+constexpr uint16_t kMcPropRatesSupported = 3;
+constexpr uint16_t kMcPropCurrentRate = 4;
+constexpr uint16_t kMcPropLockState = 5;
+
+// ── OcaMediaTransportNetwork methods (DefLevel 3, classID{1,4,2}) ──
+constexpr uint16_t kDefLevelMtn = 3;
+constexpr uint16_t kMtnGetMediaProtocol = 1;             // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetPorts = 2;                     // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetPortName = 3;                  // Optional
+constexpr uint16_t kMtnSetPortName = 4;                  // Optional
+constexpr uint16_t kMtnGetMaxSourceConnectors = 5;       // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetMaxSinkConnectors = 6;         // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetMaxPinsPerConnector = 7;       // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetMaxPortsPerPin = 8;            // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetSourceConnectors = 9;          // Optional
+constexpr uint16_t kMtnGetSourceConnector = 10;          // Optional
+constexpr uint16_t kMtnGetSinkConnectors = 11;           // Optional
+constexpr uint16_t kMtnGetSinkConnector = 12;            // Optional
+constexpr uint16_t kMtnGetConnectorsStatuses = 13;       // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetConnectorStatus = 14;          // AES70-2018 Mandatory
+constexpr uint16_t kMtnAddSourceConnector = 15;          // Optional
+constexpr uint16_t kMtnAddSinkConnector = 16;            // Optional
+constexpr uint16_t kMtnControlConnector = 17;            // Optional
+constexpr uint16_t kMtnSetSourceConnectorPinMap = 18;    // Optional
+constexpr uint16_t kMtnSetSinkConnectorPinMap = 19;      // Optional
+constexpr uint16_t kMtnSetConnectorConnection = 20;      // Optional
+constexpr uint16_t kMtnSetConnectorCoding = 21;          // Optional
+constexpr uint16_t kMtnSetConnectorAlignmentLevel = 22;  // Optional
+constexpr uint16_t kMtnSetConnectorAlignmentGain = 23;   // Optional
+constexpr uint16_t kMtnDeleteConnector = 24;             // AES70-2018 Mandatory
+constexpr uint16_t kMtnGetAlignmentLevel = 25;           // Optional
+constexpr uint16_t kMtnGetAlignmentGain = 26;            // Optional
+
+// OcaMediaTransportNetwork Property indices
+constexpr uint16_t kMtnPropProtocol = 1;
+constexpr uint16_t kMtnPropPorts = 2;
+constexpr uint16_t kMtnPropMaxSourceConnectors = 3;
+constexpr uint16_t kMtnPropMaxSinkConnectors = 4;
+constexpr uint16_t kMtnPropMaxPinsPerConnector = 5;
+constexpr uint16_t kMtnPropMaxPortsPerPin = 6;
+
+// OcaMediaTransportNetwork Event indices
+constexpr uint16_t kEventSourceConnectorChanged = 1;
+constexpr uint16_t kEventSinkConnectorChanged = 2;
+constexpr uint16_t kEventConnectorStatusChanged = 3;
+
+// ── OcaMediaTransportNetworkAES67 methods (DefLevel 7) ──
+// ClassID {1,4,2,0xFFFF,0xFA,0x2EE9,1}, defLevel = fieldCount = 7
+constexpr uint16_t kDefLevelMtnAes67 = 7;
+constexpr uint16_t kMtnAes67GetSendPacketTimes = 1;
+constexpr uint16_t kMtnAes67GetReceivePacketTimes = 2;
+constexpr uint16_t kMtnAes67GetMinReceiveBufferCapacity = 3;
+constexpr uint16_t kMtnAes67GetMaxReceiveBufferCapacity = 4;
+constexpr uint16_t kMtnAes67GetTransmissionTimeVariation = 5;
+constexpr uint16_t kMtnAes67GetSupportedDiscoverySystems = 6;
+// Fitcan 私有
+constexpr uint16_t kMtnAes67DeleteAllConnectors = 1000;
+constexpr uint16_t kMtnAes67UpdateRouteTableCommand = 0x8000;
+
+// ── OcaMediaTransportNetworkAES67 媒体协议编号 ──
+constexpr uint8_t kMediaProtocolAes67 = 3;  // AES67
+
 // ProtocolVersion (AES70-2023)
 constexpr uint16_t kProtocolVersion = 1;
 constexpr uint8_t kSyncVal = 0x3B;

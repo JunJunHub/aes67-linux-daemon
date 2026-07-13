@@ -34,8 +34,9 @@ OcaServer::OcaServer(const OcaServerConfig& cfg) : cfg_(cfg) {
   // OcaNetwork{1,2,1} DeprecatedSince 2018 / 2023 弃用;OcaControlNetwork{1,4.1}
   // AvailableSince 2018。ONo >=4096(BlockMember 区段),加入根块 GetMembers/
   // GetMembersRecursive 成员列表。详见 Spec3 计划与设计文档(2023 弃用立场)。
-  auto* net2 = new OcaNetwork(4097);
-  auto* ctrl_net = new OcaControlNetwork(4098);
+  auto* net2 = new OcaNetwork(4097, 100);  // owner = Root Block(ONo 100)
+  auto* ctrl_net =
+      new OcaControlNetwork(4098, 100);  // owner = Root Block(ONo 100)
   sub_mgr_ = sm;
   registry_.register_object(std::unique_ptr<Object>(dm));
   registry_.register_object(std::unique_ptr<Object>(nm));

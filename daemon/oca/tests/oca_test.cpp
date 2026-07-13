@@ -15,6 +15,10 @@
 #include "oca/classes/application_network.hpp"
 #include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
+#include "oca/classes/media_clock.hpp"
+#include "oca/classes/media_clock3.hpp"
+#include "oca/classes/media_clock_manager.hpp"
+#include "oca/classes/media_transport_network_aes67.hpp"
 #include "oca/classes/network.hpp"
 #include "oca/classes/network_manager.hpp"
 #include "oca/classes/root.hpp"
@@ -2155,4 +2159,213 @@ BOOST_AUTO_TEST_CASE(transport_rejects_oversized_pdu) {
 
   ::close(sock);
   server.stop();
+}
+
+// ── Spec5:媒体类单元分派测试 ──
+
+BOOST_AUTO_TEST_CASE(dispatch_media_clock_manager) {
+  oca::OcaMediaClockManager mcm(7);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // GetClocks(1):返回空 Ocp1List<OcaONo>
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mcm.exec(
+        {oca::methods::kDefLevelMediaClockMngr, oca::methods::kMcmGetClocks},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(st.nrParameters, 1);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 0u);
+  }
+  // GetMediaClockTypesSupported(2):NotImplemented
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mcm.exec({oca::methods::kDefLevelMediaClockMngr,
+                        oca::methods::kMcmGetMediaClockTypesSupported},
+                       empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+  // GetClock3s(3):返回 [8193]
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mcm.exec(
+        {oca::methods::kDefLevelMediaClockMngr, oca::methods::kMcmGetClock3s},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(st.nrParameters, 1);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u16(), 1u);
+    BOOST_CHECK_EQUAL(r.u32(), 8193u);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_media_clock3_methods) {
+  oca::OcaMediaClock3 mc3(8193, 100);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // GetAvailability(1):AVAILABLE=1
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3GetAvailability},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u8(), 1u);
+  }
+  // SetAvailability(2):NotImplemented
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3SetAvailability},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+  // GetCurrentRate(3):默认 48000Hz (bridge=nullptr)
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3GetCurrentRate},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u32(), 48000u);  // numerator
+    BOOST_CHECK_EQUAL(r.u32(), 1u);      // denominator
+    r.u32();                             // timeSourceONo
+  }
+  // SetCurrentRate(4):NotImplemented(bridge=nullptr)
+  {
+    oca::ocp1::Writer req_w;
+    req_w.u32(48000);
+    req_w.u32(1);
+    oca::ocp1::Reader req_r(req_w.data(), req_w.size());
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3SetCurrentRate},
+        req_r, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+  // GetOffset(5):0
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3GetOffset},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u64(), 0u);
+  }
+  // SetOffset(6):NotImplemented
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3SetOffset},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+  // GetSupportedRates(7):6 项(44100..192000)
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec({oca::methods::kDefLevelMediaClock3,
+                        oca::methods::kMc3GetSupportedRates},
+                       empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u16(), 6u);
+    for (uint32_t expected :
+         {44100u, 48000u, 88200u, 96000u, 176400u, 192000u}) {
+      BOOST_CHECK_EQUAL(r.u32(), expected);
+      r.u32();  // denominator
+    }
+  }
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_media_clock_deprecated) {
+  oca::OcaMediaClock mc(8194, 100);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // 废弃类所有 DefLevel-3 方法返回 NotImplemented
+  for (uint16_t idx = 1; idx <= 9; ++idx) {
+    oca::ocp1::Writer rsp;
+    auto st =
+        mc.exec({oca::methods::kDefLevelMediaClock, idx}, empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_mtn_aes67_readonly) {
+  oca::OcaMediaTransportNetworkAES67 mtn(8192, 100);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // GetMediaProtocol(1):AES67=3
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetMediaProtocol}, empty,
+        rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u8(), 3u);
+  }
+  // GetMaxSourceConnectors(5):64
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetMaxSourceConnectors},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 64u);
+  }
+  // GetMaxSinkConnectors(6):64
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetMaxSinkConnectors},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 64u);
+  }
+  // GetMaxPinsPerConnector(7):64
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetMaxPinsPerConnector},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 64u);
+  }
+  // GetMaxPortsPerPin(8):1
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetMaxPortsPerPin},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 1u);
+  }
+  // GetConnectorsStatuses(13):空列表
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetConnectorsStatuses},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 0u);
+  }
+  // AES67 defLevel-7 方法全部 NotImplemented
+  for (uint16_t idx = 1; idx <= 6; ++idx) {
+    oca::ocp1::Writer rsp;
+    auto st =
+        mtn.exec({oca::methods::kDefLevelMtnAes67, idx}, empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
+  // 私有方法 UpdateRouteTableCommand(0x8000):NotImplemented
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec({oca::methods::kDefLevelMtnAes67,
+                        oca::methods::kMtnAes67UpdateRouteTableCommand},
+                       empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+  }
 }

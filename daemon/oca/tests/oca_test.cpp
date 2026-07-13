@@ -11,6 +11,8 @@
 #include "oca/oca_server.hpp"
 #include "oca/object.hpp"
 #include "oca/ocp1.hpp"
+#include "oca/classes/agent.hpp"
+#include "oca/classes/application_network.hpp"
 #include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
 #include "oca/classes/network.hpp"
@@ -528,6 +530,148 @@ BOOST_AUTO_TEST_CASE(dispatch_cm3_network_objects) {
   BOOST_CHECK_EQUAL(rd2.u16(), 4u);
   BOOST_CHECK_EQUAL(rd2.u16(), 1u);
   BOOST_CHECK_EQUAL(rd2.u16(), 1u);
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_agent_methods) {
+  // OcaNetwork(4097) 继承 OcaAgent,测试 Agent defLevel=2 方法分派
+  oca::OcaNetwork net(4097, 100);  // owner = Root Block
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+  namespace m = oca::methods;
+
+  // GetLabel(1) -> role() = "Network"
+  oca::ocp1::Writer wLabel;
+  auto st =
+      net.exec({m::kDefLevelManager, m::kAgentGetLabel}, empty, wLabel, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wLabel.data(), wLabel.size()).string(),
+                    "Network");
+
+  // SetLabel(2) -> no-op OK
+  oca::ocp1::Writer wSetLabel;
+  st = net.exec({m::kDefLevelManager, m::kAgentSetLabel}, empty, wSetLabel,
+                sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
+  // GetOwner(3) -> 100 (Root Block)
+  oca::ocp1::Writer wOwner;
+  st = net.exec({m::kDefLevelManager, m::kAgentGetOwner}, empty, wOwner, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wOwner.data(), wOwner.size()).u32(),
+                    100u);
+
+  // GetPath(4) -> NotImplemented
+  oca::ocp1::Writer wPath;
+  st = net.exec({m::kDefLevelManager, m::kAgentGetPath}, empty, wPath, sess);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
+
+  // 未知 Agent 方法 -> NotImplemented
+  oca::ocp1::Writer wUnk;
+  st = net.exec({m::kDefLevelManager, 99}, empty, wUnk, sess);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
+
+  // defLevel=1 委托到 OcaRoot 仍正常
+  oca::ocp1::Writer wRole;
+  st = net.exec({m::kDefLevelRoot, m::kRootGetRole}, empty, wRole, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wRole.data(), wRole.size()).string(),
+                    "Network");
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_appnet_methods) {
+  // OcaControlNetwork(4098) 继承 OcaApplicationNetwork,
+  // 测试 AppNet defLevel=2 方法分派
+  oca::OcaControlNetwork ctrl(4098, 100);  // owner = Root Block
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+  namespace m = oca::methods;
+
+  // GetLabel(1) -> role() = "Control Network"
+  oca::ocp1::Writer wLabel;
+  auto st =
+      ctrl.exec({m::kDefLevelManager, m::kAppNetGetLabel}, empty, wLabel, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wLabel.data(), wLabel.size()).string(),
+                    "Control Network");
+
+  // SetLabel(2) -> no-op OK
+  oca::ocp1::Writer wSetLabel;
+  st = ctrl.exec({m::kDefLevelManager, m::kAppNetSetLabel}, empty, wSetLabel,
+                 sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+
+  // GetOwner(3) -> 100 (Root Block)
+  oca::ocp1::Writer wOwner;
+  st =
+      ctrl.exec({m::kDefLevelManager, m::kAppNetGetOwner}, empty, wOwner, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wOwner.data(), wOwner.size()).u32(),
+                    100u);
+
+  // GetServiceID(4) -> 空 OcaString
+  oca::ocp1::Writer wSvc;
+  st = ctrl.exec({m::kDefLevelManager, m::kAppNetGetServiceID}, empty, wSvc,
+                 sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wSvc.data(), wSvc.size()).u16(), 0u);
+
+  // GetSystemInterfaces(6) -> 空 List
+  oca::ocp1::Writer wIf;
+  st = ctrl.exec({m::kDefLevelManager, m::kAppNetGetSystemInterfaces}, empty,
+                 wIf, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wIf.data(), wIf.size()).u16(), 0u);
+
+  // GetPath(10) -> NotImplemented
+  oca::ocp1::Writer wPath;
+  st = ctrl.exec({m::kDefLevelManager, m::kAppNetGetPath}, empty, wPath, sess);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_worker_label_owner) {
+  // OcaBlock(100) 继承 OcaWorker,测试 Worker defLevel=2 新增方法
+  oca::OcaBlock block(100);  // root block, owner_ono 默认 0
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+  namespace m = oca::methods;
+
+  // GetLabel(8) -> role() = "Root Block"
+  oca::ocp1::Writer wLabel;
+  auto st = block.exec({m::kDefLevelManager, m::kWorkerGetLabel}, empty, wLabel,
+                       sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 1);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wLabel.data(), wLabel.size()).string(),
+                    "Root Block");
+
+  // SetLabel(9) -> no-op OK
+  oca::ocp1::Writer wSetLabel;
+  st = block.exec({m::kDefLevelManager, m::kWorkerSetLabel}, empty, wSetLabel,
+                  sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
+  // GetOwner(10) -> 0 (根块无 owner)
+  oca::ocp1::Writer wOwner;
+  st = block.exec({m::kDefLevelManager, m::kWorkerGetOwner}, empty, wOwner,
+                  sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wOwner.data(), wOwner.size()).u32(), 0u);
+
+  // GetPath(13) -> NotImplemented
+  oca::ocp1::Writer wPath;
+  st = block.exec({m::kDefLevelManager, m::kWorkerGetPath}, empty, wPath, sess);
+  BOOST_CHECK(st.status == oca::Status::NotImplemented);
+
+  // 已有 Worker 方法不受影响
+  oca::ocp1::Writer wEnabled;
+  st = block.exec({m::kDefLevelManager, m::kWorkerGetEnabled}, empty, wEnabled,
+                  sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(wEnabled.data(), wEnabled.size()).u8(),
+                    1u);
 }
 
 BOOST_AUTO_TEST_CASE(dispatch_device_manager) {

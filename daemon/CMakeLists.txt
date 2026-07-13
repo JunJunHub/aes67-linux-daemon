@@ -52,7 +52,8 @@ if(WITH_OCA)
        oca/oca_server.cpp oca/classes/root.cpp oca/classes/agent.cpp
        oca/classes/application_network.cpp oca/classes/device_manager.cpp
        oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp
-       oca/classes/network.cpp oca/classes/control_network.cpp)
+       oca/classes/network.cpp oca/classes/control_network.cpp
+       oca/oca_session_manager_bridge.cpp)
 endif()
 if(FAKE_DRIVER)
   MESSAGE(STATUS "FAKE_DRIVER")

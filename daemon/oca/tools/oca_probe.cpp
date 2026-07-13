@@ -259,14 +259,19 @@ int main(int argc, char** argv) {
   std::string host = "127.0.0.1";
   uint16_t port = 65037;
   bool do_sub = true;
+  bool do_pc = true;  // Spec4:PropertyChanged 探测段
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--no-sub") {
       do_sub = false;
+    } else if (a == "--no-pc") {  // Spec4
+      do_pc = false;
     } else if (a == "-h" || a == "--help") {
-      std::cout << "用法: oca-probe [host] [port] [--no-sub]\n"
-                << "  默认 127.0.0.1 65037\n";
+      std::cout << "用法: oca-probe [host] [port] [--no-sub] [--no-pc]\n"
+                << "  默认 127.0.0.1 65037\n"
+                << "  --no-sub  跳过 EV2 订阅测试\n"
+                << "  --no-pc   跳过 PropertyChanged 投递测试\n";
       return 0;
     } else if (a.find_first_not_of("0123456789.") == std::string::npos &&
                a.find('.') != std::string::npos && host == "127.0.0.1") {
@@ -793,6 +798,99 @@ int main(int argc, char** argv) {
       std::cout << ERR() << "  [FAIL] " << name << "(" << mi
                 << ") status=" << status_name(r.status) << OFF() << "\n";
       probe.failures++;
+    }
+  }
+
+  // --- 9. PropertyChanged 订阅与投递(Spec4)-----------------------------------
+  if (do_pc) {
+    section(
+        "PropertyChanged 订阅与投递 (AddPropertyChangeSubscription2 + "
+        "SetLabel)");
+    // 9a. 订阅 OcaNetwork(4097) 的 Label PropertyChanged
+    {
+      oca::ocp1::Writer p;
+      p.u32(4097);                 // EmitterONo
+      p.u16(m::kDefLevelManager);  // PropertyID defLevel=2(Agent)
+      p.u16(m::kPropLabel);        // PropertyID propertyIndex=1
+      p.u8(1);                     // DeliveryMode Normal
+      p.u16(0);                    // 空 NetworkAddress
+      auto r = probe.cmd(
+          4, {m::kDefLevelSubMngr, m::kSubAddPropertyChangeSubscription2},
+          p.data(), static_cast<uint32_t>(p.size()), 4);
+      if (r.ok && r.status == o::Status::OK) {
+        std::cout << OK() << "  [OK] AddPropertyChangeSubscription2 成功"
+                  << OFF() << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] AddPropertyChangeSubscription2 status="
+                  << status_name(r.status) << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+    // 9b. SetLabel(4097, "oca-probe-test")->触发 emit + transport drain
+    //     (Response 返回即触发 drain,通知上线)
+    {
+      oca::ocp1::Writer p;
+      p.string("oca-probe-test");
+      auto r = probe.cmd(4097, {m::kDefLevelManager, m::kAgentSetLabel},
+                         p.data(), static_cast<uint32_t>(p.size()), 1);
+      if (r.ok && r.status == o::Status::OK && r.params.empty()) {
+        std::cout << OK() << "  [OK] SetLabel(4097, \"oca-probe-test\") -> OK"
+                  << OFF() << "\n";
+      } else {
+        std::cout << ERR()
+                  << "  [FAIL] SetLabel status=" << status_name(r.status)
+                  << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+    // 9c. Probe::cmd 接收循环会跨过穿插的 Notification2 并打印。
+    //     但本段需主动断言收到 Ntf2,故直接 recv_pdu 等一轮。
+    {
+      auto rp = recv_pdu(probe.fd);
+      bool got_pc = false;
+      if (rp && rp->hdr.pduType == m::kPduNtf2) {
+        auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+            rp->payload.data(), rp->payload.size(), rp->hdr.messageCount);
+        for (const auto& n : ntfs) {
+          if (n.emitterONo == 4097 && n.eventID.defLevel == m::kDefLevelRoot &&
+              n.eventID.eventIndex == m::kEventPropertyChanged) {
+            oca::ocp1::Reader dr(n.data, n.dataCount);
+            uint16_t pid_dl = dr.u16();
+            uint16_t pid_idx = dr.u16();
+            std::string val = dr.string();
+            std::cout << OK() << "  [OK] 收到 PropertyChanged emitter=4097"
+                      << " PropertyID{" << pid_dl << "," << pid_idx << "}"
+                      << " newLabel=\"" << val << "\"" << OFF() << "\n";
+            got_pc = true;
+          }
+        }
+      }
+      if (!got_pc) {
+        std::cout << ERR() << "  [FAIL] 未收到预期 PropertyChanged 通知"
+                  << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+    // 9d. 回读 GetLabel(4097)->"oca-probe-test"
+    {
+      auto r = probe.cmd0(4097, {m::kDefLevelManager, m::kAgentGetLabel});
+      if (r.ok && r.status == o::Status::OK) {
+        oca::ocp1::Reader pr(r.params.data(), r.params.size());
+        std::string label = pr.string();
+        if (label == "oca-probe-test") {
+          std::cout << OK() << "  [OK] GetLabel(4097) 回读 == \"" << label
+                    << "\"" << OFF() << "\n";
+        } else {
+          std::cout << ERR() << "  [FAIL] GetLabel 回读=\"" << label
+                    << "\" (期望 \"oca-probe-test\")" << OFF() << "\n";
+          probe.failures++;
+        }
+      } else {
+        std::cout << ERR()
+                  << "  [FAIL] GetLabel status=" << status_name(r.status)
+                  << OFF() << "\n";
+        probe.failures++;
+      }
     }
   }
 

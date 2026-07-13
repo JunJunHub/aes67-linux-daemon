@@ -45,6 +45,15 @@ OcaServer::OcaServer(const OcaServerConfig& cfg) : cfg_(cfg) {
   registry_.register_object(std::unique_ptr<Object>(net2));
   registry_.register_object(std::unique_ptr<Object>(ctrl_net));
 
+  // Spec4:为所有已注册对象注入事件总线,使 attributable setter
+  // (SetLabel/SetEnabled)能触发 PropertyChanged。发射经对象成员 emitter_
+  // 调用,session 无关;投递由 trigger_event 内部按各订阅者 Session* 入队。
+  // objects_in_range(1, 9999) 覆盖管理器[1,99]、根块 100、CM3 网络[4096,...]。
+  // static_cast 安全:OcaServer 是唯一注册点,所有注册对象均为 OcaRoot 子类
+  // (Manager/Worker/Agent/AppNet 各支线均汇于 OcaRoot),且 Object 为多态基类。
+  for (auto* obj : registry_.objects_in_range(1, 9999))
+    static_cast<OcaRoot*>(obj)->set_event_emitter(sub_mgr_);
+
   transport_ = std::make_unique<Transport>(&registry_, sub_mgr_);
 }
 

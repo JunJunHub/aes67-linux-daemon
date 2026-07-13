@@ -1,4 +1,5 @@
 //  classes/control_network.cpp - OcaControlNetwork {1,4,1} v1 实现
+//  继承链: OcaControlNetwork -> OcaApplicationNetwork -> OcaRoot
 
 #include "oca/classes/control_network.hpp"
 
@@ -19,22 +20,10 @@ ExecResult OcaControlNetwork::exec(MethodID m,
                                    ocp1::Reader& req,
                                    ocp1::Writer& rsp,
                                    Session& sess) {
-  // OcaControlNetwork{1,4,1} 前缀匹配 OcaApplicationNetwork{1,4}(classID
-  // fieldCount =2, defLevel=2)。工具按基类测时 methodID.defLevel=2,故 AppNet
-  // 强制方法 (GetServiceID=4/GetSystemInterfaces=6)在 defLevel 2 分派。
-  if (m.defLevel ==
-      methods::kDefLevelManager) {  // == OcaApplicationNetwork defLevel 2
-    switch (m.methodIndex) {
-      case methods::kAppNetGetServiceID:
-        rsp.string("");  // 空 OcaString
-        return {Status::OK, 1};
-      case methods::kAppNetGetSystemInterfaces:
-        rsp.u16(0);  // 空 Ocp1List
-        return {Status::OK, 1};
-      default:
-        return {Status::NotImplemented, 0};
-    }
-  }
+  // OcaControlNetwork{1,4,1} defLevel=3 自身方法。
+  // OcaApplicationNetwork{1,4} defLevel=2 方法由父类
+  // OcaApplicationNetwork::exec
+  // 自动处理(GetLabel/SetLabel/GetOwner/GetServiceID/GetSystemInterfaces/GetPath)。
   if (m.defLevel == methods::kDefLevelBlock) {  // == classID.fieldCount == 3
     switch (m.methodIndex) {
       case methods::kCtrlNetGetControlProtocol:
@@ -45,7 +34,7 @@ ExecResult OcaControlNetwork::exec(MethodID m,
         return {Status::NotImplemented, 0};
     }
   }
-  return OcaRoot::exec(m, req, rsp, sess);  // DefLevel 1 -> OcaRoot
+  return OcaApplicationNetwork::exec(m, req, rsp, sess);
 }
 
 }  // namespace oca

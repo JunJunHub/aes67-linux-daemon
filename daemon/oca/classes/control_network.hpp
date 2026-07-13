@@ -6,13 +6,14 @@
 #ifndef OCA_CLASSES_CONTROL_NETWORK_HPP_
 #define OCA_CLASSES_CONTROL_NETWORK_HPP_
 
-#include "oca/classes/root.hpp"
+#include "oca/classes/application_network.hpp"
 
 namespace oca {
 
-class OcaControlNetwork : public OcaRoot {
+class OcaControlNetwork : public OcaApplicationNetwork {
  public:
-  explicit OcaControlNetwork(ONo ono) : OcaRoot(ono) {}
+  explicit OcaControlNetwork(ONo ono, ONo owner_ono = 0)
+      : OcaApplicationNetwork(ono, owner_ono) {}
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 1; }
   std::string role() const override { return "Control Network"; }

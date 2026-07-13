@@ -78,6 +78,22 @@ ExecResult OcaWorker::handle_worker(uint16_t idx,
     case methods::kWorkerGetPorts:
       rsp.u16(0);  // 空 Ocp1List<OcaPort>(根块无端口)
       return {Status::OK, 1};
+    case methods::kWorkerGetLabel:
+      // OcaString:返回 role() 作为标签
+      rsp.string(role());
+      return {Status::OK, 1};
+    case methods::kWorkerSetLabel:
+      // 读可选 OcaString,no-op。
+      if (req.remaining() >= 2)
+        (void)req.string();
+      return {Status::OK, 0};
+    case methods::kWorkerGetOwner:
+      // ONo:含有块的对象号。根块=0(无 owner)。
+      rsp.u32(owner_ono_);
+      return {Status::OK, 1};
+    case methods::kWorkerGetPath:
+      // OcaPath 结构复杂,YAGNI。
+      return {Status::NotImplemented, 0};
     default:
       return {Status::NotImplemented, 0};
   }

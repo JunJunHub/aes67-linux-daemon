@@ -28,7 +28,8 @@ class OcaRoot : public Object {
 // 补 DefLevel-2 分派。
 class OcaWorker : public OcaRoot {
  public:
-  using OcaRoot::OcaRoot;
+  explicit OcaWorker(ONo ono, ONo owner_ono = 0)
+      : OcaRoot(ono), owner_ono_(owner_ono) {}
   ExecResult exec(MethodID m,
                   ocp1::Reader& req,
                   ocp1::Writer& rsp,
@@ -41,6 +42,7 @@ class OcaWorker : public OcaRoot {
   ExecResult handle_worker(uint16_t methodIndex,
                            ocp1::Reader& req,
                            ocp1::Writer& rsp);
+  ONo owner_ono_ = 0;
 };
 
 // OcaManager {1,2} v2:Spec1 无自有 DefLevel-2 方法,委托 OcaRoot
@@ -52,7 +54,7 @@ class OcaManager : public OcaRoot {
 // OcaBlock {1,1,3} v2:DefLevel 3(Root Block, ONo 100)
 class OcaBlock : public OcaWorker {
  public:
-  explicit OcaBlock(ONo ono) : OcaWorker(ono) {}
+  explicit OcaBlock(ONo ono, ONo owner_ono = 0) : OcaWorker(ono, owner_ono) {}
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 2; }
   std::string role() const override { return "Root Block"; }

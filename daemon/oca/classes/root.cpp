@@ -99,14 +99,22 @@ ExecResult OcaWorker::handle_worker(uint16_t idx,
       rsp.u16(0);  // 空 Ocp1List<OcaPort>(根块无端口)
       return {Status::OK, 1};
     case methods::kWorkerGetLabel:
-      // OcaString:返回 role() 作为标签
-      rsp.string(role());
+      // Spec4:已 SetLabel 则返 label_,否则回退 role()
+      rsp.string(label_.empty() ? role() : label_);
       return {Status::OK, 1};
-    case methods::kWorkerSetLabel:
-      // 读可选 OcaString,no-op。
-      if (req.remaining() >= 2)
-        (void)req.string();
+    case methods::kWorkerSetLabel: {
+      // Spec4:真存储 label_ + 触发 PropertyChanged。空体探测时 no-op。
+      if (req.remaining() < 2)
+        return {Status::OK, 0};
+      std::string v = req.string();
+      label_ = v;
+      oca::ocp1::Writer vw;
+      vw.string(v);
+      emit_property_changed(methods::kDefLevelManager /*Worker 引入级*/,
+                            methods::kPropLabel, vw.data(),
+                            static_cast<uint16_t>(vw.size()));
       return {Status::OK, 0};
+    }
     case methods::kWorkerGetOwner:
       // ONo:含有块的对象号。根块=0(无 owner)。
       rsp.u32(owner_ono_);

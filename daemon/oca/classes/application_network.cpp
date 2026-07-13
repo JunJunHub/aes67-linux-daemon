@@ -21,14 +21,22 @@ ExecResult OcaApplicationNetwork::handle_appnet(uint16_t idx,
                                                 ocp1::Writer& rsp) {
   switch (idx) {
     case methods::kAppNetGetLabel:
-      // OcaString:返回 role() 作为标签
-      rsp.string(role());
+      // Spec4:已 SetLabel 则返 label_,否则回退 role()
+      rsp.string(label_.empty() ? role() : label_);
       return {Status::OK, 1};
-    case methods::kAppNetSetLabel:
-      // 读可选 OcaString,no-op。
-      if (req.remaining() >= 2)
-        (void)req.string();
+    case methods::kAppNetSetLabel: {
+      // Spec4:真存储 label_ + 触发 PropertyChanged。空体探测时 no-op。
+      if (req.remaining() < 2)
+        return {Status::OK, 0};
+      std::string v = req.string();
+      label_ = v;
+      oca::ocp1::Writer vw;
+      vw.string(v);
+      emit_property_changed(methods::kDefLevelManager /*AppNet 引入级*/,
+                            methods::kPropLabel, vw.data(),
+                            static_cast<uint16_t>(vw.size()));
       return {Status::OK, 0};
+    }
     case methods::kAppNetGetOwner:
       // ONo:含有块的对象号。
       rsp.u32(owner_ono_);

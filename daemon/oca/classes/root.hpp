@@ -58,6 +58,7 @@ class OcaWorker : public OcaRoot {
                            ocp1::Reader& req,
                            ocp1::Writer& rsp);
   ONo owner_ono_ = 0;
+  std::string label_;  // Spec4:Label 真存储(空则 GetLabel 回退 role())
 };
 
 // OcaManager {1,2} v2:Spec1 无自有 DefLevel-2 方法,委托 OcaRoot

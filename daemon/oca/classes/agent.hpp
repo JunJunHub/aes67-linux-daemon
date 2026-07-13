@@ -29,6 +29,7 @@ class OcaAgent : public OcaRoot {
                           ocp1::Reader& req,
                           ocp1::Writer& rsp);
   ONo owner_ono_;
+  std::string label_;  // Spec4:Label 真存储(空则 GetLabel 回退 role())
 };
 
 }  // namespace oca

@@ -674,6 +674,89 @@ BOOST_AUTO_TEST_CASE(dispatch_worker_label_owner) {
                     1u);
 }
 
+BOOST_AUTO_TEST_CASE(dispatch_property_changed_label_emit) {
+  // Spec4:对象级 PropertyChanged 发射链验证。
+  // 构造 OcaNetwork(4097,继承 OcaAgent)+ 真实 SubscriptionManager,
+  // 单元内手动注入 emitter(模拟 OcaServer 注入),SetLabel 后断言:
+  //   - Notification2 PDU 入队,emitterONo=4097,eventID={1,1}
+  //   - data = PropertyID{2,1} + OcaString == "hello"
+  //   - GetLabel 回读 == "hello"(label_ 已真存)
+  //   - emitter=nullptr 时 silent(无 ntf)
+  oca::OcaSubscriptionManager sm(4);
+  oca::OcaNetwork net(4097, 100);
+  net.set_event_emitter(&sm);  // 手动注入
+  oca::Session sess(1);
+  oca::ObjectRegistry reg;
+  sess.set_registry(&reg);
+  namespace m = oca::methods;
+
+  // 1) AddPropertyChangeSubscription2(target=4, emitter=4097, PropertyID{2,1})
+  //    sphinx §3.10:EmitterONo + PropertyID{u16,u16} + DeliveryMode + NetAddr
+  oca::ocp1::Writer reqw;
+  reqw.u32(4097);                 // EmitterONo
+  reqw.u16(m::kDefLevelManager);  // PropertyID defLevel (Agent 引入级=2)
+  reqw.u16(m::kPropLabel);        // PropertyID propertyIndex (Label=1)
+  reqw.u8(1);                     // NotificationDeliveryMode = Normal
+  reqw.u16(0);                    // 空 NetworkAddress
+  oca::ocp1::Reader req(reqw.data(), reqw.size());
+  oca::ocp1::Writer rspw;
+  auto st =
+      sm.exec({m::kDefLevelSubMngr, m::kSubAddPropertyChangeSubscription2}, req,
+              rspw, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK(sess.has_subscription(
+      4097, {m::kDefLevelRoot, m::kEventPropertyChanged}));
+
+  // 2) SetLabel(Agent defLevel=2, kAgentSetLabel=2, OcaString="hello")
+  //    -> 真存 label_ + emit PropertyChanged
+  oca::ocp1::Writer labw;
+  labw.string("hello");
+  oca::ocp1::Reader labreq(labw.data(), labw.size());
+  oca::ocp1::Writer setrsp;
+  st = net.exec({m::kDefLevelManager, m::kAgentSetLabel}, labreq, setrsp, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(st.nrParameters, 0);
+
+  // 3) 取 Notification2 PDU 并解析
+  std::vector<uint8_t> pdu;
+  BOOST_REQUIRE(sess.take_notification(pdu));
+  BOOST_REQUIRE(pdu.size() > 10);
+  BOOST_CHECK_EQUAL(pdu[0], 0x3B);
+  auto hdr =
+      oca::ocp1::PduReader::try_parse_header(pdu.data() + 1, pdu.size() - 1);
+  BOOST_REQUIRE(hdr);
+  BOOST_CHECK_EQUAL(hdr->pduType, m::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      pdu.data() + 1 + 9, pdu.size() - 1 - 9, hdr->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 4097u);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.defLevel, m::kDefLevelRoot);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.eventIndex, m::kEventPropertyChanged);
+  // data = PropertyID{u16,u16} + OcaString
+  oca::ocp1::Reader dr(ntfs[0].data, ntfs[0].dataCount);
+  BOOST_CHECK_EQUAL(dr.u16(), m::kDefLevelManager);  // PropertyID defLevel=2
+  BOOST_CHECK_EQUAL(dr.u16(), m::kPropLabel);  // PropertyID propertyIndex=1
+  BOOST_CHECK_EQUAL(dr.string(), "hello");
+  BOOST_CHECK(!sess.take_notification(pdu));  // 队列已空
+
+  // 4) GetLabel 回读 == "hello"(label_ 已真存)
+  oca::ocp1::Reader empty(nullptr, 0);
+  oca::ocp1::Writer getrsp;
+  st = net.exec({m::kDefLevelManager, m::kAgentGetLabel}, empty, getrsp, sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(getrsp.data(), getrsp.size()).string(),
+                    "hello");
+
+  // 5) emitter=nullptr 时 SetLabel silent(无 ntf)
+  net.set_event_emitter(nullptr);
+  oca::ocp1::Reader labreq2(labw.data(), labw.size());
+  oca::ocp1::Writer setrsp2;
+  st = net.exec({m::kDefLevelManager, m::kAgentSetLabel}, labreq2, setrsp2,
+                sess);
+  BOOST_CHECK(st.status == oca::Status::OK);
+  BOOST_CHECK(!sess.take_notification(pdu));  // 无新通知
+}
+
 BOOST_AUTO_TEST_CASE(dispatch_device_manager) {
   oca::OcaDeviceIdentity id;
   id.manufacturer = "Acme";

@@ -1763,6 +1763,170 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
   server.stop();
 }
 
+BOOST_AUTO_TEST_CASE(oca_e2e_property_changed) {
+  // Spec4 里程碑:全真实 socket 端到端 PropertyChanged 投递。
+  // 经真实 SetLabel 命令触发(不伸手 trigger_event),验证:
+  //   订阅 -> SetLabel -> transport drain -> Notification2 上线 -> 解析
+  // 与 oca_e2e_acceptance 区别:后者 OperationalState 经测试代码直接触发,
+  // 本用例 PropertyChanged 经真实 setter 触发,证明发射点已接入生产路径。
+  oca::OcaServerConfig cfg;
+  cfg.port = 0;
+  cfg.node_id = "AES67 daemon pc";
+  cfg.daemon_version = "bondagit-3.1.0";
+  oca::OcaServer server(cfg);
+  BOOST_REQUIRE(server.start());
+  uint16_t port = server.port();
+
+  int sock = ::socket(AF_INET, SOCK_STREAM, 0);
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(port);
+  ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  BOOST_REQUIRE(
+      ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+
+  auto sendPdu = [&](const std::vector<uint8_t>& p) {
+    BOOST_REQUIRE_EQUAL(::send(sock, p.data(), p.size(), 0), (ssize_t)p.size());
+  };
+  auto recvPdu = [&](std::vector<uint8_t>& out) -> bool {
+    uint8_t sync;
+    if (::recv(sock, &sync, 1, 0) != 1 || sync != 0x3B)
+      return false;
+    uint8_t hdr[9];
+    size_t got = 0;
+    while (got < 9) {
+      ssize_t r = ::recv(sock, hdr + got, 9 - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    auto h = oca::ocp1::PduReader::try_parse_header(hdr, 9);
+    if (!h)
+      return false;
+    size_t plen = h->pduSize - 9;
+    out.assign(hdr, hdr + 9);
+    out.resize(9 + plen);
+    got = 0;
+    while (got < plen) {
+      ssize_t r = ::recv(sock, out.data() + 9 + got, plen - got, 0);
+      if (r <= 0)
+        return false;
+      got += r;
+    }
+    out.insert(out.begin(), 0x3B);
+    return true;
+  };
+  namespace m = oca::methods;
+  // 接收穿插的 Notification2 必须缓存而非丢弃:transport 在发送 Response 后
+  // 排空通知队列,与同一命令的 Response 在单流上交错;cmd 等待 Response 时
+  // 可能先收到 Ntf2。将这类穿插通知暂存在待审队列,供步骤 5 取用。
+  std::vector<std::vector<uint8_t>> pending_ntfs;
+  // 带参命令封装:SetLabel/订阅 需传参。接收时循环跳过穿插的通知,只取
+  // pduType=Response 的 PDU;途中遇到的 Ntf2 存入 pending_ntfs。
+  auto cmdParams = [&](uint32_t handle, oca::ONo target, oca::MethodID mid,
+                       const uint8_t* params, uint32_t paramBytes,
+                       uint8_t nrParams) -> oca::ocp1::Response {
+    oca::ocp1::Writer cw;
+    oca::ocp1::write_command(cw, handle, target, mid, params, paramBytes,
+                             nrParams);
+    sendPdu(oca::ocp1::PduWriter::build_command_pdu(1, cw.data(), cw.size()));
+    for (int i = 0; i < 16; ++i) {
+      std::vector<uint8_t> rsp;
+      BOOST_REQUIRE(recvPdu(rsp));
+      auto h = oca::ocp1::PduReader::try_parse_header(rsp.data() + 1,
+                                                      rsp.size() - 1);
+      if (h->pduType == m::kPduResponse) {
+        auto rsps = oca::ocp1::PduReader::parse_responses(
+            rsp.data() + 1 + 9, h->pduSize - 9, h->messageCount);
+        BOOST_REQUIRE_EQUAL(rsps.size(), 1u);
+        return rsps[0];
+      }
+      if (h->pduType == m::kPduNtf2)
+        pending_ntfs.push_back(std::move(rsp));  // 缓存穿插通知
+      // 其他 PduType(KeepAlive)忽略
+    }
+    BOOST_FAIL("超时:未收到 Response PDU");
+    return {};
+  };
+  auto cmd = [&](uint32_t handle, oca::ONo target,
+                 oca::MethodID mid) -> oca::ocp1::Response {
+    return cmdParams(handle, target, mid, nullptr, 0, 0);
+  };
+  // 取下一个 Notification2 PDU:先消费缓存的穿插通知,再 recv。
+  auto recvNtf2 = [&]() -> std::vector<uint8_t> {
+    for (int i = 0; i < 32; ++i) {
+      if (!pending_ntfs.empty()) {
+        auto p = std::move(pending_ntfs.front());
+        pending_ntfs.erase(pending_ntfs.begin());
+        return p;
+      }
+      std::vector<uint8_t> rsp;
+      BOOST_REQUIRE(recvPdu(rsp));
+      auto h = oca::ocp1::PduReader::try_parse_header(rsp.data() + 1,
+                                                      rsp.size() - 1);
+      if (h->pduType == m::kPduNtf2)
+        return rsp;
+      // 其他 PduType 忽略,继续等
+    }
+    BOOST_FAIL("超时:未收到 Notification2 PDU");
+    return {};
+  };
+
+  // 1) KeepAlive 握手
+  sendPdu(oca::ocp1::PduWriter::build_keepalive_pdu(5));
+  std::vector<uint8_t> ka;
+  BOOST_REQUIRE(recvPdu(ka));
+
+  // 2) AddPropertyChangeSubscription2(target=4, emitter=4097, PropertyID{2,1})
+  oca::ocp1::Writer subp;
+  subp.u32(4097);                 // EmitterONo
+  subp.u16(m::kDefLevelManager);  // PropertyID defLevel=2(Agent)
+  subp.u16(m::kPropLabel);        // PropertyID propertyIndex=1
+  subp.u8(1);                     // DeliveryMode Normal
+  subp.u16(0);                    // 空 NetworkAddress
+  auto rsub = cmdParams(
+      1, 4, {m::kDefLevelSubMngr, m::kSubAddPropertyChangeSubscription2},
+      subp.data(), static_cast<uint32_t>(subp.size()), 4);
+  BOOST_CHECK(rsub.statusCode == oca::Status::OK);
+
+  // 3) SetLabel(4097, kAgentSetLabel=2, OcaString="world")
+  oca::ocp1::Writer labw;
+  labw.string("world");
+  auto rset = cmdParams(2, 4097, {m::kDefLevelManager, m::kAgentSetLabel},
+                        labw.data(), static_cast<uint32_t>(labw.size()), 1);
+  BOOST_CHECK(rset.statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(rset.nrParameters, 0);
+
+  // 4) ping(GetOcaVersion)->强制 transport 排空通知队列,通知上线
+  auto rping = cmd(3, 1, {m::kDefLevelDeviceMngr, m::kDevGetOcaVersion});
+  BOOST_CHECK(rping.statusCode == oca::Status::OK);
+
+  // 5) 取 Notification2(消费缓存或 recv;穿插通知经 cmd 已存 pending_ntfs)
+  std::vector<uint8_t> ntf = recvNtf2();
+  auto hn =
+      oca::ocp1::PduReader::try_parse_header(ntf.data() + 1, ntf.size() - 1);
+  BOOST_CHECK_EQUAL(hn->pduType, m::kPduNtf2);
+  auto ntfs = oca::ocp1::PduReader::parse_notifications2(
+      ntf.data() + 1 + 9, hn->pduSize - 9, hn->messageCount);
+  BOOST_REQUIRE_EQUAL(ntfs.size(), 1u);
+  BOOST_CHECK_EQUAL(ntfs[0].emitterONo, 4097u);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.defLevel, m::kDefLevelRoot);
+  BOOST_CHECK_EQUAL(ntfs[0].eventID.eventIndex, m::kEventPropertyChanged);
+  oca::ocp1::Reader dr(ntfs[0].data, ntfs[0].dataCount);
+  BOOST_CHECK_EQUAL(dr.u16(), m::kDefLevelManager);
+  BOOST_CHECK_EQUAL(dr.u16(), m::kPropLabel);
+  BOOST_CHECK_EQUAL(dr.string(), "world");
+
+  // 6) 回读 GetLabel(4097) -> "world"(label_ 经 OcaServer 已真存)
+  auto rget = cmd(4, 4097, {m::kDefLevelManager, m::kAgentGetLabel});
+  BOOST_CHECK(rget.statusCode == oca::Status::OK);
+  BOOST_CHECK_EQUAL(oca::ocp1::Reader(rget.paramData, rget.paramBytes).string(),
+                    "world");
+
+  ::close(sock);
+  server.stop();
+}
+
 BOOST_AUTO_TEST_CASE(transport_empty_body_probe_keeps_connection) {
   // 回归(阶段二真实控制器抓包坐实):2018 工具在 OCC Object Compliancy test5
   // 方法存在性探测阶段,对 SubscriptionManager 发空体 AddSubscription(nrParams

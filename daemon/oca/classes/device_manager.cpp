@@ -86,18 +86,21 @@ ExecResult OcaDeviceManager::GetModelGUID(ocp1::Writer& rsp) {
 }
 
 ExecResult OcaDeviceManager::GetEnabled(ocp1::Writer& rsp) {
-  // OcaBoolean(u8):daemon 总 enabled。OCAMicro GET_ENABLED 响应
+  // Spec4:返真存储 enabled_(默认 true)。OCAMicro GET_ENABLED 响应
   // NrParameters=1。
-  rsp.u8(1);
+  rsp.u8(enabled_ ? 1 : 0);
   return {Status::OK, 1};
 }
 
 ExecResult OcaDeviceManager::SetEnabled(ocp1::Reader& req) {
-  // OCAMicro SET_ENABLED 读 OcaBoolean(u8)。2018 工具探测时发空体(nrParameters
-  // 字段填 0x64 但 paramBytes=0),daemon 仅在存在字节时读取,空体视为 no-op;
-  // daemon 总 enabled,SetEnabled 为 no-op,返回 {OK,0}。
-  if (req.remaining() >= 1)
-    (void)req.u8();  // OcaBoolean(忽略,daemon 总 enabled)
+  // Spec4:真存储 enabled_ + 触发 PropertyChanged。空体探测(paramBytes=0)
+  // 时 no-op 返回 OK,不破坏 Spec1 回归。
+  if (req.remaining() >= 1) {
+    uint8_t v = req.u8();  // OcaBoolean
+    enabled_ = (v != 0);
+    emit_property_changed(methods::kDefLevelDeviceMngr /*DevMgr 引入级*/,
+                          methods::kPropEnabled, &v, 1);
+  }
   return {Status::OK, 0};
 }
 

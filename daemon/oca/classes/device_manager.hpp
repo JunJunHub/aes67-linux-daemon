@@ -46,6 +46,7 @@ class OcaDeviceManager : public OcaManager {
   ExecResult GetManagers(ocp1::Writer& rsp, Session& sess);
 
   OcaDeviceIdentity identity_;
+  bool enabled_ = true;  // Spec4:Enabled 真存储,SetEnabled 触发 PropertyChanged
 };
 
 }  // namespace oca

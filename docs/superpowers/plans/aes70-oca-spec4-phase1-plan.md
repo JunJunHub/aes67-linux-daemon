@@ -63,22 +63,14 @@
 
 - [ ] **Step 1: 新增常量**
 
-在 `daemon/oca/methods.hpp` 第 135 行(`constexpr uint16_t kEventOperationalState = 1;` 之后)插入：
+在 `daemon/oca/methods.hpp` 第 135 行(`constexpr uint16_t kEventOperationalState = 1;` 之后、`// ProtocolVersion (AES70-2023)` 之前)插入以下**新增**行(上方 `kEventPropertyChanged`/`kEventOperationalState` 与下方 `kProtocolVersion` 行均已存在,仅作定位锚点,勿重复插入):
 
 ```cpp
-// OcaRoot events (DefLevel 1)
-constexpr uint16_t kEventPropertyChanged = 1;
-
-// OcaDeviceManager events (DefLevel 3)
-constexpr uint16_t kEventOperationalState = 1;  // DeviceState 变化(演示事件)
-
 // Spec4:PropertyChanged 通知负载中的 PropertyID.propertyIndex(AES70
 // OcaPropertyID = {声明类 defLevel, 类属性表下标};propertyIndex 与 methodIndex
 // 独立命名空间)。Label/Enabled 均为各类首个可报变属性。
 constexpr uint16_t kPropLabel = 1;    // OcaAgent/OcaWorker/OcaAppNet 的 Label
 constexpr uint16_t kPropEnabled = 1;  // OcaDeviceManager 的 Enabled
-
-// ProtocolVersion (AES70-2023)
 ```
 
 - [ ] **Step 2: 构建验证常量编译通过**
@@ -503,13 +495,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
   // 调用,session 无关;投递由 trigger_event 内部按各订阅者 Session* 入队。
   // objects_in_range(1, 9999) 覆盖管理器[1,99]、根块 100、CM3 网络[4096,...]。
   for (auto* obj : registry_.objects_in_range(1, 9999))
-    obj->set_event_emitter(sub_mgr_);
+    static_cast<OcaRoot*>(obj)->set_event_emitter(sub_mgr_);
 
   transport_ = std::make_unique<Transport>(&registry_, sub_mgr_);
 ```
 
-> 需确认 oca_server.cpp 已 include 能见到 `OcaRoot::set_event_emitter`(经 root.hpp)。oca_server.cpp line 5-9 已 include 各 class 头(device_manager/network/control_network/root 等)，root.hpp 经这些传递可见。无需额外 include。
-> `sub_mgr_` 在 line 40 已赋值(`sub_mgr_ = sm;`)，注入循环在其后，安全。
+> **类型转换说明**:`objects_in_range` 返回 `std::vector<Object*>`,而 `set_event_emitter` 声明在 `OcaRoot`(非 `Object`)。需 `static_cast<OcaRoot*>(obj)` 向下转换。安全前提:所有经 OcaServer 注册的对象(DeviceManager/NetworkManager/SubscriptionManager 经 OcaManager→OcaRoot,Root Block 经 OcaWorker→OcaRoot,OcaNetwork 经 OcaAgent→OcaRoot,OcaControlNetwork 经 OcaApplicationNetwork→OcaRoot)均为 OcaRoot 子类,且 `Object` 含虚函数为多态基类,向下转换合法。该不变量由 OcaServer 构造独占维护(测试中 StubObject 等非 OcaRoot 子类不经此路径)。
+> 需确认 oca_server.cpp 已 include 能见到 `OcaRoot::set_event_emitter`(经 root.hpp)。oca_server.cpp line 5-9 已 include 各 class 头(device_manager/network/control_network/root 等),root.hpp 经这些传递可见。无需额外 include。
+> `sub_mgr_` 在 line 40 已赋值(`sub_mgr_ = sm;`),注入循环在其后,安全。
 
 - [ ] **Step 2: 构建验证**
 

@@ -11,14 +11,14 @@
 #ifndef OCA_CLASSES_NETWORK_HPP_
 #define OCA_CLASSES_NETWORK_HPP_
 
-#include "oca/classes/root.hpp"
+#include "oca/classes/agent.hpp"
 
 namespace oca {
 
 // OcaNetwork {1,2,1} v1:DeprecatedSince AES70-2018 / 2023 弃用
-class OcaNetwork : public OcaRoot {
+class OcaNetwork : public OcaAgent {
  public:
-  explicit OcaNetwork(ONo ono) : OcaRoot(ono) {}
+  explicit OcaNetwork(ONo ono, ONo owner_ono = 0) : OcaAgent(ono, owner_ono) {}
   const ClassIdentification& class_id() const override;
   uint16_t class_version() const override { return 1; }
   std::string role() const override { return "Network"; }

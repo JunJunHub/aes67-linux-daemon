@@ -49,7 +49,7 @@ ExecResult OcaNetwork::exec(MethodID m,
         return {Status::NotImplemented, 0};
     }
   }
-  return OcaRoot::exec(m, req, rsp, sess);  // DefLevel 1 -> OcaRoot
+  return OcaAgent::exec(m, req, rsp, sess);  // DefLevel 1/2 -> OcaAgent
 }
 
 }  // namespace oca

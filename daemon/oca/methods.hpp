@@ -134,6 +134,12 @@ constexpr uint16_t kEventPropertyChanged = 1;
 // OcaDeviceManager events (DefLevel 3)
 constexpr uint16_t kEventOperationalState = 1;  // DeviceState 变化(演示事件)
 
+// Spec4:PropertyChanged 通知负载中的 PropertyID.propertyIndex(AES70
+// OcaPropertyID = {声明类 defLevel, 类属性表下标};propertyIndex 与 methodIndex
+// 独立命名空间)。Label/Enabled 均为各类首个可报变属性。
+constexpr uint16_t kPropLabel = 1;    // OcaAgent/OcaWorker/OcaAppNet 的 Label
+constexpr uint16_t kPropEnabled = 1;  // OcaDeviceManager 的 Enabled
+
 // ProtocolVersion (AES70-2023)
 constexpr uint16_t kProtocolVersion = 1;
 constexpr uint8_t kSyncVal = 0x3B;

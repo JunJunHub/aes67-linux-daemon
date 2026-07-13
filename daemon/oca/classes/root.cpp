@@ -3,7 +3,9 @@
 #include "oca/classes/root.hpp"
 
 #include "oca/methods.hpp"
+#include "oca/ocp1.hpp"
 #include "oca/session.hpp"
+#include "oca/classes/subscription_manager.hpp"  // Spec4:trigger_event 完整类型
 
 namespace oca {
 
@@ -13,6 +15,24 @@ const ClassIdentification kBlockClassId = {{{1, 1, 3}}, 2};
 
 const ClassIdentification& OcaBlock::class_id() const {
   return kBlockClassId;
+}
+
+void OcaRoot::emit_property_changed(uint16_t prop_def_level,
+                                    uint16_t prop_index,
+                                    const uint8_t* value_data,
+                                    uint16_t value_count) {
+  if (!emitter_)
+    return;
+  // 负载 = PropertyID{u16 defLevel, u16 propertyIndex} + 已编码属性值
+  oca::ocp1::Writer w;
+  w.u16(prop_def_level);
+  w.u16(prop_index);
+  for (uint16_t i = 0; i < value_count; ++i)
+    w.u8(value_data[i]);
+  // PropertyChanged 事件 = OcaRoot event {kDefLevelRoot, kEventPropertyChanged}
+  emitter_->trigger_event(
+      ono(), {methods::kDefLevelRoot, methods::kEventPropertyChanged}, w.data(),
+      static_cast<uint16_t>(w.size()));
 }
 
 ExecResult OcaRoot::handle_root(uint16_t idx, ocp1::Writer& rsp) {

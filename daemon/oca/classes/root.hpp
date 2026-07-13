@@ -9,6 +9,8 @@
 
 namespace oca {
 
+class OcaSubscriptionManager;  // 前置声明,避免头循环
+
 // OcaRoot {1,1} v2:DefLevel 1 基础方法
 class OcaRoot : public Object {
  public:
@@ -19,8 +21,21 @@ class OcaRoot : public Object {
                   Session& sess) override;
   virtual std::string role() const { return {}; }
 
+  // Spec4:注入事件总线(PropertyChanged 发射用)。默认 nullptr,
+  // setter 在真存储属性后经此触发;为空时该对象不发通知(如纯只读 Manager
+  // 或单测中未经 OcaServer 构造的对象)。
+  void set_event_emitter(OcaSubscriptionManager* em) { emitter_ = em; }
+  OcaSubscriptionManager* event_emitter() const { return emitter_; }
+
  protected:
   ExecResult handle_root(uint16_t methodIndex, ocp1::Writer& rsp);
+  // Spec4:编码并触发 PropertyChanged 通知。data 负载 = PropertyID{u16,u16}
+  // + 已编码属性值。emitter_ 为空时静默(只读对象 / 未注入)。
+  void emit_property_changed(uint16_t prop_def_level,
+                             uint16_t prop_index,
+                             const uint8_t* value_data,
+                             uint16_t value_count);
+  OcaSubscriptionManager* emitter_ = nullptr;
 };
 
 // OcaWorker {1,1,1} v2:Spec1 无自有 DefLevel-2 方法,委托 OcaRoot

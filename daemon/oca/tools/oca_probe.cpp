@@ -259,7 +259,8 @@ int main(int argc, char** argv) {
   std::string host = "127.0.0.1";
   uint16_t port = 65037;
   bool do_sub = true;
-  bool do_pc = true;  // Spec4:PropertyChanged 探测段
+  bool do_pc = true;     // Spec4:PropertyChanged 探测段
+  bool do_media = true;  // Spec5:媒体时钟+MTN 探测段
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -267,11 +268,15 @@ int main(int argc, char** argv) {
       do_sub = false;
     } else if (a == "--no-pc") {  // Spec4
       do_pc = false;
+    } else if (a == "--no-media") {  // Spec5
+      do_media = false;
     } else if (a == "-h" || a == "--help") {
-      std::cout << "用法: oca-probe [host] [port] [--no-sub] [--no-pc]\n"
+      std::cout << "用法: oca-probe [host] [port] [--no-sub] [--no-pc] "
+                   "[--no-media]\n"
                 << "  默认 127.0.0.1 65037\n"
-                << "  --no-sub  跳过 EV2 订阅测试\n"
-                << "  --no-pc   跳过 PropertyChanged 投递测试\n";
+                << "  --no-sub    跳过 EV2 订阅测试\n"
+                << "  --no-pc     跳过 PropertyChanged 投递测试\n"
+                << "  --no-media  跳过媒体时钟+MTN 探测\n";
       return 0;
     } else if (a.find_first_not_of("0123456789.") == std::string::npos &&
                a.find('.') != std::string::npos && host == "127.0.0.1") {
@@ -889,6 +894,143 @@ int main(int argc, char** argv) {
         std::cout << ERR()
                   << "  [FAIL] GetLabel status=" << status_name(r.status)
                   << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+  }
+
+  // --- Spec5:媒体时钟 + MTN 探测
+  // -----------------------------------------------
+  if (do_media) {
+    section("Spec5 媒体时钟 (MediaClockManager ONo=7 / MediaClock3 ONo=8193)");
+
+    // GetClock3s on MediaClockManager(7)
+    {
+      auto r = probe.cmd(7, {m::kDefLevelMediaClockMngr, m::kMcmGetClock3s});
+      if (r.status == o::Status::OK) {
+        o::ocp1::Reader rd(r.params.data(), r.params.size());
+        uint16_t count = rd.u16();
+        bool found8193 = false;
+        for (uint16_t i = 0; i < count; ++i) {
+          uint32_t ono = rd.u32();
+          if (ono == 8193)
+            found8193 = true;
+        }
+        if (found8193) {
+          std::cout << OK() << "  [OK] GetClock3s 返回含 8193" << OFF() << "\n";
+        } else {
+          std::cout << ERR() << "  [FAIL] GetClock3s 未返回 8193" << OFF()
+                    << "\n";
+          probe.failures++;
+        }
+      } else {
+        std::cout << ERR()
+                  << "  [FAIL] GetClock3s status=" << status_name(r.status)
+                  << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetAvailability on MediaClock3(8193)
+    {
+      auto r =
+          probe.cmd(8193, {m::kDefLevelMediaClock3, m::kMc3GetAvailability});
+      if (r.status == o::Status::OK &&
+          o::ocp1::Reader(r.params.data(), r.params.size()).u8() == 1) {
+        std::cout << OK() << "  [OK] GetAvailability = AVAILABLE" << OFF()
+                  << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] GetAvailability" << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetCurrentRate on MediaClock3(8193)
+    {
+      auto r =
+          probe.cmd(8193, {m::kDefLevelMediaClock3, m::kMc3GetCurrentRate});
+      if (r.status == o::Status::OK) {
+        o::ocp1::Reader rd(r.params.data(), r.params.size());
+        uint32_t num = rd.u32();
+        rd.u32();  // denom
+        std::cout << OK() << "  [OK] GetCurrentRate = " << num << " Hz" << OFF()
+                  << "\n";
+      } else {
+        std::cout << ERR()
+                  << "  [FAIL] GetCurrentRate status=" << status_name(r.status)
+                  << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetSupportedRates on MediaClock3(8193)
+    {
+      auto r =
+          probe.cmd(8193, {m::kDefLevelMediaClock3, m::kMc3GetSupportedRates});
+      if (r.status == o::Status::OK) {
+        o::ocp1::Reader rd(r.params.data(), r.params.size());
+        uint16_t count = rd.u16();
+        std::cout << OK() << "  [OK] GetSupportedRates = " << count << " 项"
+                  << OFF() << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] GetSupportedRates status="
+                  << status_name(r.status) << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetOffset on MediaClock3(8193)
+    {
+      auto r = probe.cmd(8193, {m::kDefLevelMediaClock3, m::kMc3GetOffset});
+      if (r.status == o::Status::OK) {
+        std::cout << OK() << "  [OK] GetOffset = 0" << OFF() << "\n";
+      } else {
+        std::cout << ERR()
+                  << "  [FAIL] GetOffset status=" << status_name(r.status)
+                  << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    section("Spec5 MTN_AES67 (ONo=8192)");
+
+    // GetMediaProtocol on MTN(8192)
+    {
+      auto r = probe.cmd(8192, {m::kDefLevelMtn, m::kMtnGetMediaProtocol});
+      if (r.status == o::Status::OK &&
+          o::ocp1::Reader(r.params.data(), r.params.size()).u8() == 3) {
+        std::cout << OK() << "  [OK] GetMediaProtocol = AES67" << OFF() << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] GetMediaProtocol" << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetMaxSourceConnectors on MTN(8192)
+    {
+      auto r =
+          probe.cmd(8192, {m::kDefLevelMtn, m::kMtnGetMaxSourceConnectors});
+      if (r.status == o::Status::OK) {
+        uint16_t n = o::ocp1::Reader(r.params.data(), r.params.size()).u16();
+        std::cout << OK() << "  [OK] GetMaxSourceConnectors = " << n << OFF()
+                  << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] GetMaxSourceConnectors status="
+                  << status_name(r.status) << OFF() << "\n";
+        probe.failures++;
+      }
+    }
+
+    // GetConnectorsStatuses on MTN(8192)
+    {
+      auto r = probe.cmd(8192, {m::kDefLevelMtn, m::kMtnGetConnectorsStatuses});
+      if (r.status == o::Status::OK) {
+        uint16_t n = o::ocp1::Reader(r.params.data(), r.params.size()).u16();
+        std::cout << OK() << "  [OK] GetConnectorsStatuses = " << n
+                  << " 个连接器" << OFF() << "\n";
+      } else {
+        std::cout << ERR() << "  [FAIL] GetConnectorsStatuses status="
+                  << status_name(r.status) << OFF() << "\n";
         probe.failures++;
       }
     }

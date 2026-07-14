@@ -5,6 +5,7 @@
 # Usage:
 #   ./oca-daemonctl.sh start   [-i <iface>] [--ptp-iface <iface>] [--no-ptp]
 #                          [-p <port>] [-d <ptp_domain>] [-a <addr>] [--unload-on-stop]
+#                          [--oca] [--daemon-bin <path>]
 #   ./oca-daemonctl.sh stop    [--unload]
 #   ./oca-daemonctl.sh restart [-i <iface>] [--ptp-iface <iface>] [--no-ptp] ...
 #   ./oca-daemonctl.sh status
@@ -51,6 +52,11 @@ PTP_IFACE=""          # interface for ptp4l (default: same as IFACE). Set to lo 
 NO_PTP=0              # 1 = skip ptp4l entirely (SAP/mDNS browse & WebUI work, but
                       # audio send/recv needs a PTP lock so it won't work)
 UNLOAD_ON_STOP=0
+OCA_ENABLED=0         # 1 = enable OCA control plane (oca_enabled=true) + use the
+                      # OCA-built binary (via --oca / --daemon-bin). The daemon then
+                      # also publishes _oca._tcp mDNS for Fitcan/AES70 controllers.
+DAEMON_BIN_OVERRIDE="" # --daemon-bin <path>: use a specific daemon binary (e.g. the
+                      # out-of-source OCA build from oca-dev.sh build --real).
 
 log()  { echo "[daemonctl] $*"; }
 warn() { echo "[daemonctl] WARNING: $*" >&2; }
@@ -58,7 +64,7 @@ die()  { echo "[daemonctl] ERROR: $*" >&2; exit 1; }
 
 # ---- parse global options (apply to start/restart) ---------------------------
 parse_opts() {
-  IFACE="lo"; HTTP_ADDR="0.0.0.0"; HTTP_PORT=""; PTP_DOMAIN=""; PTP_IFACE=""; NO_PTP=0; UNLOAD_ON_STOP=0
+  IFACE="lo"; HTTP_ADDR="0.0.0.0"; HTTP_PORT=""; PTP_DOMAIN=""; PTP_IFACE=""; NO_PTP=0; UNLOAD_ON_STOP=0; OCA_ENABLED=0; DAEMON_BIN_OVERRIDE=""
   while [ $# -gt 0 ]; do
     case "$1" in
       -i) IFACE="${2:-}"; shift 2 ;;
@@ -68,12 +74,23 @@ parse_opts() {
       --ptp-iface) PTP_IFACE="${2:-}"; shift 2 ;;
       --no-ptp) NO_PTP=1; shift ;;
       --unload|--unload-on-stop) UNLOAD_ON_STOP=1; shift ;;
+      --oca) OCA_ENABLED=1; shift ;;
+      --daemon-bin) DAEMON_BIN_OVERRIDE="${2:-}"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
   [ -n "$IFACE" ] || die "interface name cannot be empty"
   # ptp4l interface defaults to the daemon interface
   [ -n "$PTP_IFACE" ] || PTP_IFACE="$IFACE"
+  # --oca implies using the OCA-built binary unless --daemon-bin overrides it
+  if [ -n "$DAEMON_BIN_OVERRIDE" ]; then
+    DAEMON_BIN="$DAEMON_BIN_OVERRIDE"
+  elif [ "$OCA_ENABLED" = 1 ]; then
+    # prefer the out-of-source OCA build (oca-dev.sh build --real), fall back to in-source
+    if [ -x "$TOPDIR/daemon/build/aes67-daemon" ]; then
+      DAEMON_BIN="$TOPDIR/daemon/build/aes67-daemon"
+    fi
+  fi
 }
 
 # ---- pre-flight --------------------------------------------------------------
@@ -130,10 +147,12 @@ kill_pidfile() {  # <pidfile>
 # ---- generate per-interface config (does NOT touch daemon.conf) --------------
 gen_config() {
   local conf; conf="$(conf_file)"
-  # start from the stock config and override fields via python (robust JSON edit)
-  python3 - "$DAEMON_CONF" "$conf" "$IFACE" "${PTP_DOMAIN:-}" "${HTTP_PORT:-}" <<'PY' || die "failed to generate config"
+  # start from the stock config and override fields via python (robust JSON edit).
+  # --oca: also set oca_enabled=true so the real driver exposes the OCA control
+  # plane (port 65037 + _oca._tcp mDNS with Fitcan-style TXT) for controller verify.
+  python3 - "$DAEMON_CONF" "$conf" "$IFACE" "${PTP_DOMAIN:-}" "${HTTP_PORT:-}" "$OCA_ENABLED" <<'PY' || die "failed to generate config"
 import json, sys
-src, dst, iface, domain, port = sys.argv[1:6]
+src, dst, iface, domain, port, oca = sys.argv[1:7]
 with open(src) as f:
     cfg = json.load(f)
 cfg["interface_name"] = iface
@@ -141,6 +160,8 @@ if domain != "":
     cfg["ptp_domain"] = int(domain)
 if port != "":
     cfg["http_port"] = int(port)
+if oca == "1":
+    cfg["oca_enabled"] = True
 with open(dst, "w") as f:
     json.dump(cfg, f, indent=2)
 PY
@@ -242,6 +263,9 @@ start() {
   log "WebUI:      http://localhost:$port"
   log "API:        http://localhost:$port/api/config"
   log "browse SAP: http://localhost:$port/api/browse/sources/sap"
+  if [ "$OCA_ENABLED" = 1 ]; then
+    log "OCA:        enabled (port 65037 OCP.1 + _oca._tcp mDNS, binary $DAEMON_BIN)"
+  fi
   log "Logs:       $(daemon_log)  /  $(ptp_log)"
   log "Stop:       ./oca-daemonctl.sh stop"
 }
@@ -357,11 +381,18 @@ Options:
   --no-ptp        skip ptp4l entirely. SAP/mDNS browse & WebUI still work, but
                   PTP stays unlocked so audio send/recv will NOT work.
   --unload        rmmod kernel module on stop
+  --oca           enable the OCA control plane (oca_enabled=true) on the real
+                  driver: OCP.1 port 65037 + _oca._tcp mDNS (Fitcan-style TXT)
+                  for AES70/Fitcan controller verify. Uses the out-of-source
+                  OCA build (daemon/build/aes67-daemon) if present.
+  --daemon-bin <path>  use a specific daemon binary (overrides --oca auto-select).
+                  Point at the OCA build from './oca-dev.sh build --real'.
 
 Examples:
   $0 start -i ens192                        # run on ens192, ptp4l on ens192 too
   $0 start -i ens192 --ptp-iface lo         # daemon on ens192, ptp4l on lo (VM)
   $0 start -i ens192 --no-ptp               # browse only, no PTP master
+  $0 start -i ens192 --oca                  # real driver + OCA for Fitcan verify
   $0 start -i ens192 -p 8081                # custom HTTP port
   $0 stop --unload                          # stop everything and unload module
   $0 status                                 # show what's running

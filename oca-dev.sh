@@ -11,9 +11,13 @@
 # OCA/HTTP/mDNS 控制平面。
 #
 # Usage:
-#   ./oca-dev.sh build [--no-avahi] [--no-oca]   # 构建(默认 OCA+AVAHI+FAKE)
-#   ./oca-dev.sh run   [-i <iface>] [-p <port>]  # 生成临时配置并后台启动
-#   ./oca-dev.sh stop                            # 停止后台 daemon
+#   ./oca-dev.sh build [--no-avahi] [--no-oca] [--real]  # 构建(默认 OCA+AVAHI+FAKE;
+#                                              # --real=真实驱动+OCA,另构建 LKM)
+#   ./oca-dev.sh run   [-i <iface>] [-p <port>]  # 生成临时配置并后台启动(FAKE)
+#   ./oca-dev.sh run-real [-i <iface>] [--ptp-iface <iface>] [--no-ptp] ...
+#                                              # 真实驱动整体验证(模块+ptp4l+OCA),
+#                                              # 委托 oca-daemonctl.sh start --oca
+#   ./oca-dev.sh stop                            # 停止后台 daemon(本脚本 + daemonctl 实例)
 #   ./oca-dev.sh status                          # 查看运行状态 + OCA 端口
 #   ./oca-dev.sh test                            # 跑 oca-test 全量
 #   ./oca-dev.sh probe [host] [port] [--no-sub]  # 跑 OCP.1 探测客户端
@@ -22,6 +26,8 @@
 # Examples:
 #   ./oca-dev.sh build
 #   ./oca-dev.sh run -i ens160                   # 在 ens160 上跑,OCA+mDNS 发布到 LAN
+#   ./oca-dev.sh build --real                    # 构建真实驱动二进制 + LKM(需 linux-headers)
+#   ./oca-dev.sh run-real -i ens192 --ptp-iface lo  # 真实驱动+OCA 整体验证(VM 用 lo 跑 ptp4l)
 #   ./oca-dev.sh status
 #   ./oca-dev.sh test
 #   ./oca-dev.sh probe 172.16.1.198 65037        # 探测指定地址的 OCA 设备
@@ -56,11 +62,12 @@ die()  { echo "${C_RED}[dev]${C_OFF} ERROR: $*" >&2; exit 1; }
 
 # ---- build -------------------------------------------------------------------
 cmd_build() {
-  local with_avahi=ON with_oca=ON
+  local with_avahi=ON with_oca=ON fake_driver=ON
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-avahi) with_avahi=OFF; shift ;;
       --no-oca)   with_oca=OFF;   shift ;;
+      --real)     fake_driver=OFF; shift ;;
       *) die "build: unknown option: $1" ;;
     esac
   done
@@ -73,7 +80,16 @@ cmd_build() {
     git -C "$TOPDIR/3rdparty/ravenna-alsa-lkm" checkout aes67-daemon >/dev/null 2>&1 || true
   fi
 
-  log "configuring (OCA=$with_oca AVAHI=$with_avahi FAKE_DRIVER=ON) ..."
+  # --real: 真实驱动需先构建 LKM(ravenna-alsa-lkm 必须在 aes67-daemon 分支)
+  if [ "$fake_driver" = OFF ]; then
+    log "building RAVENNA/AES67 kernel module ..."
+    git -C "$TOPDIR/3rdparty/ravenna-alsa-lkm" checkout aes67-daemon >/dev/null 2>&1 || true
+    ( cd "$TOPDIR/3rdparty/ravenna-alsa-lkm/driver" && make ) || die "LKM build failed (need linux-headers-$(uname -r)?)"
+    [ -f "$TOPDIR/3rdparty/ravenna-alsa-lkm/driver/MergingRavennaALSA.ko" ] || die "LKM build produced no .ko"
+    log "kernel module built: 3rdparty/ravenna-alsa-lkm/driver/MergingRavennaALSA.ko"
+  fi
+
+  log "configuring (OCA=$with_oca AVAHI=$with_avahi FAKE_DRIVER=$fake_driver) ..."
   mkdir -p "$BUILD_DIR"
   # out-of-source 构建:源码用 ${CMAKE_SOURCE_DIR}(daemon/),产物进 build/,
   # 不与源码混杂。导出 compile_commands.json 供 clangd 使用。
@@ -84,14 +100,17 @@ cmd_build() {
       -DENABLE_TESTS=ON \
       -DWITH_OCA=$with_oca \
       -DWITH_AVAHI=$with_avahi \
-      -DFAKE_DRIVER=ON \
+      -DFAKE_DRIVER=$fake_driver \
       -DWITH_STREAMER=OFF
 
   log "building aes67-daemon + oca-test ..."
   cmake --build "$BUILD_DIR" --target aes67-daemon oca-test oca-probe
-  log "build done. binary: $BIN"
+  log "build done. binary: $BIN  (FAKE_DRIVER=$fake_driver)"
   log "probe:      $BUILD_DIR/oca-probe (OCP.1 探测客户端)"
   log "compile_commands.json: $BUILD_DIR/compile_commands.json (供 .clangd)"
+  if [ "$fake_driver" = OFF ]; then
+    log "run-real:    ./oca-dev.sh run-real -i <LAN网卡> [--ptp-iface lo]"
+  fi
 }
 
 # ---- run ---------------------------------------------------------------------
@@ -147,6 +166,32 @@ cmd_run() {
   log "  stop:      ./oca-dev.sh stop"
 }
 
+# ---- run-real (真实驱动整体验证:模块+ptp4l+OCA+真实 RTP) ---------------------
+# 委托 oca-daemonctl.sh 的模块加载/ptp4l/daemon 编排,但启用 OCA(oca_enabled=true)
+# 并使用 OCA 构建产物(daemon/build/aes67-daemon)。用于真实音频硬件下的 OCA 整体验证。
+cmd_run_real() {
+  local daemonctl="$TOPDIR/oca-daemonctl.sh"
+  [ -x "$daemonctl" ] || die "oca-daemonctl.sh not found at $daemonctl"
+
+  # 验证真实驱动 + LKM 已构建(build --real)
+  [ -x "$BIN" ] || die "binary not found, run './oca-dev.sh build --real' first"
+  grep -q "FAKE_DRIVER:BOOL=OFF" "$BUILD_DIR/CMakeCache.txt" 2>/dev/null \
+    || die "current build is FAKE_DRIVER; run './oca-dev.sh build --real' first"
+  [ -f "$TOPDIR/3rdparty/ravenna-alsa-lkm/driver/MergingRavennaALSA.ko" ] \
+    || die "kernel module not built, run './oca-dev.sh build --real' first"
+
+  # 先停本脚本的 FAKE 实例(避免与真实驱动实例抢 65037 端口)
+  if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+    log "stopping FAKE daemon instance to free port 65037 ..."
+    cmd_stop
+  fi
+
+  log "delegating to oca-daemonctl.sh (real driver + OCA) ..."
+  # --oca 启用 OCA 控制平面;--daemon-bin 指定 OCA 构建产物(含 Fitcan TXT 修复)。
+  # 透传其余选项(-i / --ptp-iface / --no-ptp 等)给 oca-daemonctl.sh。
+  exec "$daemonctl" start --oca --daemon-bin "$BIN" "$@"
+}
+
 # ---- stop --------------------------------------------------------------------
 cmd_stop() {
   # 用精确进程名匹配所有 daemon 实例(pgrep -f 会误匹配本脚本)
@@ -178,6 +223,13 @@ cmd_stop() {
   done
   [ "$any_killed" = 1 ] && log "stopped (pids: $pids)" || log "no live process found"
   rm -f "$PIDFILE" "${PIDFILE}.conf"
+
+  # 若有 oca-daemonctl.sh 启动的实例(含 ptp4l),委托其 stop 清理(不 unload 模块)
+  local daemonctl="$TOPDIR/oca-daemonctl.sh"
+  if [ -x "$daemonctl" ] && ls /tmp/aes67-daemon.*.pid /tmp/aes67-ptp4l.*.pid >/dev/null 2>&1; then
+    log "also stopping oca-daemonctl instances (daemon + ptp4l) ..."
+    "$daemonctl" stop >/dev/null 2>&1 || true
+  fi
 }
 
 # ---- status ------------------------------------------------------------------
@@ -251,13 +303,14 @@ ACTION="${1:-}"
 [ -n "$ACTION" ] || usage
 shift || true
 case "$ACTION" in
-  build)  cmd_build  "$@" ;;
-  run)    cmd_run    "$@" ;;
-  stop)   cmd_stop   "$@" ;;
-  status) cmd_status ;;
-  test)   cmd_test   ;;
-  probe)  cmd_probe  "$@" ;;
-  clean)  cmd_clean  ;;
+  build)     cmd_build     "$@" ;;
+  run)       cmd_run       "$@" ;;
+  run-real)  cmd_run_real  "$@" ;;
+  stop)      cmd_stop      "$@" ;;
+  status)    cmd_status    ;;
+  test)      cmd_test      ;;
+  probe)     cmd_probe     "$@" ;;
+  clean)     cmd_clean     ;;
   -h|--help) usage ;;
   *)      usage ;;
 esac

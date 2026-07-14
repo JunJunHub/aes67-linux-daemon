@@ -62,47 +62,34 @@ void MdnsPublisher::create_service(struct AvahiClient* c) {
   if (!avahi_entry_group_is_empty(group_))
     return;
 
-  // Spec5:TXT 记录含设备元数据(Fitcan 控制器期望)
-  // 基础:txtvers=1, protovers=1
-  // 扩展:ip_addr, ip_addr_sec, mac_addr, device_id, channels, firmware
-  std::string ip_txt, ip_sec_txt, mac_txt, dev_txt, ch_txt, fw_txt;
-  const char* p_ip = nullptr;
-  const char* p_ip_sec = nullptr;
-  const char* p_mac = nullptr;
-  const char* p_dev = nullptr;
-  const char* p_ch = nullptr;
-  const char* p_fw = nullptr;
-
-  if (!txt_.ip_addr.empty()) {
-    ip_txt = "ip_addr=" + txt_.ip_addr;
-    p_ip = ip_txt.c_str();
-  }
-  if (!txt_.ip_addr_sec.empty()) {
-    ip_sec_txt = "ip_addr_sec=" + txt_.ip_addr_sec;
-    p_ip_sec = ip_sec_txt.c_str();
-  }
-  if (!txt_.mac_addr.empty()) {
-    mac_txt = "mac_addr=" + txt_.mac_addr;
-    p_mac = mac_txt.c_str();
-  }
-  if (!txt_.device_id.empty()) {
-    dev_txt = "device_id=" + txt_.device_id;
-    p_dev = dev_txt.c_str();
-  }
+  // Spec5:TXT 记录含设备元数据(Fitcan 控制器期望)。
+  // 用 avahi_string_list 逐条追加非空字段:varargs 版 add_service 以 nullptr
+  // 结尾, 任一中段字段为空即截断后续(mac/device_id/channels/firmware
+  // 会被丢弃)。 strlst 版无此缺陷。
+  AvahiStringList* txt = nullptr;
+  txt = avahi_string_list_add_pair(txt, "txtvers", "1");
+  txt = avahi_string_list_add_pair(txt, "protovers", "1");
+  if (!txt_.ip_addr.empty())
+    txt = avahi_string_list_add_pair(txt, "ip_addr", txt_.ip_addr.c_str());
+  if (!txt_.ip_addr_sec.empty())
+    txt = avahi_string_list_add_pair(txt, "ip_addr_sec",
+                                     txt_.ip_addr_sec.c_str());
+  if (!txt_.mac_addr.empty())
+    txt = avahi_string_list_add_pair(txt, "mac_addr", txt_.mac_addr.c_str());
+  if (!txt_.device_id.empty())
+    txt = avahi_string_list_add_pair(txt, "device_id", txt_.device_id.c_str());
   if (txt_.channels > 0) {
-    ch_txt = "channels=" + std::to_string(txt_.channels);
-    p_ch = ch_txt.c_str();
+    const std::string ch = std::to_string(txt_.channels);
+    txt = avahi_string_list_add_pair(txt, "channels", ch.c_str());
   }
-  if (!txt_.firmware.empty()) {
-    fw_txt = "firmware=" + txt_.firmware;
-    p_fw = fw_txt.c_str();
-  }
+  if (!txt_.firmware.empty())
+    txt = avahi_string_list_add_pair(txt, "firmware", txt_.firmware.c_str());
 
-  int r = avahi_entry_group_add_service(
+  int r = avahi_entry_group_add_service_strlst(
       group_, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,
       static_cast<AvahiPublishFlags>(0), name_.c_str(), "_oca._tcp", nullptr,
-      nullptr, port_, "txtvers=1", "protovers=1", p_ip, p_ip_sec, p_mac, p_dev,
-      p_ch, p_fw, nullptr);
+      nullptr, port_, txt);
+  avahi_string_list_free(txt);
   if (r < 0) {
     if (r == AVAHI_ERR_COLLISION) {
       // 名称冲突:换一个名(AVAHI_CLIENT_S_COLLISION 重连时处理)

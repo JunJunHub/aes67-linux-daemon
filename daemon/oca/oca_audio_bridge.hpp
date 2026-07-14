@@ -1,8 +1,8 @@
 //  oca_audio_bridge.hpp - OCA 层与 daemon 音频运行时的桥接接口
 //
 //  OCA 编译单元零依赖 SessionManager 头文件/类型。
-//  接口从 OCA 需求倒推，不暴露 StreamSource/StreamSink 等内部类型。
-//  唯一实现在 oca_session_manager_bridge.cpp。
+//  接口从 OCA 需求倒推，不暴露 AES67 daemon StreamSource/StreamSink 等非 OCA
+//  协议层内部类型。 唯一实现在 oca_session_manager_bridge.cpp。
 
 #ifndef OCA_OCA_AUDIO_BRIDGE_HPP_
 #define OCA_OCA_AUDIO_BRIDGE_HPP_
@@ -89,6 +89,8 @@ class OcaAudioBridge {
   virtual std::string get_interface_name() const = 0;
   virtual std::string get_ip_addr() const = 0;
   virtual std::string get_mac_addr() const = 0;
+  virtual std::string get_device_id()
+      const = 0;  // node_id(OcaNetwork.IDAdvertised)
 
   // ── I/O 端口(从 driver 查询) ──
   virtual uint32_t get_input_channels() const = 0;

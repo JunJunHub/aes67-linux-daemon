@@ -17,12 +17,22 @@ class DriverManager;
 
 namespace oca {
 
-class OcaSessionManagerBridge : public OcaAudioBridge {
+// SessionManager observer 永不注销(SessionManager 无 remove API)。
+// 析构后若 SessionManager 仍触发 observer,lambda 持有的 weak_ptr 自我判定
+// 失效后直接 no-op,避免对已析构 bridge 解引用。故 bridge 必须由 shared_ptr
+// 持有且在 start() 注册 observer。
+class OcaSessionManagerBridge
+    : public OcaAudioBridge,
+      public std::enable_shared_from_this<OcaSessionManagerBridge> {
  public:
   OcaSessionManagerBridge(std::shared_ptr<SessionManager> sm,
                           std::shared_ptr<Config> cfg,
                           std::shared_ptr<DriverManager> drv);
   ~OcaSessionManagerBridge() override;
+
+  // 构造后由 shared_ptr 持有者调用:注册 SessionManager observer。
+  // 用 weak_from_this() 捕获自我弱引用,析构后 observer 自动失效。
+  void start();
 
   // 禁止拷贝/移动(持有 observer 回调)
   OcaSessionManagerBridge(const OcaSessionManagerBridge&) = delete;
@@ -46,6 +56,7 @@ class OcaSessionManagerBridge : public OcaAudioBridge {
   std::string get_interface_name() const override;
   std::string get_ip_addr() const override;
   std::string get_mac_addr() const override;
+  std::string get_device_id() const override;
   uint32_t get_input_channels() const override;
   uint32_t get_output_channels() const override;
   void set_ptp_observer(PtpObserver cb) override;

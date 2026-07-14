@@ -208,9 +208,15 @@ int main(int argc, char* argv[]) {
       /* start OCA server */
 #ifdef _USE_OCA_
       std::unique_ptr<oca::OcaServer> oca_server;
+      std::shared_ptr<oca::OcaSessionManagerBridge> oca_bridge;
       if (config->get_oca_enabled()) {
-        auto oca_bridge = std::make_shared<oca::OcaSessionManagerBridge>(
+        // oca_bridge 必须与 oca_server 同作用域(且比其长寿):OcaServer 及其
+        // transport 线程持有裸 bridge_ 指针。若 bridge 先析构,UAF。
+        // shared_ptr 持有 + SessionManager observer 以 weak_from_this 注册,
+        // bridge 析构后 observer 自动失效。
+        oca_bridge = std::make_shared<oca::OcaSessionManagerBridge>(
             session_manager, config, driver);
+        oca_bridge->start();
         oca::OcaServerConfig ocacfg;
         ocacfg.port = config->get_oca_port();
         ocacfg.device_name = config->get_oca_device_name();
@@ -233,8 +239,7 @@ int main(int argc, char* argv[]) {
         BOOST_LOG_TRIVIAL(info)
             << "main:: OCA server listening on port " << oca_server->port();
       }
-#else
-      (void)0;
+#else(void) 0;
 #endif
 
       /* load session status from file */

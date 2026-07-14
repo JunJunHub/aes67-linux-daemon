@@ -40,7 +40,7 @@ class OcaMediaTransportNetworkAES67 : public OcaMediaTransportNetwork {
                                        ocp1::Writer& rsp) override;
   ExecResult add_sink_connector_impl(ocp1::Reader& req,
                                      ocp1::Writer& rsp) override;
-  ExecResult delete_connector_impl(uint32_t connector_id,
+  ExecResult delete_connector_impl(uint16_t connector_id,
                                    ocp1::Writer& rsp) override;
 
  private:

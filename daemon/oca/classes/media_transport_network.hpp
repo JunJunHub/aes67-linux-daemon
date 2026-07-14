@@ -16,9 +16,12 @@
 namespace oca {
 
 // OcaMediaTransportNetwork {1,4,2} v1
-// connector 内部存储:Source/Sink 各按 connectorID 索引
+// connector 内部存储:Source/Sink 各按 connectorID 索引。
+// 两套 ID 命名空间分离:connector_id(OCA 线缆侧,u16)与 daemon_id
+// (daemon 流 id,0..63,经 bridge CRUD)。避免删除/查状态时映射错位。
 struct SourceConnector {
-  uint32_t connector_id;  // OcaMediaConnectorID = OcaUint32
+  uint16_t connector_id;  // OcaMediaConnectorID = u16(OCAMicro)
+  uint8_t daemon_id = 0;  // daemon Source id(0..63),传 bridge
   std::string name;
   std::string codec;         // "L16","L24","AM824"
   std::vector<uint8_t> map;  // pin → port
@@ -33,7 +36,8 @@ struct SourceConnector {
 };
 
 struct SinkConnector {
-  uint32_t connector_id;
+  uint16_t connector_id;  // OcaMediaConnectorID = u16(OCAMicro)
+  uint8_t daemon_id = 0;  // daemon Sink id(0..63),传 bridge
   std::string name;
   std::string codec;
   std::vector<uint8_t> map;
@@ -76,7 +80,7 @@ class OcaMediaTransportNetwork : public OcaApplicationNetwork {
                                                ocp1::Writer& rsp) = 0;
   virtual ExecResult add_sink_connector_impl(ocp1::Reader& req,
                                              ocp1::Writer& rsp) = 0;
-  virtual ExecResult delete_connector_impl(uint32_t connector_id,
+  virtual ExecResult delete_connector_impl(uint16_t connector_id,
                                            ocp1::Writer& rsp) = 0;
 
   // DefLevel 3 方法分派
@@ -87,13 +91,13 @@ class OcaMediaTransportNetwork : public OcaApplicationNetwork {
   // connector 序列化(供子类和本类使用)
   void write_source_connector(const SourceConnector& sc, ocp1::Writer& rsp);
   void write_sink_connector(const SinkConnector& sc, ocp1::Writer& rsp);
-  void write_connector_status(uint32_t connector_id,
-                              uint8_t status,
+  void write_connector_status(uint16_t connector_id,
+                              uint8_t state,
                               ocp1::Writer& rsp);
 
-  // connector 列表(子类 CRUD 时操作)
-  std::map<uint32_t, SourceConnector> sources_;
-  std::map<uint32_t, SinkConnector> sinks_;
+  // connector 列表(子类 CRUD 时操作),按 OcaMediaConnectorID(u16)索引
+  std::map<uint16_t, SourceConnector> sources_;
+  std::map<uint16_t, SinkConnector> sinks_;
   OcaAudioBridge* bridge_ = nullptr;
 };
 

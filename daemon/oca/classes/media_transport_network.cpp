@@ -34,21 +34,22 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
       return {Status::OK, 1};
 
     case methods::kMtnGetPorts: {
-      // Ocp1List<OcaPort> = u16 count + [u16 id, u8 mode, string name]*
-      // 从 bridge 获取 I/O 端口数
+      // Ocp1List<OcaPort> = u16 count + [OcaPort: u16 id + u8 mode + u16
+      // index]* 从 bridge 获取 I/O 端口数。OcaPortMode: INPUT=1,
+      // OUTPUT=2(OCAMicro)。
       uint32_t inputs = bridge_ ? bridge_->get_input_channels() : 0;
       uint32_t outputs = bridge_ ? bridge_->get_output_channels() : 0;
       uint16_t total = static_cast<uint16_t>(inputs + outputs);
       rsp.u16(total);
       for (uint16_t i = 0; i < static_cast<uint16_t>(inputs); ++i) {
-        rsp.u16(i);  // id
-        rsp.u8(0);   // mode = INPUT
-        rsp.string("In " + std::to_string(i));
+        rsp.u16(i);      // id
+        rsp.u8(1);       // mode = INPUT
+        rsp.u16(i + 1);  // index(从 1 起)
       }
       for (uint16_t i = 0; i < static_cast<uint16_t>(outputs); ++i) {
         rsp.u16(static_cast<uint16_t>(inputs) + i);  // id
-        rsp.u8(1);                                   // mode = OUTPUT
-        rsp.string("Out " + std::to_string(i));
+        rsp.u8(2);                                   // mode = OUTPUT
+        rsp.u16(i + 1);                              // index(从 1 起)
       }
       return {Status::OK, 1};
     }
@@ -84,9 +85,10 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
     }
 
     case methods::kMtnGetSourceConnector: {
-      if (req.remaining() < 4)
+      // OcaMediaConnectorID = u16(OCAMicro OcaLiteMediaConnectorID)
+      if (req.remaining() < 2)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       auto it = sources_.find(cid);
       if (it == sources_.end())
         return {Status::ParameterError, 0};
@@ -103,9 +105,10 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
     }
 
     case methods::kMtnGetSinkConnector: {
-      if (req.remaining() < 4)
+      // OcaMediaConnectorID = u16
+      if (req.remaining() < 2)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       auto it = sinks_.find(cid);
       if (it == sinks_.end())
         return {Status::ParameterError, 0};
@@ -114,45 +117,45 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
     }
 
     case methods::kMtnGetConnectorsStatuses: {
-      // Ocp1List<OcaMediaConnectorStatus>
+      // Ocp1List<OcaMediaConnectorStatus>: {u16 id, u8 state, u16 errorCode}*
+      // state = OcaMediaConnectorState: STOPPED=0,SETTING_UP=1,RUNNING=2,
+      // PAUSED=3,FAULT=4(OCAMicro)。errorCode=0(无故障)。
       uint16_t total = static_cast<uint16_t>(sources_.size() + sinks_.size());
       rsp.u16(total);
       for (const auto& [id, sc] : sources_) {
-        uint8_t status = sc.enabled ? 2 /*CONNECTED*/ : 1 /*IDLE*/;
-        write_connector_status(id, status, rsp);
+        uint8_t state = sc.enabled ? 2 /*RUNNING*/ : 0 /*STOPPED*/;
+        write_connector_status(id, state, rsp);
       }
       for (const auto& [id, sc] : sinks_) {
-        uint8_t status = 1; /*IDLE*/
+        uint8_t state = 0; /*STOPPED*/
         if (bridge_) {
-          auto ss = bridge_->get_sink_status(static_cast<uint8_t>(id & 0xFF));
-          if (ss.receiving)
-            status = 2; /*CONNECTED*/
-          else if (ss.muted)
-            status = 3; /*PAUSED*/
+          auto ss = bridge_->get_sink_status(sc.daemon_id);
+          state = ss.receiving ? 2 /*RUNNING*/ : (ss.muted ? 3 /*PAUSED*/ : 0);
         }
-        write_connector_status(id, status, rsp);
+        write_connector_status(id, state, rsp);
       }
       return {Status::OK, 1};
     }
 
     case methods::kMtnGetConnectorStatus: {
-      if (req.remaining() < 4)
+      // OcaMediaConnectorID = u16
+      if (req.remaining() < 2)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       auto sit = sources_.find(cid);
       if (sit != sources_.end()) {
-        uint8_t status = sit->second.enabled ? 2 : 1;
-        write_connector_status(cid, status, rsp);
+        uint8_t state = sit->second.enabled ? 2 /*RUNNING*/ : 0 /*STOPPED*/;
+        write_connector_status(cid, state, rsp);
         return {Status::OK, 1};
       }
       auto kit = sinks_.find(cid);
       if (kit != sinks_.end()) {
-        uint8_t status = 1;
+        uint8_t state = 0;
         if (bridge_) {
-          auto ss = bridge_->get_sink_status(static_cast<uint8_t>(cid & 0xFF));
-          status = ss.receiving ? 2 : (ss.muted ? 3 : 1);
+          auto ss = bridge_->get_sink_status(kit->second.daemon_id);
+          state = ss.receiving ? 2 : (ss.muted ? 3 : 0);
         }
-        write_connector_status(cid, status, rsp);
+        write_connector_status(cid, state, rsp);
         return {Status::OK, 1};
       }
       return {Status::ParameterError, 0};
@@ -168,19 +171,23 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
       return {Status::NotImplemented, 0};
 
     case methods::kMtnSetSourceConnectorPinMap: {
-      // connectorID(u32) + OcaMap<u16,u16>
+      // connectorID(u16) + OcaMap<u16,OcaPortID>: u16 count + [u16 key, u8
+      // mode, u16 index]*  (OcaPortID = {OcaPortMode u8, OcaUint16 index})
       if (req.remaining() < 4)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       auto it = sources_.find(cid);
       if (it == sources_.end())
         return {Status::ParameterError, 0};
       uint16_t count = req.u16();
       std::vector<uint8_t> new_map;
       for (uint16_t i = 0; i < count; ++i) {
+        if (req.remaining() < 5)
+          return {Status::BadFormat, 0};
         (void)req.u16();  // key = pin index
+        (void)req.u8();   // mode (INPUT=1/OUTPUT=2)
         new_map.push_back(
-            static_cast<uint8_t>(req.u16() & 0xFF));  // value = port
+            static_cast<uint8_t>(req.u16() & 0xFF));  // port index
       }
       it->second.map = new_map;
       return {Status::OK, 0};
@@ -189,14 +196,17 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
     case methods::kMtnSetSinkConnectorPinMap: {
       if (req.remaining() < 4)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       auto it = sinks_.find(cid);
       if (it == sinks_.end())
         return {Status::ParameterError, 0};
       uint16_t count = req.u16();
       std::vector<uint8_t> new_map;
       for (uint16_t i = 0; i < count; ++i) {
+        if (req.remaining() < 5)
+          return {Status::BadFormat, 0};
         (void)req.u16();
+        (void)req.u8();
         new_map.push_back(static_cast<uint8_t>(req.u16() & 0xFF));
       }
       it->second.map = new_map;
@@ -210,9 +220,10 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
       return {Status::NotImplemented, 0};
 
     case methods::kMtnDeleteConnector: {
-      if (req.remaining() < 4)
+      // OcaMediaConnectorID = u16
+      if (req.remaining() < 2)
         return {Status::BadFormat, 0};
-      uint32_t cid = req.u32();
+      uint16_t cid = req.u16();
       return delete_connector_impl(cid, rsp);
     }
 
@@ -229,38 +240,38 @@ ExecResult OcaMediaTransportNetwork::handle_mtn(uint16_t idx,
 
 void OcaMediaTransportNetwork::write_source_connector(const SourceConnector& sc,
                                                       ocp1::Writer& rsp) {
-  // OcaMediaSourceConnector OCAMicro 格式:
-  // u16 connectorIDInternal
-  // string idExternal
-  // OcaMediaConnection: u8 secure + blob streamParams + u8 streamCastMode
-  // OcaMediaCoding: u16 codingSchemeID + string codecParams + u32 clockONo
-  // u16 pinCount
-  // OcaLiteMap<u16,PortID>: u16 count + [u16 key, u32 ownerONo, u16 portID]*
+  // OcaMediaSourceConnector OCAMicro 格式(逐字段对齐
+  // OcaLiteMediaSourceConnector): u16    IDInternal (OcaLiteMediaConnectorID =
+  // u16) string IDExternal OcaMediaConnection: u8 secure + blob streamParams +
+  // u8 streamCastMode OcaMediaCoding: u16 codingSchemeID + string codecParams +
+  // u32 clockONo u16    pinCount OcaLiteMap<u16,PortID>: u16 count + [u16 key,
+  // u8 mode, u16 index]*
+  //   (OcaLitePortID = {OcaPortMode u8, OcaUint16 index}; mode
+  //   INPUT=1/OUTPUT=2)
   // float32 alignmentLevel
   rsp.u16(static_cast<uint16_t>(sc.connector_id & 0xFFFF));
   rsp.string(sc.name);
   // OcaMediaConnection
-  rsp.u8(0);  // secure = false
-  // blob: AES67 stream parameters (简化:空 blob)
-  rsp.blob(nullptr, 0);
+  rsp.u8(0);             // secure = false
+  rsp.blob(nullptr, 0);  // streamParameters(简化:空 blob)
   rsp.u8(sc.dest_addr.empty() ? 1 /*UNICAST*/ : 2 /*MULTICAST*/);
   // OcaMediaCoding
   rsp.u16(1);  // codingSchemeID = PCM
   rsp.string(sc.codec);
-  rsp.u32(0);  // clockONo = 0 (无关联时钟)
+  rsp.u32(0);  // clockONo = 0(无关联时钟)
   // pinCount + pinMap
   rsp.u16(static_cast<uint16_t>(sc.map.size()));
   for (uint16_t i = 0; i < static_cast<uint16_t>(sc.map.size()); ++i) {
     rsp.u16(i);          // key = pin index
-    rsp.u32(ono());      // ownerONo = this network
-    rsp.u16(sc.map[i]);  // portID
+    rsp.u8(2);           // mode = OUTPUT(source 出口)
+    rsp.u16(sc.map[i]);  // port index
   }
   rsp.f32(0.0f);  // alignmentLevel
 }
 
 void OcaMediaTransportNetwork::write_sink_connector(const SinkConnector& sc,
                                                     ocp1::Writer& rsp) {
-  // OcaMediaSinkConnector OCAMicro 格式(比 Source 多 alignmentGain)
+  // OcaMediaSinkConnector(比 Source 多 alignmentGain float32)
   rsp.u16(static_cast<uint16_t>(sc.connector_id & 0xFFFF));
   rsp.string(sc.name);
   // OcaMediaConnection
@@ -275,19 +286,21 @@ void OcaMediaTransportNetwork::write_sink_connector(const SinkConnector& sc,
   rsp.u16(static_cast<uint16_t>(sc.map.size()));
   for (uint16_t i = 0; i < static_cast<uint16_t>(sc.map.size()); ++i) {
     rsp.u16(i);
-    rsp.u32(ono());
+    rsp.u8(1);  // mode = INPUT(sink 入口)
     rsp.u16(sc.map[i]);
   }
   rsp.f32(0.0f);  // alignmentLevel
-  rsp.f32(0.0f);  // alignmentGain (Sink 独有)
+  rsp.f32(0.0f);  // alignmentGain(Sink 独有)
 }
 
-void OcaMediaTransportNetwork::write_connector_status(uint32_t connector_id,
-                                                      uint8_t status,
+void OcaMediaTransportNetwork::write_connector_status(uint16_t connector_id,
+                                                      uint8_t state,
                                                       ocp1::Writer& rsp) {
-  // OcaMediaConnectorStatus: u32 connectorID + u8 status
-  rsp.u32(connector_id);
-  rsp.u8(status);
+  // OcaMediaConnectorStatus: u16 connectorID + u8 state + u16 errorCode
+  // (OcaLiteMediaConnectorStatus = {u16 id, u8 state, u16 errorCode})
+  rsp.u16(connector_id);
+  rsp.u8(state);
+  rsp.u16(0);  // errorCode = 0(无故障)
 }
 
 }  // namespace oca

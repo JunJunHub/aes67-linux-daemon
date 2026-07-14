@@ -26,10 +26,10 @@ ExecResult OcaNetwork::exec(MethodID m,
         rsp.u8(1);
         return {Status::OK, 1};
       case methods::kNet2GetIDAdvertised: {
-        // OcaNetworkNodeID = OcaBlob
-        // Spec5:bridge 非空时返回 node_id blob
+        // OcaNetworkNodeID = OcaBlob。返回 node_id(设备唯一标识),
+        // 非 ip_addr(IP 由 GetSystemInterfaces 提供)。
         if (bridge_) {
-          std::string node_id = bridge_->get_ip_addr();
+          std::string node_id = bridge_->get_device_id();
           rsp.blob(reinterpret_cast<const uint8_t*>(node_id.data()),
                    node_id.size());
         } else {

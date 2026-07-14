@@ -17,47 +17,64 @@ OcaSessionManagerBridge::OcaSessionManagerBridge(
     std::shared_ptr<Config> cfg,
     std::shared_ptr<DriverManager> drv)
     : sm_(std::move(sm)), cfg_(std::move(cfg)), drv_(std::move(drv)) {
+  // Observer 注册延后到 start():构造期 shared_from_this 不可用。
+}
+
+void OcaSessionManagerBridge::start() {
+  if (!sm_)
+    return;
+  // 持有 weak_ptr:bridge 析构后 observer 仍可能被 SessionManager 触发,
+  // lock() 失败即 no-op,避免解引用已析构对象(SessionManager 无注销 API)。
+  std::weak_ptr<OcaSessionManagerBridge> weak_self = weak_from_this();
   // 注册 SessionManager PTP 状态 observer
-  if (sm_) {
-    sm_->add_ptp_status_observer([this](const std::string& status) -> bool {
-      if (ptp_cb_) {
-        PtpStatus ps = get_ptp_status();
-        ptp_cb_(ps);
-      }
-      return true;
-    });
-    // 注册 source add/remove observer
-    sm_->add_source_observer(::SessionManager::SourceObserverType::add_source,
-                             [this](uint8_t id, const std::string& /*name*/,
-                                    const std::string& /*sdp*/) -> bool {
-                               if (source_cb_)
-                                 source_cb_(id, true);
-                               return true;
-                             });
-    sm_->add_source_observer(
-        ::SessionManager::SourceObserverType::remove_source,
-        [this](uint8_t id, const std::string& /*name*/,
-               const std::string& /*sdp*/) -> bool {
-          if (source_cb_)
-            source_cb_(id, false);
-          return true;
-        });
-    // 注册 sink add/remove observer
-    sm_->add_sink_observer(
-        ::SessionManager::SinkObserverType::add_sink,
-        [this](uint8_t id, const std::string& /*name*/) -> bool {
-          if (sink_cb_)
-            sink_cb_(id, true);
-          return true;
-        });
-    sm_->add_sink_observer(
-        ::SessionManager::SinkObserverType::remove_sink,
-        [this](uint8_t id, const std::string& /*name*/) -> bool {
-          if (sink_cb_)
-            sink_cb_(id, false);
-          return true;
-        });
-  }
+  sm_->add_ptp_status_observer(
+      [weak_self](const std::string& /*status*/) -> bool {
+        if (auto self = weak_self.lock()) {
+          if (self->ptp_cb_) {
+            OcaAudioBridge::PtpStatus ps = self->get_ptp_status();
+            self->ptp_cb_(ps);
+          }
+        }
+        return true;
+      });
+  // 注册 source add/remove observer
+  sm_->add_source_observer(::SessionManager::SourceObserverType::add_source,
+                           [weak_self](uint8_t id, const std::string& /*name*/,
+                                       const std::string& /*sdp*/) -> bool {
+                             if (auto self = weak_self.lock()) {
+                               if (self->source_cb_)
+                                 self->source_cb_(id, true);
+                             }
+                             return true;
+                           });
+  sm_->add_source_observer(::SessionManager::SourceObserverType::remove_source,
+                           [weak_self](uint8_t id, const std::string& /*name*/,
+                                       const std::string& /*sdp*/) -> bool {
+                             if (auto self = weak_self.lock()) {
+                               if (self->source_cb_)
+                                 self->source_cb_(id, false);
+                             }
+                             return true;
+                           });
+  // 注册 sink add/remove observer
+  sm_->add_sink_observer(
+      ::SessionManager::SinkObserverType::add_sink,
+      [weak_self](uint8_t id, const std::string& /*name*/) -> bool {
+        if (auto self = weak_self.lock()) {
+          if (self->sink_cb_)
+            self->sink_cb_(id, true);
+        }
+        return true;
+      });
+  sm_->add_sink_observer(
+      ::SessionManager::SinkObserverType::remove_sink,
+      [weak_self](uint8_t id, const std::string& /*name*/) -> bool {
+        if (auto self = weak_self.lock()) {
+          if (self->sink_cb_)
+            self->sink_cb_(id, false);
+        }
+        return true;
+      });
 }
 
 OcaSessionManagerBridge::~OcaSessionManagerBridge() = default;
@@ -103,7 +120,14 @@ uint32_t OcaSessionManagerBridge::get_sample_rate() const {
 bool OcaSessionManagerBridge::set_sample_rate(uint32_t hz) {
   if (!drv_)
     return false;
-  return !drv_->set_sample_rate(hz);
+  if (drv_->set_sample_rate(hz))
+    return false;
+  // 同步落盘到 Config,使后续 get_sample_rate() 读回新值且退出时持久化。
+  // 否则 SetCurrentRate 后 GetCurrentRate 读回旧值,且 emit 的 PropertyChanged
+  // 与可读值自相矛盾。
+  if (cfg_)
+    cfg_->set_sample_rate(hz);
+  return true;
 }
 
 std::vector<uint32_t> OcaSessionManagerBridge::get_supported_sample_rates()
@@ -222,6 +246,12 @@ std::string OcaSessionManagerBridge::get_ip_addr() const {
 std::string OcaSessionManagerBridge::get_mac_addr() const {
   if (cfg_)
     return cfg_->get_mac_addr_str();
+  return {};
+}
+
+std::string OcaSessionManagerBridge::get_device_id() const {
+  if (cfg_)
+    return cfg_->get_node_id();
   return {};
 }
 

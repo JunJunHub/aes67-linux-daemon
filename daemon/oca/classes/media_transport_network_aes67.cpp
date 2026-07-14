@@ -51,7 +51,7 @@ ExecResult OcaMediaTransportNetworkAES67::add_source_connector_impl(
   // OcaMediaConnection: u8 secure + blob streamParams + u8 streamCastMode
   // OcaMediaCoding: u16 codingSchemeID + string codecParams + u32 clockONo
   // u16 pinCount
-  // OcaLiteMap<u16,PortID>: u16 count + [u16 key, u32 ownerONo, u16 portID]*
+  // OcaLiteMap<u16,PortID>: u16 count + [u16 key, u8 mode, u16 index]*
   // float32 alignmentLevel
   if (req.remaining() < 2)
     return {Status::BadFormat, 0};
@@ -61,54 +61,59 @@ ExecResult OcaMediaTransportNetworkAES67::add_source_connector_impl(
   // OcaMediaConnection
   if (req.remaining() < 1)
     return {Status::BadFormat, 0};
-  (void)req.u8();               // secure
-  auto conn_blob = req.blob();  // streamParameters
+  (void)req.u8();    // secure
+  (void)req.blob();  // streamParameters(简化:忽略内容)
   if (req.remaining() < 1)
     return {Status::BadFormat, 0};
-  uint8_t cast_mode = req.u8();  // streamCastMode
+  (void)req.u8();  // streamCastMode
 
   // OcaMediaCoding
   if (req.remaining() < 2)
     return {Status::BadFormat, 0};
-  uint16_t coding_scheme = req.u16();
+  (void)req.u16();  // codingSchemeID
   std::string codec = req.string();
   if (req.remaining() < 4)
     return {Status::BadFormat, 0};
-  uint32_t clock_ono = req.u32();
+  (void)req.u32();  // clockONo
 
   // pinCount + pinMap
+  // OcaLiteMap<u16,PortID>: u16 count + [u16 key, u8 mode, u16 index]*
+  // (OcaLitePortID = {OcaPortMode u8, OcaUint16 index})
   if (req.remaining() < 2)
     return {Status::BadFormat, 0};
   uint16_t pin_count = req.u16();
   std::vector<uint8_t> chan_map;
   for (uint16_t i = 0; i < pin_count; ++i) {
-    if (req.remaining() < 8)
+    if (req.remaining() < 5)
       return {Status::BadFormat, 0};
     (void)req.u16();  // key = pin index
-    (void)req.u32();  // ownerONo
-    chan_map.push_back(static_cast<uint8_t>(req.u16() & 0xFF));  // portID
+    (void)req.u8();   // mode (INPUT=1/OUTPUT=2)
+    chan_map.push_back(static_cast<uint8_t>(req.u16() & 0xFF));  // port index
   }
   // alignmentLevel
   if (req.remaining() >= 4)
     (void)req.f32();
 
-  // 分配 source ID
+  // 分配 source ID(daemon 流 id,0..63)
   uint8_t src_id = next_source_id_++;
   if (src_id > 63)
     return {Status::ParameterOutOfRange, 0};
 
   // 构造 SourceConnector
+  // connector_id:控制器提供的 int_id 非空则用之,否则分配 OCA 侧唯一 id。
+  // daemon_id:传 bridge 的真实 Source id(与 connector_id 分离)。
   SourceConnector sc;
-  sc.connector_id = int_id ? int_id : (0x0001 + src_id);
+  sc.connector_id = int_id ? int_id : static_cast<uint16_t>(0x0001 + src_id);
+  sc.daemon_id = src_id;
   sc.name = name.empty() ? ("Source " + std::to_string(src_id)) : name;
   sc.codec = codec.empty() ? "L24" : codec;
   sc.map = chan_map.empty() ? std::vector<uint8_t>{0} : chan_map;
   sc.enabled = (state == 2 /*RUNNING*/);
 
-  // 通过 bridge 添加 source
+  // 通过 bridge 添加 source(用 daemon_id)
   if (bridge_) {
     OcaAudioBridge::SourceInfo si;
-    si.id = src_id;
+    si.id = sc.daemon_id;
     si.enabled = sc.enabled;
     si.name = sc.name;
     si.codec = sc.codec;
@@ -148,31 +153,32 @@ ExecResult OcaMediaTransportNetworkAES67::add_sink_connector_impl(
   // OcaMediaConnection
   if (req.remaining() < 1)
     return {Status::BadFormat, 0};
-  (void)req.u8();  // secure
-  auto conn_blob = req.blob();
+  (void)req.u8();    // secure
+  (void)req.blob();  // streamParameters
   if (req.remaining() < 1)
     return {Status::BadFormat, 0};
-  uint8_t cast_mode = req.u8();
+  (void)req.u8();  // streamCastMode
 
   // OcaMediaCoding
   if (req.remaining() < 2)
     return {Status::BadFormat, 0};
-  uint16_t coding_scheme = req.u16();
+  (void)req.u16();  // codingSchemeID
   std::string codec = req.string();
   if (req.remaining() < 4)
     return {Status::BadFormat, 0};
-  uint32_t clock_ono = req.u32();
+  (void)req.u32();  // clockONo
 
   // pinCount + pinMap
+  // OcaLiteMap<u16,PortID>: u16 count + [u16 key, u8 mode, u16 index]*
   if (req.remaining() < 2)
     return {Status::BadFormat, 0};
   uint16_t pin_count = req.u16();
   std::vector<uint8_t> chan_map;
   for (uint16_t i = 0; i < pin_count; ++i) {
-    if (req.remaining() < 8)
+    if (req.remaining() < 5)
       return {Status::BadFormat, 0};
-    (void)req.u16();
-    (void)req.u32();
+    (void)req.u16();  // key
+    (void)req.u8();   // mode
     chan_map.push_back(static_cast<uint8_t>(req.u16() & 0xFF));
   }
   // alignmentLevel + alignmentGain(Sink 独有)
@@ -186,7 +192,8 @@ ExecResult OcaMediaTransportNetworkAES67::add_sink_connector_impl(
     return {Status::ParameterOutOfRange, 0};
 
   SinkConnector sc;
-  sc.connector_id = int_id ? int_id : (0x0101 + snk_id);
+  sc.connector_id = int_id ? int_id : static_cast<uint16_t>(0x0101 + snk_id);
+  sc.daemon_id = snk_id;
   sc.name = name.empty() ? ("Sink " + std::to_string(snk_id)) : name;
   sc.codec = codec.empty() ? "L24" : codec;
   sc.map = chan_map.empty() ? std::vector<uint8_t>{0} : chan_map;
@@ -194,7 +201,7 @@ ExecResult OcaMediaTransportNetworkAES67::add_sink_connector_impl(
 
   if (bridge_) {
     OcaAudioBridge::SinkInfo si;
-    si.id = snk_id;
+    si.id = sc.daemon_id;
     si.name = sc.name;
     si.delay = 576;
     si.source_url = "";
@@ -213,19 +220,21 @@ ExecResult OcaMediaTransportNetworkAES67::add_sink_connector_impl(
 }
 
 ExecResult OcaMediaTransportNetworkAES67::delete_connector_impl(
-    uint32_t connector_id,
+    uint16_t connector_id,
     ocp1::Writer& rsp) {
+  // 用 connector_id 查内部表,再用存储的 daemon_id 调 bridge remove。
+  // 严禁用 connector_id 直接当 daemon id(命名空间不同 -> off-by-one / 误删)。
   auto sit = sources_.find(connector_id);
   if (sit != sources_.end()) {
     if (bridge_)
-      bridge_->remove_source(static_cast<uint8_t>(connector_id & 0xFF));
+      bridge_->remove_source(sit->second.daemon_id);
     sources_.erase(sit);
     return {Status::OK, 0};
   }
   auto kit = sinks_.find(connector_id);
   if (kit != sinks_.end()) {
     if (bridge_)
-      bridge_->remove_sink(static_cast<uint8_t>(connector_id & 0xFF));
+      bridge_->remove_sink(kit->second.daemon_id);
     sinks_.erase(kit);
     return {Status::OK, 0};
   }
@@ -255,14 +264,14 @@ ExecResult OcaMediaTransportNetworkAES67::handle_mtn_aes67(uint16_t idx,
       if (type == 2 || type == 3) {
         for (auto& [id, sc] : sources_) {
           if (bridge_)
-            bridge_->remove_source(static_cast<uint8_t>(id & 0xFF));
+            bridge_->remove_source(sc.daemon_id);
         }
         sources_.clear();
       }
       if (type == 1 || type == 3) {
         for (auto& [id, sc] : sinks_) {
           if (bridge_)
-            bridge_->remove_sink(static_cast<uint8_t>(id & 0xFF));
+            bridge_->remove_sink(sc.daemon_id);
         }
         sinks_.clear();
       }

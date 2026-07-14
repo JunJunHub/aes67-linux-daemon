@@ -28,6 +28,7 @@
 #   ./oca-dev.sh run -i ens160                   # 在 ens160 上跑,OCA+mDNS 发布到 LAN
 #   ./oca-dev.sh build --real                    # 构建真实驱动二进制 + LKM(需 linux-headers)
 #   ./oca-dev.sh run-real -i ens192 --ptp-iface lo  # 真实驱动+OCA 整体验证(VM 用 lo 跑 ptp4l)
+  ./oca-dev.sh run-real -i ens160,ens192         # ST-2022-7 双网卡冗余(主备)
 #   ./oca-dev.sh status
 #   ./oca-dev.sh test
 #   ./oca-dev.sh probe 172.16.1.198 65037        # 探测指定地址的 OCA 设备
@@ -126,8 +127,12 @@ cmd_run() {
 
   [ -x "$BIN" ] || die "binary not found, run './oca-dev.sh build' first"
 
-  # 生成临时配置:interface_name + oca_enabled=true,不改原 daemon.conf
-  local conf="/tmp/aes67-dev.${iface}.conf"
+  # -i 支持 ST-2022-7 主备双网卡:"ens160,ens192"(逗号分隔,daemon interface_name
+  # 原生支持)。主接口=逗号前第一个,用于临时配置文件名。
+  local primary="${iface%%,*}"
+
+  # 生成临时配置:interface_name(完整双网卡值) + oca_enabled=true,不改原 daemon.conf
+  local conf="/tmp/aes67-dev.${primary}.conf"
   sed -e "s/\"interface_name\": \"[^\"]*\"/\"interface_name\": \"$iface\"/" \
       -e 's/"oca_enabled": false/"oca_enabled": true/' \
       "$DAEMON_CONF" > "$conf"

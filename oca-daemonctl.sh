@@ -11,11 +11,15 @@
 #   ./oca-daemonctl.sh status
 #
 # Options:
-#   -i <iface>            network interface for the daemon (default: lo)
-#                         e.g. ens192 — needed to discover SAP/mDNS sources on the LAN
-#   --ptp-iface <iface>   interface for ptp4l (default: same as -i). In VMs the
-#                         virtual NIC often has no PTP clock ("failed to create a
-#                         clock"); use --ptp-iface lo to run the master on loopback.
+#   -i <iface>            network interface for the daemon (default: lo).
+#                         Single NIC (e.g. ens192) for SAP/mDNS on LAN. Two interfaces
+#                         comma-separated (e.g. ens160,ens192) enable ST-2022-7
+#                         redundancy: PTP/RTP on primary+secondary, SAP/mDNS on all.
+#                         Primary = first (for pidfile/log/ptp4l default).
+#   --ptp-iface <iface>   interface for ptp4l (default: same as the PRIMARY -i).
+#                         Single ptp4l instance. In VMs the virtual NIC often has no
+#                         PTP clock ("failed to create a clock"); use --ptp-iface lo
+#                         to run the master on loopback.
 #   --no-ptp              skip ptp4l entirely (browse/WebUI OK, but no audio send/recv)
 #   -p <port>             HTTP server port (default: 8080, from daemon.conf)
 #   -d <domain>           PTPv2 domain 0..127 (default: from daemon.conf)
@@ -80,8 +84,11 @@ parse_opts() {
     esac
   done
   [ -n "$IFACE" ] || die "interface name cannot be empty"
-  # ptp4l interface defaults to the daemon interface
-  [ -n "$PTP_IFACE" ] || PTP_IFACE="$IFACE"
+  # -i 支持 ST-2022-7 主备双网卡:"ens160,ens192"(逗号分隔,daemon interface_name
+  # 原生支持)。主接口=逗号前第一个,用于 pidfile/log/ptp4l 默认值。
+  PRIMARY_IFACE="${IFACE%%,*}"
+  # ptp4l interface defaults to the PRIMARY daemon interface (单实例 ptp4l)
+  [ -n "$PTP_IFACE" ] || PTP_IFACE="$PRIMARY_IFACE"
   # --oca implies using the OCA-built binary unless --daemon-bin overrides it
   if [ -n "$DAEMON_BIN_OVERRIDE" ]; then
     DAEMON_BIN="$DAEMON_BIN_OVERRIDE"
@@ -93,15 +100,25 @@ parse_opts() {
   fi
 }
 
+# 校验 -i 指定的所有接口存在(主备双网卡都校验)。返回非 0 即缺失。
+validate_ifaces() {
+  local saved_ifs="$IFS"; IFS=','
+  local ifc
+  for ifc in $IFACE; do
+    ip -o link show "$ifc" >/dev/null 2>&1 || { IFS="$saved_ifs"; die "interface '$ifc' does not exist (ip link show)"; }
+    ip -br addr show "$ifc" 2>/dev/null | grep -qE 'UP' || warn "interface '$ifc' is not UP"
+  done
+  IFS="$saved_ifs"
+}
+
 # ---- pre-flight --------------------------------------------------------------
 preflight() {
   [ -x "$DAEMON_BIN" ] || die "daemon not compiled: $DAEMON_BIN (run build.sh)"
   [ -r "$DAEMON_CONF" ] || die "config not found: $DAEMON_CONF"
   [ -r "$KMOD" ] || die "kernel module not compiled: $KMOD (run build.sh)"
   [ "$NO_PTP" = 1 ] || [ -x "$PTP4L" ] || die "ptp4l not installed at $PTP4L (apt install linuxptp, or use --no-ptp)"
-  # validate daemon interface exists
-  ip -o link show "$IFACE" >/dev/null 2>&1 || die "interface '$IFACE' does not exist (ip link show)"
-  ip -br addr show "$IFACE" 2>/dev/null | grep -qE 'UP' || warn "interface '$IFACE' is not UP"
+  # validate daemon interface(s) exist (主备双网卡都校验)
+  validate_ifaces
   # validate ptp4l interface (if ptp4l will run)
   if [ "$NO_PTP" != 1 ]; then
     ip -o link show "$PTP_IFACE" >/dev/null 2>&1 || die "ptp interface '$PTP_IFACE' does not exist"
@@ -109,16 +126,17 @@ preflight() {
   command -v arecord >/dev/null || warn "arecord not found (alsa-utils) — playback/record tests won't work"
 }
 
-# ---- paths derived from IFACE / PTP_IFACE ------------------------------------
+# ---- paths derived from PRIMARY_IFACE / PTP_IFACE ----------------------------
+# 用主接口名(逗号前)做文件名,避免逗号进 pidfile/log/conf 文件名。
 ptp_log()       { echo "/tmp/ptp4l.$PTP_IFACE.log"; }
 ptp_pidfile()   { echo "/tmp/aes67-ptp4l.$PTP_IFACE.pid"; }
-daemon_log()    { echo "/tmp/aes67-daemon.$IFACE.log"; }
-daemon_pidfile(){ echo "/tmp/aes67-daemon.$IFACE.pid"; }
-conf_file()     { echo "/tmp/aes67-daemon.$IFACE.conf"; }
+daemon_log()    { echo "/tmp/aes67-daemon.$PRIMARY_IFACE.log"; }
+daemon_pidfile(){ echo "/tmp/aes67-daemon.$PRIMARY_IFACE.pid"; }
+conf_file()     { echo "/tmp/aes67-daemon.$PRIMARY_IFACE.conf"; }
 
 iface_ip() {
-  # print the first IPv4 of $IFACE, or empty
-  ip -4 -o addr show "$IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+  # print the first IPv4 of the PRIMARY interface, or empty
+  ip -4 -o addr show "$PRIMARY_IFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
 }
 
 # ---- helpers -----------------------------------------------------------------
@@ -172,9 +190,16 @@ PY
 start() {
   preflight
 
-  local ipaddr; ipaddr="$(iface_ip)"
-  if [ "$IFACE" != "lo" ] && [ -z "$ipaddr" ]; then
-    die "interface '$IFACE' has no IPv4 address — daemon cannot bind SAP/mDNS/PTP"
+  # 校验每个接口有 IPv4(主备双网卡都需 IP,SAP/mDNS 跑所有接口)。
+  local ipaddr; ipaddr="$(iface_ip)"   # 主接口 IP(用于状态显示)
+  if [ "$IFACE" != "lo" ]; then
+    local saved_ifs="$IFS"; IFS=','
+    local ifc
+    for ifc in $IFACE; do
+      local ip4; ip4="$(ip -4 -o addr show "$ifc" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
+      [ -n "$ip4" ] || die "interface '$ifc' has no IPv4 address — daemon cannot bind SAP/mDNS/PTP"
+    done
+    IFS="$saved_ifs"
   fi
 
   # 1. kernel module
@@ -374,8 +399,10 @@ Usage: $0 {start|stop|restart|status} [options]
         show all running instances, PTP status, discovered SAP sources
 
 Options:
-  -i <iface>      network interface for the daemon (default: lo). Use a real NIC,
-                  e.g. ens192, to discover SAP/mDNS audio sources on the LAN.
+  -i <iface>      network interface for the daemon (default: lo). Single NIC
+                  (e.g. ens192) for SAP/mDNS on LAN. Two interfaces comma-separated
+                  (e.g. ens160,ens192) enable ST-2022-7 redundancy (PTP/RTP on
+                  primary+secondary, SAP/mDNS on all). Primary = first.
   -p <port>       HTTP server port (default: from daemon.conf = 8080)
   -d <domain>     PTPv2 domain 0..127 (default: from daemon.conf)
   -a <addr>       HTTP bind address (default: 0.0.0.0)
@@ -395,6 +422,7 @@ Options:
 
 Examples:
   $0 start -i ens192                        # run on ens192, ptp4l on ens192 too
+  $0 start -i ens160,ens192 --ptp-iface lo   # ST-2022-7 dual-NIC, ptp4l on lo (VM)
   $0 start -i ens192 --ptp-iface lo         # daemon on ens192, ptp4l on lo (VM)
   $0 start -i ens192 --no-ptp               # browse only, no PTP master
   $0 start -i ens192 --oca                  # real driver + OCA for Fitcan verify

@@ -169,26 +169,6 @@ constexpr uint16_t kMc3PropTimeSourceONo = 2;
 constexpr uint16_t kMc3PropOffset = 3;
 constexpr uint16_t kMc3PropCurrentRate = 4;
 
-// ── OcaMediaClock methods (DefLevel 3, classID{1,2,6}) ──
-// DeprecatedSince AES70-2018;合规工具仍检查,全部 NotImplemented。
-constexpr uint16_t kDefLevelMediaClock = 3;
-constexpr uint16_t kMcGetType = 1;
-constexpr uint16_t kMcSetType = 2;
-constexpr uint16_t kMcGetDomainID = 3;
-constexpr uint16_t kMcSetDomainID = 4;
-constexpr uint16_t kMcGetRatesSupported = 5;
-constexpr uint16_t kMcGetRate = 6;
-constexpr uint16_t kMcSetRate = 7;
-constexpr uint16_t kMcGetLockState = 8;
-constexpr uint16_t kMcGetTypesSupported = 9;
-
-// OcaMediaClock Property indices (废弃)
-constexpr uint16_t kMcPropType = 1;
-constexpr uint16_t kMcPropDomainID = 2;
-constexpr uint16_t kMcPropRatesSupported = 3;
-constexpr uint16_t kMcPropCurrentRate = 4;
-constexpr uint16_t kMcPropLockState = 5;
-
 // ── OcaMediaTransportNetwork methods (DefLevel 3, classID{1,4,2}) ──
 constexpr uint16_t kDefLevelMtn = 3;
 constexpr uint16_t kMtnGetMediaProtocol = 1;             // AES70-2018 Mandatory

@@ -32,7 +32,6 @@ struct OcaServerConfig {
   std::string ip_addr;
   std::string ip_addr_sec;
   std::string mac_addr;
-  uint32_t channels = 0;
 };
 
 class OcaServer {

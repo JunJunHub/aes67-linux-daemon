@@ -16,13 +16,12 @@
 
 namespace oca {
 
-// Spec5:mDNS TXT 记录扩展(Fitcan 控制器期望的设备元数据)
+// Spec5:mDNS TXT 记录扩展。key 名为 Fitcan 控制器私有约定(见 .cpp),
+// 非 AES70 标准风格。
 struct MdnsTxtRecords {
   std::string ip_addr;
   std::string ip_addr_sec;
   std::string mac_addr;
-  std::string device_id;
-  uint32_t channels = 0;
   std::string firmware;
 };
 

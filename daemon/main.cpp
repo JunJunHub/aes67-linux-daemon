@@ -229,9 +229,6 @@ int main(int argc, char* argv[]) {
         // Spec5:设备元数据(mDNS TXT + OcaNetwork 现实化)
         ocacfg.ip_addr = config->get_ip_addr_str();
         ocacfg.mac_addr = config->get_mac_addr_str();
-        int32_t n_out = 0;
-        driver->get_number_of_outputs(n_out);
-        ocacfg.channels = static_cast<uint32_t>(n_out);
         oca_server = std::make_unique<oca::OcaServer>(ocacfg, oca_bridge.get());
         if (!oca_server->start()) {
           throw std::runtime_error(std::string("OcaServer:: start failed"));

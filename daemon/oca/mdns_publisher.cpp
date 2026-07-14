@@ -62,28 +62,37 @@ void MdnsPublisher::create_service(struct AvahiClient* c) {
   if (!avahi_entry_group_is_empty(group_))
     return;
 
-  // Spec5:TXT 记录含设备元数据(Fitcan 控制器期望)。
-  // 用 avahi_string_list 逐条追加非空字段:varargs 版 add_service 以 nullptr
-  // 结尾, 任一中段字段为空即截断后续(mac/device_id/channels/firmware
-  // 会被丢弃)。 strlst 版无此缺陷。
+  // Spec5:TXT 记录含设备元数据。key 名为 Fitcan 控制器私有约定(权威源
+  // OcaLiteLib AES70Browser_OnResolveServiceName.cpp::GetInfoFromTXT_Record),
+  // 非 AES70 标准风格。Fitcan 解析的 key 与标准不同名,且存在硬过滤:
+  // AES70Manager_ThreadOnBrowsingDevice.cpp:147 IP_P==0 && IP_S==0 即丢弃。
+  // 故单接口设备必须发 IP_P(真实 IP,与 A 记录一致,否则故障连接检查失败)。
+  // 用 avahi_string_list 逐条追加:varargs 版 add_service 以 nullptr 结尾,
+  // 任一中段字段为空即截断后续。strlst 版无此缺陷。
   AvahiStringList* txt = nullptr;
   txt = avahi_string_list_add_pair(txt, "txtvers", "1");
   txt = avahi_string_list_add_pair(txt, "protovers", "1");
+  // Fitcan 私有 key:主接口(IP_P/MAC_P)为必需/建议,备接口(IP_S/MAC_S)
+  // 单接口可省(硬过滤是 &&,IP_P 有值即过)。
   if (!txt_.ip_addr.empty())
-    txt = avahi_string_list_add_pair(txt, "ip_addr", txt_.ip_addr.c_str());
+    txt = avahi_string_list_add_pair(txt, "IP_P", txt_.ip_addr.c_str());
   if (!txt_.ip_addr_sec.empty())
-    txt = avahi_string_list_add_pair(txt, "ip_addr_sec",
-                                     txt_.ip_addr_sec.c_str());
+    txt = avahi_string_list_add_pair(txt, "IP_S", txt_.ip_addr_sec.c_str());
   if (!txt_.mac_addr.empty())
-    txt = avahi_string_list_add_pair(txt, "mac_addr", txt_.mac_addr.c_str());
-  if (!txt_.device_id.empty())
-    txt = avahi_string_list_add_pair(txt, "device_id", txt_.device_id.c_str());
-  if (txt_.channels > 0) {
-    const std::string ch = std::to_string(txt_.channels);
-    txt = avahi_string_list_add_pair(txt, "channels", ch.c_str());
-  }
+    txt = avahi_string_list_add_pair(txt, "MAC_P", txt_.mac_addr.c_str());
+  // ServicePortNo:Fitcan 仅作信息字段(控制连接实际用 SRV 记录端口);
+  // 与 port_ 一致以保持可读性。
+  txt = avahi_string_list_add_pair(txt, "ServicePortNo",
+                                   std::to_string(port_).c_str());
+  // DeviceID:Fitcan 按 atol 十进制数字解析(非字符串)。daemon 的 node_id
+  // 是字符串,发数字 0(仅用于设备查找,不参与过滤/连接;设备名已在 SRV
+  // service instance name 中)。
+  txt = avahi_string_list_add_pair(txt, "DeviceID", "0");
+  // SubChNum:每路流的子通道数(1=mono,2=stereo),非总通道数。默认 1。
+  txt = avahi_string_list_add_pair(txt, "SubChNum", "1");
   if (!txt_.firmware.empty())
-    txt = avahi_string_list_add_pair(txt, "firmware", txt_.firmware.c_str());
+    txt = avahi_string_list_add_pair(txt, "FirmwareVersion",
+                                     txt_.firmware.c_str());
 
   int r = avahi_entry_group_add_service_strlst(
       group_, AVAHI_IF_UNSPEC, AVAHI_PROTO_UNSPEC,

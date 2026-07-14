@@ -55,7 +55,7 @@ if(WITH_OCA)
        oca/classes/network.cpp oca/classes/control_network.cpp
        oca_session_manager_bridge.cpp   # daemon 层桥接胶水(依赖 SessionManager/Config)
        oca/classes/media_clock_manager.cpp oca/classes/media_clock3.cpp
-       oca/classes/media_clock.cpp oca/classes/media_transport_network.cpp
+       oca/classes/media_transport_network.cpp
        oca/classes/media_transport_network_aes67.cpp)
 endif()
 if(FAKE_DRIVER)

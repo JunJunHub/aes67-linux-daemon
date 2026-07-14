@@ -4,7 +4,6 @@
 
 #include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
-#include "oca/classes/media_clock.hpp"
 #include "oca/classes/media_clock3.hpp"
 #include "oca/classes/media_clock_manager.hpp"
 #include "oca/classes/media_transport_network_aes67.hpp"
@@ -52,11 +51,9 @@ OcaServer::OcaServer(const OcaServerConfig& cfg, OcaAudioBridge* bridge)
   auto* mtn =
       new OcaMediaTransportNetworkAES67(8192, 100);  // owner = Root Block
   auto* mc3 = new OcaMediaClock3(8193, 100);
-  auto* mc = new OcaMediaClock(8194, 100);
   registry_.register_object(std::unique_ptr<Object>(mcm));
   registry_.register_object(std::unique_ptr<Object>(mtn));
   registry_.register_object(std::unique_ptr<Object>(mc3));
-  registry_.register_object(std::unique_ptr<Object>(mc));
 
   // 注入 bridge 到需要运行时数据的对象
   if (bridge_) {
@@ -91,8 +88,6 @@ bool OcaServer::start() {
     txt.ip_addr = cfg_.ip_addr;
     txt.ip_addr_sec = cfg_.ip_addr_sec;
     txt.mac_addr = cfg_.mac_addr;
-    txt.device_id = cfg_.node_id;
-    txt.channels = cfg_.channels;
     txt.firmware = cfg_.daemon_version;
     mdns_ = std::make_unique<MdnsPublisher>(
         cfg_.device_name.empty() ? cfg_.node_id : cfg_.device_name,

@@ -15,7 +15,6 @@
 #include "oca/classes/application_network.hpp"
 #include "oca/classes/control_network.hpp"
 #include "oca/classes/device_manager.hpp"
-#include "oca/classes/media_clock.hpp"
 #include "oca/classes/media_clock3.hpp"
 #include "oca/classes/media_clock_manager.hpp"
 #include "oca/classes/media_transport_network_aes67.hpp"
@@ -1539,7 +1538,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
 
   // GetMembers(5) on Root Block(ONo 100) -> List<ObjectIdentification>
   //  [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
-  //  + [7,8192,8193,8194] Spec5 新增对象
+  //  + [7,8192,8193] Spec5 新增对象
   // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion
   oca::ocp1::Writer cw2;
   oca::ocp1::write_command(
@@ -1555,7 +1554,7 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
       rsp2.data() + 1 + 9, rh2->pduSize - 9, rh2->messageCount);
   BOOST_REQUIRE_EQUAL(rsps2.size(), 1u);
   oca::ocp1::Reader pr2(rsps2[0].paramData, rsps2[0].paramBytes);
-  BOOST_CHECK_EQUAL(pr2.u16(), 9u);  // 9 members(3 管理器 + 2 CM3 + 4 Spec5)
+  BOOST_CHECK_EQUAL(pr2.u16(), 8u);  // 8 members(3 管理器 + 2 CM3 + 3 Spec5)
   // ONo=1 DeviceManager {1,3,1} v2
   BOOST_CHECK_EQUAL(pr2.u32(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
@@ -1616,13 +1615,6 @@ BOOST_AUTO_TEST_CASE(oca_server_facade) {
   BOOST_CHECK_EQUAL(pr2.u16(), 1u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);
   BOOST_CHECK_EQUAL(pr2.u16(), 15u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 2u);  // ClassVersion
-  // ONo=8194 OcaMediaClock {1,2,6} v2(Spec5 废弃存根)
-  BOOST_CHECK_EQUAL(pr2.u32(), 8194u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 3u);  // ClassID fieldCount
-  BOOST_CHECK_EQUAL(pr2.u16(), 1u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 2u);
-  BOOST_CHECK_EQUAL(pr2.u16(), 6u);
   BOOST_CHECK_EQUAL(pr2.u16(), 2u);  // ClassVersion
 
   ::close(sock);
@@ -1730,13 +1722,13 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
 
   // 4) 发现:GetMembers(ONo 100) -> List<ObjectIdentification>
   //     [1,4,6] 管理器 + [4097,4098] CM3 网络对象(Spec3)
-  //     + [7,8192,8193,8194] Spec5 新增对象
+  //     + [7,8192,8193] Spec5 新增对象
   auto r3 = cmd(3, 100,
                 {oca::methods::kDefLevelBlock, oca::methods::kBlockGetMembers});
   BOOST_CHECK(r3.statusCode == oca::Status::OK);
   {
     oca::ocp1::Reader r(r3.paramData, r3.paramBytes);
-    BOOST_CHECK_EQUAL(r.u16(), 9u);  // 9 members(3 管理器 + 2 CM3 + 4 Spec5)
+    BOOST_CHECK_EQUAL(r.u16(), 8u);  // 8 members(3 管理器 + 2 CM3 + 3 Spec5)
     // 每个元素 = ONo + ClassID(fieldCount+levels) + ClassVersion;只校验 ONo
     BOOST_CHECK_EQUAL(r.u32(), 1u);
     r.u16();  // skip ClassID fieldCount
@@ -1791,13 +1783,6 @@ BOOST_AUTO_TEST_CASE(oca_e2e_acceptance) {
     r.u16();  // ClassVersion
     // ONo=8193 OcaMediaClock3 {1,2,15} v2(Spec5)
     BOOST_CHECK_EQUAL(r.u32(), 8193u);
-    r.u16();  // ClassID fieldCount=3
-    r.u16();
-    r.u16();
-    r.u16();
-    r.u16();  // ClassVersion
-    // ONo=8194 OcaMediaClock {1,2,6} v2(Spec5 废弃存根)
-    BOOST_CHECK_EQUAL(r.u32(), 8194u);
     r.u16();  // ClassID fieldCount=3
     r.u16();
     r.u16();
@@ -2178,13 +2163,15 @@ BOOST_AUTO_TEST_CASE(dispatch_media_clock_manager) {
     BOOST_CHECK_EQUAL(st.nrParameters, 1);
     BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 0u);
   }
-  // GetMediaClockTypesSupported(2):NotImplemented
+  // GetMediaClockTypesSupported(2):返空 List<OcaMediaClockType>
   {
     oca::ocp1::Writer rsp;
     auto st = mcm.exec({oca::methods::kDefLevelMediaClockMngr,
                         oca::methods::kMcmGetMediaClockTypesSupported},
                        empty, rsp, sess);
-    BOOST_CHECK(st.status == oca::Status::NotImplemented);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(st.nrParameters, 1);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 0u);
   }
   // GetClock3s(3):返回 [8193]
   {
@@ -2277,20 +2264,6 @@ BOOST_AUTO_TEST_CASE(dispatch_media_clock3_methods) {
       BOOST_CHECK_EQUAL(r.u32(), expected);
       r.u32();  // denominator
     }
-  }
-}
-
-BOOST_AUTO_TEST_CASE(dispatch_media_clock_deprecated) {
-  oca::OcaMediaClock mc(8194, 100);
-  oca::Session sess(1);
-  oca::ocp1::Reader empty(nullptr, 0);
-
-  // 废弃类所有 DefLevel-3 方法返回 NotImplemented
-  for (uint16_t idx = 1; idx <= 9; ++idx) {
-    oca::ocp1::Writer rsp;
-    auto st =
-        mc.exec({oca::methods::kDefLevelMediaClock, idx}, empty, rsp, sess);
-    BOOST_CHECK(st.status == oca::Status::NotImplemented);
   }
 }
 

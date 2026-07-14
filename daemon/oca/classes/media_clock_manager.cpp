@@ -25,8 +25,9 @@ ExecResult OcaMediaClockManager::exec(MethodID m,
         rsp.u16(0);
         return {Status::OK, 1};
       case methods::kMcmGetMediaClockTypesSupported:
-        // Optional:返回 NotImplemented
-        return {Status::NotImplemented, 0};
+        // Mandatory:返空 List<OcaMediaClockType>(设备用 Clock3,无 legacy type)
+        rsp.u16(0);
+        return {Status::OK, 1};
       case methods::kMcmGetClock3s:
         // GetClock3s:返回 Ocp1List<OcaONo> = [8193]
         rsp.u16(1);

@@ -1,8 +1,9 @@
-//  oca_audio_bridge.hpp - OCA 层与 daemon 音频运行时的桥接接口
+//  oca_audio_bridge.hpp - OCA 协议层与 daemon 音频运行时的桥接接口
 //
-//  OCA 编译单元零依赖 SessionManager 头文件/类型。
-//  接口从 OCA 需求倒推，不暴露 AES67 daemon StreamSource/StreamSink 等非 OCA
-//  协议层内部类型。 唯一实现在 oca_session_manager_bridge.cpp。
+//  纯虚接口,定义在 daemon/oca/(协议层)。OCA 编译单元零依赖 SessionManager
+//  头文件/类型,接口从 OCA 需求倒推,不暴露 AES67 daemon StreamSource/StreamSink
+//  等非 OCA 协议层内部类型。唯一实现在 daemon 层 oca_session_manager_bridge.cpp
+//  (daemon/ 根,与 config/session_manager/driver_manager 同级)。
 
 #ifndef OCA_OCA_AUDIO_BRIDGE_HPP_
 #define OCA_OCA_AUDIO_BRIDGE_HPP_

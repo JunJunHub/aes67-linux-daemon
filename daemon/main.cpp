@@ -37,7 +37,7 @@
 
 #ifdef _USE_OCA_
 #include "oca/oca_server.hpp"
-#include "oca/oca_session_manager_bridge.hpp"
+#include "oca_session_manager_bridge.hpp"
 #endif
 
 #ifdef _USE_SYSTEMD_

@@ -1,7 +1,8 @@
 //  oca_session_manager_bridge.hpp - OcaAudioBridge 的 SessionManager 实现
 //
-//  .hpp 仅前向声明 SessionManager/Config/DriverManager，零 include 传递;
-//  .cpp include 完整头文件做类型转换。
+//  本文件在 daemon 层(daemon/ 根),是 OCA 协议层(daemon/oca/)与 daemon 核心
+//  (SessionManager/Config/DriverManager)的唯一胶水。.hpp 仅前向声明核心类型,
+//  零 include 传递;.cpp include 完整头文件做类型转换。
 
 #ifndef OCA_OCA_SESSION_MANAGER_BRIDGE_HPP_
 #define OCA_OCA_SESSION_MANAGER_BRIDGE_HPP_

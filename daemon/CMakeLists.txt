@@ -53,7 +53,7 @@ if(WITH_OCA)
        oca/classes/application_network.cpp oca/classes/device_manager.cpp
        oca/classes/network_manager.cpp oca/classes/subscription_manager.cpp
        oca/classes/network.cpp oca/classes/control_network.cpp
-       oca/oca_session_manager_bridge.cpp
+       oca_session_manager_bridge.cpp   # daemon 层桥接胶水(依赖 SessionManager/Config)
        oca/classes/media_clock_manager.cpp oca/classes/media_clock3.cpp
        oca/classes/media_clock.cpp oca/classes/media_transport_network.cpp
        oca/classes/media_transport_network_aes67.cpp)

@@ -1,10 +1,10 @@
 //  oca_session_manager_bridge.cpp - OcaAudioBridge 的 SessionManager 实现
 //
-//  此文件 include SessionManager/Config/DriverManager 完整头文件，
+//  daemon 层胶水(daemon/ 根):include SessionManager/Config/DriverManager 完整
 //  做类型转换(StreamSource→SourceInfo 等)，注册 Observer。
-//  OCA 其余编译单元零依赖这些头文件。
+//  daemon/oca/ 内的 OCA 编译单元零依赖这些头文件(经 OcaAudioBridge 纯虚接口解耦)。
 
-#include "oca/oca_session_manager_bridge.hpp"
+#include "oca_session_manager_bridge.hpp"
 
 #include "config.hpp"
 #include "driver_interface.hpp"  // FAKE_DRIVER 感知,条件引入 DriverManager

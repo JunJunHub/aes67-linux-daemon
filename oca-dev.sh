@@ -28,7 +28,7 @@
 #   ./oca-dev.sh run -i ens160                   # 在 ens160 上跑,OCA+mDNS 发布到 LAN
 #   ./oca-dev.sh build --real                    # 构建真实驱动二进制 + LKM(需 linux-headers)
 #   ./oca-dev.sh run-real -i ens192 --ptp-iface lo  # 真实驱动+OCA 整体验证(VM 用 lo 跑 ptp4l)
-  ./oca-dev.sh run-real -i ens160,ens192         # ST-2022-7 双网卡冗余(主备)
+#   ./oca-dev.sh run-real -i ens160,ens192         # ST-2022-7 双网卡冗余(主备)
 #   ./oca-dev.sh status
 #   ./oca-dev.sh test
 #   ./oca-dev.sh probe 172.16.1.198 65037        # 探测指定地址的 OCA 设备

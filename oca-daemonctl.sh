@@ -231,7 +231,12 @@ start() {
     log "daemon already running (pid $(cat "$(daemon_pidfile)"))"
   else
     log "starting aes67-daemon on $IFACE ..."
-    ( cd "$TOPDIR/daemon" && nohup ./aes67-daemon -c "$conf" -a "$HTTP_ADDR" > "$(daemon_log)" 2>&1 & echo $! > "$(daemon_pidfile)" )
+    # cd daemon/ 保持相对路径(status.json 等)正确,但用 $DAEMON_BIN(可能是
+    # out-of-source 的 OCA 构建,而非 in-source)。--oca 默认选 build/aes67-daemon。
+    # exec 让子 shell 替换为 daemon,使 $! 记录真实 daemon pid(否则记录的是
+    # nohup wrapper pid,stop/status 会误判)。
+    ( cd "$TOPDIR/daemon" && exec nohup "$DAEMON_BIN" -c "$conf" -a "$HTTP_ADDR" > "$(daemon_log)" 2>&1 ) &
+    echo $! > "$(daemon_pidfile)"
     sleep 2
     is_running "$(daemon_pidfile)" || die "daemon failed to start, see $(daemon_log)"
     log "daemon started (pid $(cat "$(daemon_pidfile)"))"

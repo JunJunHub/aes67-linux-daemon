@@ -234,20 +234,44 @@ cmd_stop() {
 
 # ---- status ------------------------------------------------------------------
 cmd_status() {
-  echo "=== dev daemon ==="
+  # OCA 端口监听状态(无论哪个实例起的)
+  local oca_listen=""
+  if command -v ss >/dev/null 2>&1; then
+    oca_listen="$(ss -tlnp 2>/dev/null | grep ':65037 ' || true)"
+  fi
+
+  echo "=== dev daemon (FAKE, ./oca-dev.sh run) ==="
   if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
     local pid; pid="$(cat "$PIDFILE")"
     log "running (pid $pid)"
     echo "  log: $LOGFILE"
-    # OCA 端口监听状态
-    if command -v ss >/dev/null 2>&1; then
-      local oca; oca="$(ss -tlnp 2>/dev/null | grep ':65037 ' || true)"
-      [ -n "$oca" ] && echo "  OCA 65037: LISTEN ✓" || echo "  OCA 65037: not listening"
-    fi
-    # OCA 启动行
     grep -m1 "OCA server listening" "$LOGFILE" 2>/dev/null | sed 's/^/  /' || true
   else
     log "not running"
+  fi
+
+  # oca-daemonctl.sh 启动的实例(真实驱动 ./oca-dev.sh run-real)
+  local daemonctl_pids=""
+  for pf in /tmp/aes67-daemon.*.pid; do
+    [ -f "$pf" ] || continue
+    local p; p="$(cat "$pf" 2>/dev/null)"
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      local iface; iface="$(basename "$pf" .pid)"; iface="${iface#aes67-daemon.}"
+      daemonctl_pids="$daemonctl_pids $p"
+      echo "  [$iface] real-driver pid=$p ($(readlink /proc/$p/exe 2>/dev/null || echo '?'))"
+      grep -m1 "OCA server listening" "/tmp/aes67-daemon.$iface.log" 2>/dev/null | sed 's/^/    /' || true
+    fi
+  done
+  if [ -n "$daemonctl_pids" ]; then
+    echo "  (以上为 ./oca-dev.sh run-real 启动的真实驱动实例)"
+  else
+    log "no real-driver instances (run-real)"
+  fi
+
+  # OCA 端口总览
+  if [ -n "$oca_listen" ]; then
+    echo "=== OCA 65037 ==="
+    echo "  LISTEN ✓"
   fi
 
   # mDNS 发布检查(若 avahi-browse 可用)

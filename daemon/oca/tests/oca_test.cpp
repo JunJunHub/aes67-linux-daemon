@@ -2369,3 +2369,209 @@ BOOST_AUTO_TEST_CASE(dispatch_mtn_aes67_readonly) {
     BOOST_CHECK(st.status == oca::Status::NotImplemented);
   }
 }
+
+// ── Spec5 fix 回归:bridge 非空路径 + connector ID 映射 ──
+
+// FakeBridge:记录 add/remove 调用以验证 connector CRUD 与 ID 映射正确性。
+class FakeBridge : public oca::OcaAudioBridge {
+ public:
+  std::map<uint8_t, oca::OcaAudioBridge::SourceInfo> sources;
+  std::map<uint8_t, oca::OcaAudioBridge::SinkInfo> sinks;
+  uint32_t rate = 48000;
+
+  oca::OcaAudioBridge::PtpConfig get_ptp_config() const override {
+    return {0, 46};
+  }
+  bool set_ptp_config(oca::OcaAudioBridge::PtpConfig) override { return true; }
+  oca::OcaAudioBridge::PtpStatus get_ptp_status() const override {
+    return {oca::OcaAudioBridge::PtpLockState::Locked, "gmid", 0};
+  }
+  uint32_t get_sample_rate() const override { return rate; }
+  bool set_sample_rate(uint32_t hz) override {
+    rate = hz;
+    return true;
+  }
+  std::vector<uint32_t> get_supported_sample_rates() const override {
+    return {44100, 48000, 96000};
+  }
+  std::vector<oca::OcaAudioBridge::SourceInfo> get_sources() const override {
+    std::vector<oca::OcaAudioBridge::SourceInfo> out;
+    for (const auto& [id, s] : sources)
+      out.push_back(s);
+    return out;
+  }
+  bool add_source(const oca::OcaAudioBridge::SourceInfo& s) override {
+    sources[s.id] = s;
+    return true;
+  }
+  bool remove_source(uint8_t id) override { return sources.erase(id) > 0; }
+  std::string get_source_sdp(uint8_t) const override { return {}; }
+  std::vector<oca::OcaAudioBridge::SinkInfo> get_sinks() const override {
+    std::vector<oca::OcaAudioBridge::SinkInfo> out;
+    for (const auto& [id, s] : sinks)
+      out.push_back(s);
+    return out;
+  }
+  bool add_sink(const oca::OcaAudioBridge::SinkInfo& s) override {
+    sinks[s.id] = s;
+    return true;
+  }
+  bool remove_sink(uint8_t id) override { return sinks.erase(id) > 0; }
+  oca::OcaAudioBridge::SinkStatus get_sink_status(uint8_t) const override {
+    return {false, false, false, false, true, false};
+  }
+  std::string get_interface_name() const override { return "lo"; }
+  std::string get_ip_addr() const override { return "127.0.0.1"; }
+  std::string get_mac_addr() const override { return "01:02:03:04:05:06"; }
+  std::string get_device_id() const override { return "AES67 daemon test"; }
+  uint32_t get_input_channels() const override { return 8; }
+  uint32_t get_output_channels() const override { return 8; }
+  void set_ptp_observer(PtpObserver) override {}
+  void set_source_observer(SourceObserver) override {}
+  void set_sink_observer(SinkObserver) override {}
+};
+
+// 构造 AddSourceConnector 请求:state(u8) + OcaMediaSourceConnector。
+// pinMap 用 OCAMicro 格式 [u16 key, u8 mode, u16 index]。
+static oca::ocp1::Writer make_add_source_req(uint16_t connector_id,
+                                             const std::string& name) {
+  oca::ocp1::Writer w;
+  w.u8(2);  // state = RUNNING
+  // OcaMediaSourceConnector
+  w.u16(connector_id);  // IDInternal
+  w.string(name);       // IDExternal
+  w.u8(0);              // connection.secure
+  w.blob(nullptr, 0);   // streamParameters
+  w.u8(2);              // streamCastMode = MULTICAST
+  w.u16(1);             // codingSchemeID = PCM
+  w.string("L24");      // codecParams
+  w.u32(0);             // clockONo
+  w.u16(1);             // pinCount
+  w.u16(0);             // pinMap key
+  w.u8(2);              // PortID.mode = OUTPUT
+  w.u16(1);             // PortID.index
+  w.f32(0.0f);          // alignmentLevel
+  return w;
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_mtn_connector_crud_via_bridge) {
+  FakeBridge bridge;
+  oca::OcaMediaTransportNetworkAES67 mtn(8192, 100);
+  mtn.set_bridge(&bridge);
+  oca::Session sess(1);
+
+  // AddSourceConnector:bridge 应被调用,daemon_id=0
+  {
+    auto w = make_add_source_req(0x0001, "Source 1");
+    oca::ocp1::Reader req(w.data(), w.size());
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnAddSourceConnector}, req,
+        rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    // 返回的 connector 应含分配的 connector_id
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u16(), 0x0001u);
+    BOOST_CHECK_EQUAL(r.string(), "Source 1");
+  }
+  BOOST_CHECK_EQUAL(bridge.sources.size(), 1u);
+  BOOST_CHECK_EQUAL(bridge.sources.at(0).id, 0u);
+
+  // GetSourceConnectors:返回 1 个,connector_id 正确
+  {
+    oca::ocp1::Writer rsp;
+    oca::ocp1::Reader empty(nullptr, 0);
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetSourceConnectors},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u16(), 1u);
+    BOOST_CHECK_EQUAL(r.u16(), 0x0001u);
+  }
+
+  // GetConnectorsStatuses:1 个 source,state=RUNNING(2)
+  {
+    oca::ocp1::Writer rsp;
+    oca::ocp1::Reader empty(nullptr, 0);
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetConnectorsStatuses},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u16(), 1u);       // count
+    BOOST_CHECK_EQUAL(r.u16(), 0x0001u);  // connectorID
+    BOOST_CHECK_EQUAL(r.u8(), 2u);        // state RUNNING
+    BOOST_CHECK_EQUAL(r.u16(), 0u);       // errorCode
+  }
+
+  // DeleteConnector(connector_id=0x0001):用 connector_id 查表,
+  // 应删 bridge source 0(daemon_id),而非 connector_id&0xFF=1。
+  {
+    oca::ocp1::Writer wreq;
+    wreq.u16(0x0001);
+    oca::ocp1::Reader req(wreq.data(), wreq.size());
+    oca::ocp1::Writer rsp;
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnDeleteConnector}, req,
+        rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+  }
+  BOOST_CHECK_EQUAL(bridge.sources.size(), 0u);  // source 0 已删
+
+  // GetSourceConnectors:回到空列表
+  {
+    oca::ocp1::Writer rsp;
+    oca::ocp1::Reader empty(nullptr, 0);
+    auto st = mtn.exec(
+        {oca::methods::kDefLevelMtn, oca::methods::kMtnGetSourceConnectors},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u16(), 0u);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(dispatch_media_clock3_rate_via_bridge) {
+  FakeBridge bridge;
+  bridge.rate = 96000;
+  oca::OcaMediaClock3 mc3(8193, 100);
+  mc3.set_bridge(&bridge);
+  oca::Session sess(1);
+  oca::ocp1::Reader empty(nullptr, 0);
+
+  // GetCurrentRate 读 bridge->get_sample_rate() = 96000
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3GetCurrentRate},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    oca::ocp1::Reader r(rsp.data(), rsp.size());
+    BOOST_CHECK_EQUAL(r.u32(), 96000u);
+    BOOST_CHECK_EQUAL(r.u32(), 1u);
+  }
+
+  // SetCurrentRate(88200):bridge.rate 更新(H2 回归:写后可读回)
+  {
+    oca::ocp1::Writer wreq;
+    wreq.u32(88200);
+    wreq.u32(1);
+    oca::ocp1::Reader req(wreq.data(), wreq.size());
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3SetCurrentRate},
+        req, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+  }
+  BOOST_CHECK_EQUAL(bridge.rate, 88200u);  // bridge 已更新
+
+  // GetCurrentRate 读回新值(88200),验证不陈旧
+  {
+    oca::ocp1::Writer rsp;
+    auto st = mc3.exec(
+        {oca::methods::kDefLevelMediaClock3, oca::methods::kMc3GetCurrentRate},
+        empty, rsp, sess);
+    BOOST_CHECK(st.status == oca::Status::OK);
+    BOOST_CHECK_EQUAL(oca::ocp1::Reader(rsp.data(), rsp.size()).u32(), 88200u);
+  }
+}

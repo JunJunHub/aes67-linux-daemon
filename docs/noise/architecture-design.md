@@ -3,7 +3,7 @@
 > **版本**: v0.1-draft
 > **日期**: 2026-07-14
 > **状态**: 初稿，待团队讨论
-> **基于**: aes67-linux-daemon (feature/aes70-oca 分支) + RNNoise
+> **基于**: aes67-linux-daemon (feature/noise 分支，HTTP-only，不扩展 OCA) + RNNoise
 
 ---
 
@@ -31,7 +31,6 @@
 | **ONNX** | Open Neural Network Exchange | 开放神经网络交换格式。将 PyTorch/TensorFlow 训练的模型导出为标准中间格式（.onnx 文件），与训练框架解耦，可用 ONNX Runtime 在 C++ 中高效推理。本系统两处用到：降噪插件加载 DTLN（model_1/2.onnx）和 DeepFilterNet（enc/df_dec/erb_dec.onnx）；Phase 2 ML 噪声分类加载 PANNs/VGGish。两个原本是 Python 的降噪模型经此格式可在 C++ daemon 直接运行，无需 Python 运行时 |
 | **TFLite** | TensorFlow Lite | TensorFlow 的轻量推理引擎，面向移动/嵌入式。DTLN 仓库除 ONNX 外还导出了 `.tflite` 模型（含量化版 `model_quant_*.tflite`，体积更小、推理更快但精度略降）。作为 DTLN 的备选推理后端，资源受限场景可替代 ONNX Runtime |
 | **Rust libDF** | libDF (DeepFilterNet library) | DeepFilterNet 用 Rust 实现的原生推理库，封装了 STFT + 三子图协作 + ISTFT 全流程，对外暴露 `process_frame(input, output)` 高层 API，C++ 经 cbindgen 生成的 C 头调用。相比走 ONNX 自行编排三子图，libDF 性能更好、逻辑现成，但需 Rust 工具链或预编译库。本系统默认走 ONNX 路径统一后端，libDF 作为 DeepFilterNet 的备选优化路径 |
-| **OCA** | Open Control Architecture | AES70 标准定义的控制架构。通过 OCP.1 协议（TCP）远程读写设备对象的属性和方法，如 Fitcan 控制器控制本 daemon |
 | **SSE** | Server-Sent Events | 服务器发送事件，基于 HTTP 的服务器到客户端单向数据流推送。客户端通过 `EventSource` 建立 HTTP 长连接，服务器持续推送数据块。本系统用它实时推送噪声指标快照和降噪后 PCM 音频流到 Web UI，相比轮询更省资源，适合实时监测场景 |
 | **Sink / Source** | - | AES67 术语。Source = 发送端（Talker），向外发送 RTP 组播音频；Sink = 接收端（Listener），接收远端 RTP 音频。本系统对 Sink 接收的音频做噪声分析 |
 | **PESQ** | Perceptual Evaluation of Speech Quality | ITU-T P.862 定义的语音质量客观评估指标，范围 -0.5~4.5（映射到 MOS 主观评分）。需**有干净参考音**做对比，全段离线处理，**不适合实时**。本系统用于 A/B 对比实验阶段离线评估各降噪插件的语音质量（见降噪插件文档 §7.2） |
@@ -85,7 +84,7 @@ flowchart TB
         S2_D["NoiseDetector + Analyzer<br/>盲检测"]
         S2_S -->|RTP| S2_K
         S2_K --> S2_D
-        S2_D -->|噪声类型 + 量级| S2_UI["OCA 控制器 / Web UI<br/>实时显示噪声状况"]
+        S2_D -->|噪声类型 + 量级| S2_UI["Web UI<br/>实时显示噪声状况"]
     end
 
     subgraph 场景3["场景 3：实时降噪输出"]
@@ -129,7 +128,6 @@ flowchart TB
 本项目已具备：
 
 - **AES67 音频传输**：RTP 组播音频流，最多 64 路 Source/Sink，支持 L16/L24/AM824 编码，48kHz/96kHz 等采样率
-- **AES70/OCA 控制协议**：15 个 OCA 对象类，OcaAudioBridge 桥接接口，可通过 Fitcan 等标准控制器远程控制 Source/Sink 切换、采样率设置等
 - **Streamer 模块**：已实现从 ALSA 设备实时采集 PCM → AAC 编码 → HTTP 流式分发，可作为音频截取的参考实现
 - **噪声比对算法**：已有成熟的参考音比对 + 自适应滤波噪声估计算法（详见 `噪声比对监测实现说明.docx`），用于广播主备链路噪声检测
 
@@ -139,11 +137,11 @@ flowchart TB
 
 | # | 能力 | 说明 |
 |---|------|------|
-| R1 | AES70 控制器切换音频接收 | 通过 OCA 控制器选择 Sink 接收指定远端 AES67 Source |
+| R1 | 切换音频接收 | 通过 HTTP API 配置 Sink 接收指定远端 AES67 Source（复用既有 `/api/sink` 接口） |
 | R2 | 实时噪声检测 | 对接收音频实时分析，检测噪声存在、类型和量级 |
 | R3 | 噪声特征分析 | 频谱分析、噪声分类（白噪声/工频哼声/脉冲噪声等）、SNR 估算 |
 | R4 | 实时降噪处理 | 基于 RNNoise 神经网络降噪，输出干净音频 |
-| R5 | 噪声指标上报 | 通过 OCA 事件订阅和 HTTP API 暴露噪声指标 |
+| R5 | 噪声指标上报 | 通过 HTTP REST API（含 SSE 实时推送）暴露噪声指标 |
 | R6 | 参考音比对噪声检测 | 复用已有算法，对主备链路做参考音比对式噪声估计 |
 
 ### 1.2.1 并发能力指标
@@ -158,10 +156,11 @@ flowchart TB
 
 > 并发上限按"单帧 10ms 预算 / 单路开销 × 保守系数 0.7"估算，留余量给采集、聚合、IO。实际受 Sink 采样率、通道数、CPU 主频影响。多 Sink 按路分核并行（见 §6.2 风险 6）。
 >
-> 系统硬限制：受 OCA NoiseSensor 对象上限与 AES67 Sink 上限（64）双重约束，**默认软上限 16 路**，可通过配置 `noise_max_sensors` 调整。超出时拒绝新建传感器并告警，避免 CPU 过载导致音频 xrun。
+> 系统硬限制：受 AES67 Sink 上限（64）约束，**默认软上限 16 路**（CPU 预算约束，见上表），可通过配置 `noise_max_sensors` 调整。超出时拒绝新建传感器并告警，避免 CPU 过载导致音频 xrun。
 
 ### 1.3 非目标（初版不含）
 
+- 扩展 AES70/OCA 控制协议（噪声参数设置与结果上报统一走 HTTP REST API，不新增 OCA 对象）
 - 噪声样本数据集训练与匹配（Phase 2）
 - 降噪后音频回注 ALSA 播放（需改驱动层，Phase 2）
 - 多节点分布式噪声监测（Phase 3）
@@ -179,10 +178,9 @@ flowchart TB
         ALSA["ALSA RAVENNA 驱动"]
     end
 
-    subgraph OCA["AES70/OCA 控制层"]
-        CTRL["OCA 控制器<br/>(Fitcan 等)"]
-        OCA_OBJ["OCA 对象树<br/>+ NoiseManager"]
-        BRIDGE["OcaAudioBridge"]
+    subgraph CORE["daemon 核心"]
+        SM["SessionManager<br/>Sink 配置 + PCM 提供"]
+        BRIDGE["NoiseAudioBridge<br/>纯虚桥接接口"]
     end
 
     subgraph NOISE["噪声分析与降噪模块"]
@@ -194,16 +192,14 @@ flowchart TB
         MET["NoiseMetrics<br/>指标聚合"]
     end
 
-    subgraph API["暴露层"]
+    subgraph API["暴露层 (HTTP)"]
         HTTP["HTTP REST API<br/>/api/noise/*"]
-        OCA_EVT["OCA 事件订阅<br/>NoiseLevelChanged"]
+        SSE["HTTP SSE 推送<br/>噪声指标 + 告警"]
     end
 
     RTP --> ALSA
-    CTRL -->|OCP.1| OCA_OBJ
-    OCA_OBJ --> BRIDGE
-    BRIDGE -->|Sink 选择| CAP
-    ALSA -->|PCM 帧| CAP
+    SM --> BRIDGE
+    BRIDGE -->|PCM 帧| CAP
     CAP --> DET
     CAP --> ANA
     CAP --> DNR
@@ -212,7 +208,7 @@ flowchart TB
     ANA --> MET
     REF --> MET
     MET --> HTTP
-    MET --> OCA_EVT
+    MET --> SSE
     DNR -->|降噪 PCM| HTTP
 ```
 
@@ -224,7 +220,7 @@ flowchart TB
 | **桥接解耦** | 噪声模块经纯虚接口 `NoiseAudioBridge` 接入 daemon 核心，不直接依赖 SessionManager/Config |
 | **帧式处理** | 所有分析/降噪以固定帧长（RNNoise = 480 样本 @48kHz = 10ms）为处理单元，保证实时性 |
 | **零拷贝优先** | 音频截取尽量共享缓冲区，避免额外内存拷贝 |
-| **OCA 可控** | 噪声检测/降噪的启停、参数调整均通过 OCA 对象属性暴露，可被标准控制器操作 |
+| **HTTP 可控** | 噪声检测/降噪的启停、参数调整均通过 HTTP REST API 暴露，供 Web UI 或外部脚本操作 |
 
 ---
 
@@ -421,7 +417,7 @@ output = dry_wet × denoised + (1 - dry_wet) × input
 
 `dry_wet = 0` 旁通原音，`1` 全降噪，中间值保留部分环境感（适合音乐场景）。
 
-**运行时切换（准热切换）**：通过 OCA/HTTP 指定插件名，`DenoiseProcessor` 用原子指针交换切换插件（无锁、无 UAF），切换后静音一个冷启动窗口（约 50-90ms，按新插件算法延迟 + 收敛余量取值）让新插件填满内部缓冲与状态再开声。不做新旧并行 crossfade--代价是切换瞬间短暂静音，收益是实现简单、CPU 不翻倍，适合噪声监测主用途。切换后上报新 `algorithmic_latency_samples()` 供下游补偿延迟跳变。详细设计与时序见插件架构文档 §4.2。各插件特有参数（如 DeepFilterNet 的 `postfilter`）经通用 `set_param()` 键值表传入，不污染公共接口。
+**运行时切换（准热切换）**：通过 HTTP 指定插件名，`DenoiseProcessor` 用原子指针交换切换插件（无锁、无 UAF），切换后静音一个冷启动窗口（约 50-90ms，按新插件算法延迟 + 收敛余量取值）让新插件填满内部缓冲与状态再开声。不做新旧并行 crossfade--代价是切换瞬间短暂静音，收益是实现简单、CPU 不翻倍，适合噪声监测主用途。切换后上报新 `algorithmic_latency_samples()` 供下游补偿延迟跳变。详细设计与时序见插件架构文档 §4.2。各插件特有参数（如 DeepFilterNet 的 `postfilter`）经通用 `set_param()` 键值表传入，不污染公共接口。
 
 ### 3.5 RefComparator — 参考音比对噪声检测
 
@@ -466,7 +462,7 @@ private:
 
 ### 3.6 NoiseMetrics — 指标聚合
 
-**职责**：聚合各模块输出，维护时间序列，触发告警和 OCA 事件。
+**职责**：聚合各模块输出，维护时间序列，触发告警并通过 HTTP SSE 推送。
 
 **指标集**：
 
@@ -511,64 +507,11 @@ struct NoiseMetricsSnapshot {
 
 ---
 
-## 4. OCA 集成设计
+## 4. daemon 核心桥接
 
-### 4.1 新增 OCA 对象
+噪声模块不直接依赖 `SessionManager`/`Config` 等 daemon 核心类，经纯虚接口 `NoiseAudioBridge` 接入，保证模块可独立编译与单元测试（`WITH_NOISE` 关闭时 daemon 行为零变化）。实现位于 daemon 根目录 `noise_session_manager_bridge.hpp/cpp`，桥接 `SessionManager` 的 Sink PCM 与状态查询。
 
-在现有 OCA 对象树中新增 `OcaNoiseManager` 和 `OcaNoiseSensor`：
-
-```mermaid
-flowchart TB
-    ROOT["OcaRoot"] --> AGENT["OcaAgent"]
-    AGENT --> DM["OcaDeviceManager"]
-    DM --> SUB["OcaSubscriptionManager"]
-    DM --> NET["OcaNetworkManager"]
-    DM --> MTN["OcaMediaTransportNetwork"]
-    MTN --> MTN67["OcaMediaTransportNetworkAES67"]
-    DM --> NOISE_MGR["OcaNoiseManager<br/>⚡ 新增"]
-    NOISE_MGR --> SENSOR1["OcaNoiseSensor[0]<br/>⚡ 新增"]
-    NOISE_MGR --> SENSOR2["OcaNoiseSensor[1]<br/>⚡ 新增"]
-    NOISE_MGR --> SENSOR_N["OcaNoiseSensor[N]<br/>⚡ 新增"]
-```
-
-### 4.2 OcaNoiseManager
-
-| 属性 | 类型 | 说明 |
-|------|------|------|
-| NoiseSensors | OcaLiteList\<OcaNoiseSensor\> | 噪声传感器列表 |
-| GlobalEnable | OcaBoolean | 全局噪声检测开关 |
-| DefaultSensitivity | OcaFloat32 | 默认检测灵敏度 |
-
-| 方法 | 说明 |
-|------|------|
-| AddSensor(sinkId) | 为指定 Sink 添加噪声传感器 |
-| RemoveSensor(sensorId) | 移除噪声传感器 |
-| GetSensor(sensorId) | 获取传感器对象 |
-
-### 4.3 OcaNoiseSensor
-
-每个 NoiseSensor 绑定一个 Sink，持续监测该 Sink 接收音频的噪声状况。
-
-| 属性 | 类型 | 可写 | 说明 |
-|------|------|------|------|
-| SinkId | OcaUint8 | 否 | 绑定的 Sink ID |
-| Enabled | OcaBoolean | 是 | 传感器启停 |
-| NoiseLevel | OcaFloat32 | 否 | 当前噪声级 (dBFS) |
-| NoiseType | OcaUint8 | 否 | 噪声类型枚举 |
-| EstimatedSNR | OcaFloat32 | 否 | 估算 SNR (dB) |
-| DenoiseEnabled | OcaBoolean | 是 | 降噪开关 |
-| DenoiseLevel | OcaFloat32 | 是 | 降噪强度 [0, 1] |
-| NoiseReduction | OcaFloat32 | 否 | 降噪量 (dB) |
-| AlertThreshold | OcaFloat32 | 是 | 告警阈值 (dBFS) |
-| RefSourceId | OcaUint8 | 是 | 参考音 Sink ID（0xFF = 无参考比对） |
-
-| 事件 | 说明 |
-|------|------|
-| NoiseLevelChanged | 噪声级变化通知（可设订阅阈值） |
-| NoiseAlert | 噪声超阈值告警 |
-| NoiseTypeChanged | 噪声类型变化 |
-
-### 4.4 NoiseAudioBridge
+### 4.1 NoiseAudioBridge
 
 噪声模块与 daemon 核心的桥接接口：
 
@@ -656,7 +599,6 @@ flowchart LR
 
     subgraph 输出["输出"]
         METRICS["指标聚合<br/>+ 告警判断"]
-        OCA_NTF["OCA 事件通知"]
         HTTP_SSE["HTTP SSE 推送"]
         PCM_OUT["降噪 PCM 流"]
     end
@@ -670,7 +612,6 @@ flowchart LR
     FFT --> METRICS
     RNN --> METRICS
     RNN --> PCM_OUT
-    METRICS --> OCA_NTF
     METRICS --> HTTP_SSE
 ```
 
@@ -716,9 +657,6 @@ daemon/
 │   ├── noise_metrics.hpp/cpp       # 指标聚合与告警
 │   ├── noise_audio_bridge.hpp      # 桥接纯虚接口
 │   ├── noise_manager.hpp/cpp       # 模块总管（生命周期 + 配置）
-│   ├── oca/                        # OCA 对象
-│   │   ├── noise_manager.hpp/cpp   # OcaNoiseManager
-│   │   └── noise_sensor.hpp/cpp    # OcaNoiseSensor
 │   └── tests/                      # 模块测试
 │       ├── noise_test.cpp          # Boost.Test 套件
 │       └── test_data/              # 测试音频文件
@@ -759,15 +697,20 @@ endif()
 
 ### 8.3 构建验证
 
-```bash
-# 无硬件构建（噪声模块开启）
-cmake -DFAKE_DRIVER=ON -DWITH_OCA=ON -DWITH_NOISE=ON ..
-make -j$(nproc)
+噪声模块的编译验证统一使用 `noise-dev.sh`（out-of-source 构建到 `daemon/build/`，导出 `compile_commands.json` 供 clangd，详见 `.claude/rules/build.md`）。脚本封装 FAKE_DRIVER=ON + WITH_AVAHI=ON + WITH_STREAMER=OFF、不传 WITH_OCA（本分支不接入 OCA）。
 
-# 无硬件构建（噪声模块关闭，行为不变）
-cmake -DFAKE_DRIVER=ON -DWITH_OCA=ON ..
-make -j$(nproc)
+```bash
+# 无硬件构建（开发/验证主路径）
+./noise-dev.sh build            # 构建 daemon（FAKE_DRIVER，仅 HTTP 控制平面）
+./noise-dev.sh run -i ens160    # 生成临时配置并后台启动，mDNS 发布到 LAN
+./noise-dev.sh status           # 查看运行状态
+./noise-dev.sh stop             # 停止后台 daemon
+./noise-dev.sh clean            # 温和清理（仅删构建产物，保留子模块）
 ```
+
+> **WITH_NOISE 接入说明**：`WITH_NOISE` 选项与 `add_subdirectory(noise)` 属于 Phase 1 落地内容，当前 `noise-dev.sh` 尚未传该参数（模块代码未实现）。Phase 1 在 `daemon/CMakeLists.txt` 增加 §8.2 的 option 后，同步在 `noise-dev.sh` build 流程中加上 `-DWITH_NOISE=ON`，使 `./noise-dev.sh build` 默认开启噪声模块。关闭模块（恢复 daemon 默认行为）时用 `cmake -DFAKE_DRIVER=ON -DWITH_NOISE=OFF ..` 手动构建，或临时改脚本开关。
+
+真实音频硬件验证改用 `./noise-dev.sh build --real`（构建真实驱动二进制 + LKM）+ `./noise-dev.sh run-real -i <iface>`（加载模块 + ptp4l + daemon 整体验证），委托 `noise-daemonctl.sh`。
 
 ---
 
@@ -828,14 +771,14 @@ make -j$(nproc)
 
 ### Phase 2 — 完整功能
 
-**目标**：噪声分类 + 参考比对 + OCA 对象 + 告警
+**目标**：噪声分类 + 参考比对 + 告警 + HTTP SSE 实时推送
 
 | 步骤 | 内容 |
 |------|------|
 | 2.1 | NoiseAnalyzer：频谱分析 + 噪声分类 |
 | 2.2 | RefComparator：参考音比对噪声检测 |
-| 2.3 | OcaNoiseManager + OcaNoiseSensor 对象 |
-| 2.4 | OCA 事件订阅（NoiseLevelChanged, NoiseAlert） |
+| 2.3 | 噪声传感器 HTTP 配置 API（PUT/DELETE /api/noise/sensor/:id） |
+| 2.4 | HTTP SSE 实时推送噪声指标与告警 |
 | 2.5 | 告警规则引擎 + HTTP SSE 推送 |
 
 ### Phase 3 — 生产增强
@@ -860,9 +803,8 @@ make -j$(nproc)
 | 2 | ALSA PCM 截取与 Streamer 共享设备，可能冲突 | 无法同时运行 Streamer 和 NoiseCapture | 方案 A：共享 ALSA buffer；方案 B：从 RTP 层截取（绕过 ALSA） |
 | 3 | WebRTC VAD 源码提取和许可合规 | 需从 Chromium 树提取，BSD 许可需标注 | 使用独立提取版本（如 `webrtc-vad` C 封装） |
 | 4 | 参考比对算法的 C++ 实现量 | 已有算法为成熟产品代码，可能需重新实现 | 评估是否可直接移植，或先以简化版实现 |
-| 5 | OCA NoiseSensor 对象的 ClassID 分配 | 需确保不与未来 AES70 标准冲突 | 使用厂商扩展范围（ClassID > 1.3.x 厂商段） |
-| 6 | 多 Sink 并行处理的 CPU 占用 | 每增加 1 Sink，RNNoise + FFT + VAD 增加约 5% CPU（单核） | 限制最大并行数；考虑线程池 |
-| 7 | RNNoise 对非语音音频（音乐）的降噪效果 | RNNoise 训练数据以语音为主，对音乐可能过度抑制 | 提供降噪强度参数；音乐场景建议仅检测不降噪 |
+| 5 | 多 Sink 并行处理的 CPU 占用 | 每增加 1 Sink，RNNoise + FFT + VAD 增加约 5% CPU（单核） | 限制最大并行数；考虑线程池 |
+| 6 | RNNoise 对非语音音频（音乐）的降噪效果 | RNNoise 训练数据以语音为主，对音乐可能过度抑制 | 提供降噪强度参数；音乐场景建议仅检测不降噪 |
 
 ---
 

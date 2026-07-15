@@ -221,7 +221,7 @@ struct NoiseEmbedding {
 
 | 操作 | 说明 |
 |------|------|
-| 录入 | 通过 HTTP API 或 OCA 方法上传噪声示例 WAV → 自动提取特征 → 存入模板库 |
+| 录入 | 通过 HTTP API 上传噪声示例 WAV → 自动提取特征 → 存入模板库 |
 | 标注 | 每个模板带 label（噪声类型名）+ description + 录入时间 |
 | 删除 | 通过 label 或 ID 删除模板 |
 | 导出/导入 | 模板库序列化为 JSON/二进制，支持跨设备共享 |

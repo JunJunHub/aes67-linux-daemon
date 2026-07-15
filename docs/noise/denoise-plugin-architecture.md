@@ -483,7 +483,7 @@ endif()
 
 ### 4.2 运行时切换（准热切换）
 
-通过 OCA/HTTP 指定插件名，`DenoiseProcessor` 切换活动插件。采用**准热切换**方案：原子指针交换保证线程安全，切换瞬间静音一个冷启动窗口，不追求无缝过渡。
+通过 HTTP 指定插件名，`DenoiseProcessor` 切换活动插件。采用**准热切换**方案：原子指针交换保证线程安全，切换瞬间静音一个冷启动窗口，不追求无缝过渡。
 
 **设计要点**：
 
@@ -636,17 +636,19 @@ flowchart LR
 
 ---
 
-## 6. OCA 与 HTTP 暴露
+## 6. HTTP 暴露
 
-### 6.1 OcaNoiseSensor 新增属性
+降噪相关配置统一通过 HTTP REST API 暴露，不扩展 OCA 对象。各传感器（`/api/noise/sensor/:id`）的降噪配置字段如下：
 
-| 属性 | 类型 | 说明 |
+### 6.1 降噪配置 HTTP 参数
+
+| 字段 | 类型 | 说明 |
 |------|------|------|
-| DenoisePlugin | OcaString | 当前插件名（`rnnoise`/`dtln`/`deepfilternet`） |
-| AvailablePlugins | OcaLiteList\<OcaString\> | 编译期可用的插件列表 |
-| DenoiseDryWet | OcaFloat32 | 干湿比 [0,1] |
-| DenoiseLatencyMs | OcaFloat32 | 当前插件算法延迟（只读） |
-| PluginParams | OcaMap\<OcaString,OcaString\> | 插件特有参数键值表 |
+| denoise_plugin | string | 当前插件名（`rnnoise`/`dtln`/`deepfilternet`） |
+| available_plugins | string[] | 编译期可用的插件列表（只读） |
+| denoise_dry_wet | float | 干湿比 [0,1] |
+| denoise_latency_ms | float | 当前插件算法延迟（只读） |
+| plugin_params | map\<string,string\> | 插件特有参数键值表 |
 
 ### 6.2 HTTP API
 

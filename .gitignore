@@ -1,0 +1,142 @@
+# Build output
+build/
+build-*/
+build_test/
+build_review/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Clangd cache
+.cache/
+compile_commands.json
+
+# Qt specific
+*.autogen/
+*_autogen/
+mocs_compilation.cpp
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile*
+CMP*.cmake
+CTestTestfile.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+install_manifest.txt
+
+# Qt deployment
+*.prl
+*.pc
+
+# Qt Creator
+.qtcreator/
+*.creator
+*.creator.user
+*.files
+*.includes
+CMakeLists.txt.user
+CMakeLists.txt.user.*
+*.user
+*.user.*
+
+# Debug
+Debug/
+debug/
+*.pro.user
+*.pro.user.*
+
+# Release
+Release/
+release/
+RelWithDebInfo/
+MinSizeRel/
+
+# Reference
+#reference/
+
+# Distribution packages (generated)
+dist/
+*.deb
+*.rpm
+*.tar.gz
+*.tar.bz2
+*.zip
+
+# IDE
+.vs/
+.idea/
+.vscode/
+.obsidian/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+# 只提交共享规则和团队 skills；其他 .claude 本地配置继续忽略。
+CLAUDE.md
+.claude/*
+!.claude/rules/
+!.claude/rules/*.md
+# !.claude/skills/
+# !.claude/skills/README.md
+# !.claude/skills/*/
+# !.claude/skills/*/SKILL.md
+# worktree 固定目录：所有 worktree 统一放此路径下（.claude/* 已覆盖忽略）
+.claude/worktrees/
+# .superpowers/
+# 旧 worktree 目录，禁止使用
+.worktrees/
+
+# Agent
+AGENTS.md
+.agents/*
+# !.agents/rules
+# !.agents/rules/
+# !.agents/rules/*.md
+# !.agents/skills
+# !.agents/skills/
+# !.agents/skills/README.md
+# !.agents/skills/*/
+# !.agents/skills/*/SKILL.md
+
+
+# Codex
+.codex/*
+
+
+# Daemon run test
+status.json
+MergingRavennaALSA.mod
+
+# Logs
+*.log
+logs/
+
+# OCA build artifacts (in-source 构建遗留的二进制,out-of-source 构建产物在 build/)
+daemon/oca-probe
+daemon/tests/oca-test
+
+# OCA 抓包产物(.pcap 体积大且可重抓,仅保留解析工具源码)
+captures/
+daemon/oca/tools/__pycache__/
+
+
+# Packaging temp files
+packaging/temp/
+packaging/output/
+
+
+# AES70 docs
+docs/AES70-2023

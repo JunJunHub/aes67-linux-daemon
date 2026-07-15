@@ -1,0 +1,11 @@
+CompileFlags:
+  # 显式将编译数据库钉在当前工作区的 build/ 目录,路径相对本文件所在目录解析。
+  # 避免在 worktree 中因根目录符号链接缺失而向上回退到主工作区的 compile_commands.json,
+  # 导致 clangd 给出主工作区的错误诊断。每个 worktree 各自的 .clangd 命中各自的 build/。
+  CompilationDatabase: build
+  Add:
+    - "-std=c++17"
+    - "-DQT_DISABLE_DEPRECATED_BEFORE=0x050F00"
+
+Index:
+  Background: Build

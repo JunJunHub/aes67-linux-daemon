@@ -614,7 +614,7 @@ mDNS 验证需 `WITH_AVAHI=ON`（需 avahi 开发包）。
 | Spec2 阶段三（**5/5**） | CM3 对象补齐 + GetMembersRecursive + Worker 分派 | oca-test 26/26，test4 **Passed** | `f3d7f3e`..`51f737d` |
 | Spec3 | OcaAgent/AppNet 中间类 + Worker 方法补齐 | oca-test 31/31，test5 改善 | `c42239b`..`88e8b1c` |
 | Spec4 | PropertyChanged 发射点接入 + 端到端投递验证 | oca-test 34/34,oca-probe PC 段 [OK] | `42eb83c`..`2c2dc31` |
-| Spec5 | 媒体桥接:OcaAudioBridge + 3 媒体类 + Network 现实化 + mDNS TXT | oca-test 39/39 | `d61385f`..`d3a2a77` + 审查修复 `1eb6b5b`..`fa33b5a` |
+| Spec5 | 媒体桥接:OcaAudioBridge + 3 媒体类 + Network 现实化 + mDNS TXT + Fitcan 兼容 | oca-test 39/39,合规 5/5 | `d61385f`..`d3a2a77` + 审查修复 `1eb6b5b`..`fa33b5a` + 回归修复 `f3ecbdf` |
 
 ### 合规工具验收（Aes70CompliancyTestTool v2.0.1 AES70-2018）
 
@@ -623,10 +623,10 @@ mDNS 验证需 `WITH_AVAHI=ON`（需 avahi 开发包）。
 | 1 | OCA Service Discovery | ✅ Passed |
 | 2 | OCP.1 device reset mechanism | ✅ Passed |
 | 3 | OCP.1 KeepAlive mechanism | ✅ Passed |
-| 4 | Minimum object compliancy test | ❌ **Failed**（Spec5 回归，见下注，已修复待重验） |
-| 5 | OCC Object Compliancy Tests | ❌ **Failed**（Spec5 回归，见下注，已修复待重验） |
+| 4 | Minimum object compliancy test | ✅ **Passed**（Spec5 回归已修复，2026-07-14 重验通过） |
+| 5 | OCC Object Compliancy Tests | ✅ **Passed**（Spec5 回归已修复，2026-07-14 重验通过） |
 
-> **Spec5 合规回归（2026-07-14 重验发现，已修复待重验）**：Spec3 终态为 5/5 COMPLIANT；Spec5 新增 OcaMediaClockManager(7)+OcaMediaClock(8194) 后，2026-07-14 重跑合规工具跌至 3/5，test4+test5 Failed。根因两处：(1) OcaMediaClockManager 强制方法 GetMediaClockTypesSupported 返 NotImplemented(8)；(2) OcaMediaClock(8194) 废弃存根的强制方法 GetType/GetSupportedRates/GetRate/GetLockState 全返 NI。合规工具对 mandatory 方法判 result!=8 才过，NI 即 must implement 失败——Spec5 设计文档原假设「返回 NI 可过」被证伪。**修复**：GetMediaClockTypesSupported 改返空 List；移除 OcaMediaClock(8194) 废弃存根（弃用类、Spec5 前即 5/5 证明非 mandatory、零功能）。oca-test 39/39 绿。重跑合规工具预期恢复 5/5。
+> **Spec5 合规回归（2026-07-14 发现，已修复并重验通过）**：Spec3 终态为 5/5 COMPLIANT；Spec5 新增 OcaMediaClockManager(7)+OcaMediaClock(8194) 后，2026-07-14 重跑合规工具跌至 3/5，test4+test5 Failed。根因两处：(1) OcaMediaClockManager 强制方法 GetMediaClockTypesSupported 返 NotImplemented(8)；(2) OcaMediaClock(8194) 废弃存根的强制方法 GetType/GetSupportedRates/GetRate/GetLockState 全返 NI。合规工具对 mandatory 方法判 result!=8 才过，NI 即 must implement 失败--Spec5 设计文档原假设「返回 NI 可过」被证伪。**修复**：GetMediaClockTypesSupported 改返空 List；移除 OcaMediaClock(8194) 废弃存根（弃用类、Spec5 前即 5/5 证明非 mandatory、零功能）。**2026-07-14 17:08 重验**：5/5 全通过，device COMPLIANT to AES70-2018（GetMembersRecursive nr members=8，移除 OcaMediaClock 后符合）。验证结果存 `captures/2026-07-14-17-08-Daemon 10acc601-TestResult.txt`。
 
 ### Spec2 阶段三四轮迭代
 
@@ -648,7 +648,7 @@ mDNS 验证需 `WITH_AVAHI=ON`（需 avahi 开发包）。
 
 ### Spec3：test5 OCC Object Compliancy
 
-> Spec3 编码已完成（OcaAgent defLevel-2 方法已实装，见对象模型 L2 > OcaAgent/OcaNetwork）；本节保留为 test5 重验待办，重验结果见上方合规表「待重验」注。
+> Spec3 编码已完成（OcaAgent defLevel-2 方法已实装，见对象模型 L2 > OcaAgent/OcaNetwork）。test5 OCC Object Compliancy 已于 2026-07-14 17:08 重验通过（5/5 COMPLIANT）。本节保留作为 test5 历史背景与扩展路径参考。
 
 test5 对所有已报告对象检查全部类层次的方法，比 test4 更严格。当前失败原因：OcaAgent{1,2} 的 GetLabel/SetLabel/GetOwner/GetPath 在 ONo 4097 返回 BadMethod(11)。这些方法 2018 非 mandatory，但 OCC test5 更严格地检查。
 
@@ -903,6 +903,6 @@ daemon 实际发布的 TXT（`mdns_publisher.cpp`，Fitcan 私有名）：
 - ocac 参考实现（C99，2018）：`/home/Share/GitHub/ocac`，方法索引来源（注意其 ClassID 用 {1,3,x}，与本项目 Manager 类一致但 Worker/Network 类不同）
 - OCAMicro 参考实现（C++）：defLevel==fieldCount 规则来源、方法索引来源
 - Fork 维护规范：`.claude/rules/fork-maintenance.md`
-- 验证基线：oca-test 39/39（Spec5 + Spec5 审查修复终态,移除 OcaMediaClock 废弃存根测试）、Aes70CompliancyTestTool v2.0.1 AES70-2018 **3/5**（2026-07-14 Spec5 回归,修复后待重验恢复 5/5）
+- 验证基线：oca-test 39/39（Spec5 + Spec5 审查修复终态,移除 OcaMediaClock 废弃存根测试）、Aes70CompliancyTestTool v2.0.1 AES70-2018 **5/5 COMPLIANT**（2026-07-14 17:08 重验通过,Spec5 回归已修复）
 - 抓包工具链：tcpdump 旁路 + `daemon/oca/tools/oca-parse-pcap.py`（零依赖）
 - daemon 构建路径注意：`oca-dev.sh` 用 out-of-source `daemon/build/` 二进制

@@ -93,11 +93,11 @@ CLAUDE.md
 # !.claude/skills/README.md
 # !.claude/skills/*/
 # !.claude/skills/*/SKILL.md
-# # worktree 固定目录（.claude/* 已覆盖，显式列出以与 git-workflow 规则文本一致）
-# .claude/worktrees/
+# worktree 固定目录：所有 worktree 统一放此路径下（.claude/* 已覆盖忽略）
+.claude/worktrees/
 # .superpowers/
-# # 旧 worktree 目录，禁止使用（见 .claude/rules/git-workflow.md）
-# .worktrees/
+# 旧 worktree 目录，禁止使用
+.worktrees/
 
 # Agent
 AGENTS.md

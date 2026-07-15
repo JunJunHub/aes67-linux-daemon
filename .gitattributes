@@ -1,0 +1,32 @@
+# 自动处理行结束符
+* text=auto
+
+# C/C++/Qt 源文件统一使用 LF
+*.h text eol=lf
+*.cpp text eol=lf
+*.c text eol=lf
+
+
+# CMake
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+
+# Qt 资源文件
+*.qrc text eol=lf
+
+
+# 脚本文件
+# Windows 专属脚本：强制保留 CRLF 和 UTF-8 with BOM
+*.bat     text eol=crlf
+*.cmd     text eol=crlf
+*.ps1     text eol=crlf working-tree-encoding=UTF-8-BOM
+
+# Unix 脚本：强制转换为 LF
+*.sh      text eol=lf
+*.py      text eol=lf
+*.js      text eol=lf
+
+# 通用文本文件：仓库内统一为 LF（避免跨平台差异）
+*.md      text eol=lf
+*.txt     text eol=lf
+*.json    text eol=lf

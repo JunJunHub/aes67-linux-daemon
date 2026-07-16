@@ -88,6 +88,7 @@ bool OcaServer::start() {
     txt.ip_addr = cfg_.ip_addr;
     txt.ip_addr_sec = cfg_.ip_addr_sec;
     txt.mac_addr = cfg_.mac_addr;
+    txt.mac_addr_sec = cfg_.mac_addr_sec;
     txt.firmware = cfg_.daemon_version;
     mdns_ = std::make_unique<MdnsPublisher>(
         cfg_.device_name.empty() ? cfg_.node_id : cfg_.device_name,

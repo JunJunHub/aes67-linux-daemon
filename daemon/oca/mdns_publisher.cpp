@@ -73,13 +73,16 @@ void MdnsPublisher::create_service(struct AvahiClient* c) {
   txt = avahi_string_list_add_pair(txt, "txtvers", "1");
   txt = avahi_string_list_add_pair(txt, "protovers", "1");
   // Fitcan 私有 key:主接口(IP_P/MAC_P)为必需/建议,备接口(IP_S/MAC_S)
-  // 单接口可省(硬过滤是 &&,IP_P 有值即过)。
+  // 单接口可省(硬过滤是 &&,IP_P 有值即过)。ST-2022-7 双网卡时备接口
+  // IP_S/MAC_S 必须同时发,否则 Fitcan 控制器只显示主链路连接信息。
   if (!txt_.ip_addr.empty())
     txt = avahi_string_list_add_pair(txt, "IP_P", txt_.ip_addr.c_str());
   if (!txt_.ip_addr_sec.empty())
     txt = avahi_string_list_add_pair(txt, "IP_S", txt_.ip_addr_sec.c_str());
   if (!txt_.mac_addr.empty())
     txt = avahi_string_list_add_pair(txt, "MAC_P", txt_.mac_addr.c_str());
+  if (!txt_.mac_addr_sec.empty())
+    txt = avahi_string_list_add_pair(txt, "MAC_S", txt_.mac_addr_sec.c_str());
   // ServicePortNo:Fitcan 仅作信息字段(控制连接实际用 SRV 记录端口);
   // 与 port_ 一致以保持可读性。
   txt = avahi_string_list_add_pair(txt, "ServicePortNo",

@@ -32,6 +32,7 @@ struct OcaServerConfig {
   std::string ip_addr;
   std::string ip_addr_sec;
   std::string mac_addr;
+  std::string mac_addr_sec;  // ST-2022-7 备接口 MAC(-> mDNS TXT MAC_S)
 };
 
 class OcaServer {

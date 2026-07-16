@@ -229,6 +229,15 @@ int main(int argc, char* argv[]) {
         // Spec5:设备元数据(mDNS TXT + OcaNetwork 现实化)
         ocacfg.ip_addr = config->get_ip_addr_str();
         ocacfg.mac_addr = config->get_mac_addr_str();
+        // ST-2022-7 双网卡:备接口 IP/MAC 填入 mDNS TXT 的 IP_S/MAC_S,
+        // 供 Fitcan 控制器显示第二链路连接信息。单网卡时
+        // get_interface_name(1) 返回空,ip_addr_sec/mac_addr_sec 留空,
+        // mdns_publisher 仅发主接口 IP_P/MAC_P(与既有单接口行为一致)。
+        const std::string& sec_iface = config->get_interface_name(1);
+        if (!sec_iface.empty()) {
+          ocacfg.ip_addr_sec = get_interface_ip(sec_iface).second;
+          ocacfg.mac_addr_sec = get_interface_mac(sec_iface).second;
+        }
         oca_server = std::make_unique<oca::OcaServer>(ocacfg, oca_bridge.get());
         if (!oca_server->start()) {
           throw std::runtime_error(std::string("OcaServer:: start failed"));

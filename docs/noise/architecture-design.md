@@ -1347,13 +1347,13 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ### Phase 1 — 最小可用（MVP）
 
-**目标**：单 Sink 噪声检测 + RNNoise 降噪 + HTTP API
+**目标**：多 Sink 噪声检测 + RNNoise 降噪 + HTTP API（单 capture 线程逐帧处理，并发数受 CPU 约束，见 §1.2.1）
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
 | 1.1 | NoiseSessionManagerBridge：独占 ALSA capture + FrameProvider 分发 | 单元测试：帧回调触发 |
 | 1.2 | Streamer 重构：从 Bridge 拿帧，删除 snd_pcm_open/readi | 回归测试：AAC 流功能不变 |
-| 1.3 | NoiseManager（单 sensor 上下文）+ AudioCapture：从 Bridge FrameProvider 接收帧，按 sink_id 路由分发到该 sensor 的处理组件 | 单元测试：帧回调触发 |
+| 1.3 | NoiseManager（多 sensor map + per-sensor 生命周期）+ AudioCapture：从 Bridge FrameProvider 接收帧，按 sink_id 路由分发到对应 sensor 的处理组件 | 单元测试：帧回调触发；多 sensor 路由 |
 | 1.4 | NoiseDetector：WebRTC VAD + 频谱平坦度 | 单元测试：白噪声/语音/静音 |
 | 1.5 | DenoiseProcessor：RNNoise 集成 + 三路输出（原始/降噪/噪声） | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪 |
 | 1.6 | NoiseMetrics：指标聚合 + HTTP API | 集成测试：API 响应 |
@@ -1401,7 +1401,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 7 | Streamer 重构回归风险 | 删除 ALSA capture 逻辑改为从 PcmCaptureService 拿帧，可能引入回归 | Phase 1 步骤 1.2 专做 Streamer 重构 + 回归测试 |
 | ~~8~~ | ~~WITH_NOISE=OFF 时 Streamer 如何获取 PCM 帧~~ | ~~PCM 分发基础设施不能只在 noise 模块里~~ | **已解决**：PcmCaptureService 独立于 noise 模块，编译条件 `WITH_STREAMER=ON ∨ WITH_NOISE=ON`。详见 §4.3 |
 | 9 | PcmCaptureService 帧回调内联执行，慢消费者阻塞全局 | 任一 FrameProvider 回调阻塞（如 Streamer 文件 I/O）会拖慢整个 capture 线程，导致 ALSA xrun | Phase 1 帧回调必须快速返回（只做内存拷贝 + 环形缓冲写入），重操作（AAC 编码、文件写入）延后到消费者自身线程 |
-| 10 | Phase 1 多 Sink 帧处理为顺序执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无并行。§1.2.1 的"≥8 路"基于顺序处理的保守估计 | Phase 1 顺序处理，文档如实标注；Phase 3 步骤 3.5 引入 per-sink 线程池做真正并行 |
+| 10 | Phase 1 多 Sink 帧处理在单 capture 线程内逐帧执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无 per-sink 并行。§1.2.1 的"≥8 路"基于单线程逐帧处理的保守估计 | Phase 1 单线程逐帧处理（各 Sink 交替处理，非串行等待）；Phase 3 步骤 3.5 引入 per-sink 线程池做真正并行 |
 | 11 | RT 路径同步原语非无锁 | `std::atomic_load/store(shared_ptr)`（C++17 废弃自由函数）内部用自旋锁，每帧调用致优先级反转/xrun；旧插件析构（ONNX teardown）若在 RT 线程触发同样致 xrun | **不采用** `atomic_load/store(shared_ptr)`。DenoiseProcessor / NoiseManager 统一用 `RcuPtr<T>`：`atomic<T*>` 原子发布 + period 顶部 pin（整 period 复用，不每帧原子操作）+ retire 队列延迟回收（旧插件析构由控制线程 housekeeper 在静止点后完成，绝不在 RT 线程）。`SensorContext` 用 `shared_ptr` 成员使 sensor 表 COW 廉价共享。详见 §3.7 帧回调线程安全 / 降噪插件文档 §4.2 |
 | 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐；或注册两路回调后在同一 process 调用中匹配 |
 

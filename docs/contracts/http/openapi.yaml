@@ -1388,6 +1388,15 @@ components:
           type: integer
           description: Streamer 播放器缓冲文件数
           example: 1
+        noise_max_sensors:
+          type: integer
+          description: |
+            噪声传感器软上限（默认 16）。超出时拒绝新建传感器并返回 400。
+            硬限制受 AES67 Sink 上限（64）约束。仅在 WITH_NOISE=ON 编译时有效。
+          default: 16
+          minimum: 1
+          maximum: 64
+          example: 16
 
     # ──────────────────────────────────────────
     # PTP

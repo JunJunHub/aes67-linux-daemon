@@ -384,20 +384,23 @@ paths:
     get:
       tags: [Streamer]
       summary: 获取 Sink 的 Streamer 信息
-      description: 返回指定 Sink 的 Streamer 状态和配置，包括当前文件 ID、通道数、格式和采样率。
+      description: |
+        返回指定 Sink 的 Streamer 状态和配置，包括当前文件 ID、通道数、格式和采样率。
+        注意：daemon 对此端点始终返回 HTTP 200，错误以 JSON body 的 `status` 字段
+        编码（4=Streamer 未启用，5=无效 Sink，6=无法获取 Sink），不返回 4xx。
+        客户端应检查 `status` 字段而非 HTTP 状态码判断成功。
       operationId: getStreamerInfo
       parameters:
         - $ref: "#/components/parameters/sinkId"
       responses:
         "200":
-          description: 成功返回 Streamer 信息
+          description: |
+            始终返回 200。检查 `status` 字段：0=正常；4-6=错误条件
+            （Streamer 未启用 / 无效 Sink / 无法获取 Sink），此时其余字段无意义。
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/StreamerInfo"
-        "404":
-          $ref: "#/components/responses/NotFound"
-
   /api/streamer/stream/{sinkId}:
     get:
       tags: [Streamer]
@@ -423,6 +426,18 @@ paths:
                 type: string
                 format: binary
                 description: 16-bit signed LE interleaved PCM 流（48kHz）
+        "400":
+          description: Streamer 未启用或 sinkId 格式错误（text/plain 错误描述）
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: 检索 Sink 或初始化流失败（text/plain 错误描述）
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /api/streamer/stream/{sinkId}/{fileId}:
     get:
@@ -463,6 +478,18 @@ paths:
                 type: string
                 format: binary
                 description: ADTS AAC-LC 音频帧
+        "400":
+          description: Streamer 未启用或 sinkId/fileId 格式错误（text/plain 错误描述）
+          content:
+            text/plain:
+              schema:
+                type: string
+        "500":
+          description: 检索 Sink 或获取流失败（text/plain 错误描述）
+          content:
+            text/plain:
+              schema:
+                type: string
 
   # ──────────────────────────────────────────────
   # 噪声传感器
@@ -513,6 +540,7 @@ paths:
       description: |
         创建新传感器或更新已有传感器配置。请求体中未提供的字段保持原值不变。
         创建传感器时需指定 sink_id（该传感器监测哪个 Sink 的接收音频）。
+        与 daemon 既有 PUT 约定一致：创建与更新均返回 HTTP 200（非 201）。
       operationId: putNoiseSensor
       parameters:
         - $ref: "#/components/parameters/sensorId"
@@ -524,13 +552,7 @@ paths:
               $ref: "#/components/schemas/NoiseSensorConfig"
       responses:
         "200":
-          description: 传感器配置已更新
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/NoiseSensor"
-        "201":
-          description: 传感器已创建
+          description: 传感器已创建或配置已更新
           content:
             application/json:
               schema:
@@ -719,11 +741,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/DenoiseConfig"
         "400":
-          description: 请求的插件名不存在或未编译
-          content:
-            text/plain:
-              schema:
-                type: string
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -770,6 +788,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PluginParams"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -948,6 +968,8 @@ paths:
                       余弦相似度 [0, 1]。>0.75 通常表示匹配成功，
                       <0.5 表示该音频与模板不相似。
                     example: 0.89
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -992,9 +1014,9 @@ paths:
               properties:
                 templates:
                   type: array
-                  description: 待导入的模板列表
+                  description: 待导入的模板列表（每项不含 id/created_at，系统自动分配）
                   items:
-                    $ref: "#/components/schemas/NoiseTemplate"
+                    $ref: "#/components/schemas/NoiseTemplateImport"
       responses:
         "200":
           description: 导入完成，返回实际导入的模板数量
@@ -1010,6 +1032,8 @@ paths:
                   skipped_count:
                     type: integer
                     description: 因 label 重复而跳过的模板数量
+        "400":
+          $ref: "#/components/responses/BadRequest"
 
   # ──────────────────────────────────────────────
   # Streamer 三路音频流扩展
@@ -1044,7 +1068,7 @@ paths:
                 format: binary
                 description: 16-bit signed LE interleaved PCM 流（48kHz），延迟更低
         "404":
-          description: 该 Sink 未启用噪声传感器或降噪未开启
+          $ref: "#/components/responses/NotFound"
 
   /api/streamer/stream/{sinkId}/noise:
     get:
@@ -1070,7 +1094,7 @@ paths:
                 type: string
                 format: binary
         "404":
-          description: 该 Sink 未启用噪声传感器或降噪未开启
+          $ref: "#/components/responses/NotFound"
 
   /api/streamer/stream/{sinkId}/{fileId}/denoised:
     get:
@@ -1100,7 +1124,7 @@ paths:
                 type: string
                 format: binary
         "404":
-          description: 文件不存在或该 Sink 未启用降噪
+          $ref: "#/components/responses/NotFound"
 
   /api/streamer/stream/{sinkId}/{fileId}/noise:
     get:
@@ -1128,7 +1152,7 @@ paths:
                 type: string
                 format: binary
         "404":
-          description: 文件不存在或该 Sink 未启用降噪
+          $ref: "#/components/responses/NotFound"
 
 components:
 
@@ -1264,13 +1288,13 @@ components:
             包含所有已配置 Source 和 Sink 的配置。
           example: "./status.json"
         rtp_port:
-          type: string
-          description: Source 使用的 RTP 端口号
-          example: "5004"
+          type: integer
+          description: Source 使用的 RTP 端口号（daemon 以 JSON 数字序列化，非字符串）
+          example: 5004
         rtp_port_sec:
-          type: string
-          description: ST-2022-7 第二接口的 RTP 端口号
-          example: "5006"
+          type: integer
+          description: ST-2022-7 第二接口的 RTP 端口号（daemon 以 JSON 数字序列化，非字符串）
+          example: 5006
         ptp_domain:
           type: integer
           description: PTP 时钟域，daemon 尝试同步到此域的主时钟
@@ -1649,6 +1673,7 @@ components:
           description: |
             Streamer 状态码。0=OK，1=PTP 未锁定，2=通道未采集，
             3=缓冲中，4=Streamer 未启用，5=无效 Sink，6=无法获取 Sink。
+          enum: [0, 1, 2, 3, 4, 5, 6]
           example: 0
         file_duration:
           type: integer
@@ -1716,6 +1741,36 @@ components:
           example: -42.3
         noise_type:
           $ref: "#/components/schemas/NoiseType"
+        noise_type_confidence:
+          type: number
+          format: float
+          description: |
+            主噪声类型的分类置信度 [0, 1]。对应 C++ NoiseMetricsSnapshot.primary_confidence。
+            与 noise_confidence（是否含噪声的置信度）不同：后者是检测置信度，前者是分类置信度。
+          example: 0.83
+        is_mixed:
+          type: boolean
+          description: |
+            是否为混合噪声（多个候选置信度接近）。当次高置信度 > 0.3 时为 true。
+            UI 据此展示"主要：工频哼声(0.72)，混合：白噪声(0.45)"。
+          example: false
+        noise_candidates:
+          type: array
+          description: |
+            候选噪声类型列表（按置信度降序，最多 3 个，仅含 confidence > 0.1 的候选）。
+            用于混合噪声场景展示。非混合时仅含主类型一项。
+          items:
+            type: object
+            properties:
+              type:
+                $ref: "#/components/schemas/NoiseType"
+              confidence:
+                type: number
+                format: float
+                description: 该候选类型的置信度 [0, 1]
+          example:
+            - { type: hum_50hz, confidence: 0.72 }
+            - { type: white, confidence: 0.45 }
         estimated_snr_db:
           type: number
           format: float
@@ -1777,6 +1832,13 @@ components:
             频谱质心（Hz），表征噪声的"亮度"。
             白噪声质心偏高（~8kHz），工频哼声质心偏低（~150Hz）。
           example: 3200.0
+        spectral_flatness:
+          type: number
+          format: float
+          description: |
+            频谱平坦度（Wiener 熵）[0, 1]，区分噪声与语音的关键指标。
+            接近 1 = 能量均匀分布（白噪声）；接近 0 = 能量集中（纯音/语音）。暴露给 UI。
+          example: 0.85
         hum_strength_db:
           type: number
           format: float
@@ -1817,19 +1879,20 @@ components:
     NoiseType:
       type: string
       description: |
-        噪声类型枚举。由 NoiseAnalyzer 的分层分类器产出：
+        噪声类型枚举（JSON 序列化为小写蛇形，如 "hum_50hz"；C++ enum 名为 CamelCase
+        如 Hum50Hz，由序列化层映射）。由 NoiseAnalyzer 的分层分类器产出：
         L1 规则式频谱分析识别常见类型，L2 模板匹配识别自定义类型，
-        无法识别的归为 Unknown。
+        无法识别的归为 unknown。
       enum:
-        - Clean
-        - White
-        - Pink
-        - Hum50Hz
-        - Hum60Hz
-        - Impulse
-        - Broadband
-        - Digital
-        - Unknown
+        - clean
+        - white
+        - pink
+        - hum_50hz
+        - hum_60hz
+        - impulse
+        - broadband
+        - digital
+        - unknown
       x-enum-descriptions:
         - "干净音频，未检测到噪声"
         - "白噪声，频谱平坦度 > 0.7（热噪声、DAC 底噪、量化噪声）"
@@ -1868,6 +1931,17 @@ components:
           example: 0.92
         noise_type:
           $ref: "#/components/schemas/NoiseType"
+        primary_confidence:
+          type: number
+          format: float
+          description: |
+            主噪声类型的分类置信度 [0, 1]。与 noise_confidence（是否含噪声的检测置信度）不同：
+            前者是分类置信度，后者是检测置信度。
+          example: 0.83
+        is_mixed:
+          type: boolean
+          description: 是否为混合噪声（次高置信度 > 0.3 时为 true）
+          example: false
         noise_level_dbfs:
           type: number
           format: float
@@ -1883,6 +1957,11 @@ components:
           format: float
           description: 频谱质心（Hz）
           example: 3200.0
+        spectral_flatness:
+          type: number
+          format: float
+          description: 频谱平坦度（Wiener 熵）[0, 1]，区分噪声与语音的关键指标
+          example: 0.85
         hum_strength_db:
           type: number
           format: float
@@ -1891,7 +1970,7 @@ components:
         impulse_count:
           type: number
           format: float
-          description: 脉冲计数/秒，衡量脉冲噪声频率
+          description: 脉冲计数/秒，衡量脉冲噪声频率（来自 NoiseAnalysisResult，聚合入快照）
           example: 0.0
         ref_similarity:
           type: number
@@ -2067,6 +2146,43 @@ components:
           enum: [manual, cluster]
           default: manual
 
+    # 导入请求专用：id 与 created_at 由系统分配，客户端不应提供。
+    # 导入时按 label 去重（见 POST /api/noise/templates/import 描述）。
+    NoiseTemplateImport:
+      type: object
+      description: |
+        模板导入请求体单项。与 NoiseTemplate 相同，但 id/created_at 由系统在导入时
+        自动分配，客户端只提供 label/description/bark_spectrum/reference_level_dbfs/source。
+        导入按 label 去重：若导入模板的 label 与已有模板相同则跳过。
+      required: [label, bark_spectrum, reference_level_dbfs]
+      properties:
+        label:
+          type: string
+          description: 噪声类型标签（中文）
+          example: "空调噪声"
+        description:
+          type: string
+          description: 模板的详细描述（可选）
+          example: "机房精密空调低频隆隆声+风道共振"
+        bark_spectrum:
+          type: array
+          description: 归一化的 32 维 Bark 频带能量向量
+          items:
+            type: number
+            format: float
+          minItems: 32
+          maxItems: 32
+        reference_level_dbfs:
+          type: number
+          format: float
+          description: 录入时该噪声示例的参考噪声级（dBFS）
+          example: -35.0
+        source:
+          type: string
+          description: 模板来源
+          enum: [manual, cluster]
+          default: manual
+
     # ──────────────────────────────────────────
     # SSE 流
     # ──────────────────────────────────────────
@@ -2084,7 +2200,9 @@ components:
         客户端通过 EventSource API 建立长连接：
           const es = new EventSource('/api/noise/sensor/0/denoised');
           es.addEventListener('pcm', (e) => {
-            const pcm = Float32Array.from(atob(e.data), c => c.charCodeAt(0) / 128 - 1);
+            // data 是 base64 编码的 float32 PCM 帧块（48kHz mono, [-1,1]）
+            const bytes = Uint8Array.from(atob(e.data), c => c.charCodeAt(0));
+            const pcm = new Float32Array(bytes.buffer);
           });
       properties:
         event:

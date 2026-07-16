@@ -81,7 +81,7 @@ noise-model/DeepFilterNet/models/
 | **输出格式** | float[-1,1] mono | float[-1,1] mono | float, 多通道 | - |
 | **返回值** | **VAD 概率[0,1]** | 无（仅降噪输出） | 无；含 lsnr 估计 | 仅 RNNoise 产出 VAD |
 | **算法延迟** | 10ms（1 帧） | ~32ms（1 帧） | ~30ms（hop+lookahead） | DeepFilterNet 有前视 |
-| **模型大小** | ~250KB（编译进二进制） | **1.4+2.5 MB（双 ONNX）** | ~3 MB（三子图 ONNX） | - |
+| **模型大小** | ~250KB（编译进二进制） | **1.4+2.5 MB（双 ONNX）** | ~8.2 MB（三子图 ONNX，实测 enc+df_dec+erb_dec.onnx） | - |
 | **推理后端** | 原生 C（无引擎依赖） | ONNX Runtime | ONNX Runtime / Rust libDF | 后端异构是关键差异 |
 | **许可** | BSD-3 | MIT | MIT / Apache-2.0 双许可 | 均可商用 |
 | **模型文件** | 编译进二进制 + .bin | model_1.onnx + model_2.onnx | enc/df_dec/erb_dec.onnx | 均已随仓库提供 |
@@ -192,8 +192,16 @@ flowchart TB
 
 namespace noise {
 
+// 处理状态：RT 线程据此决定是否降级、上报、切插件
+enum class ProcessStatus {
+  kOk,      // 正常降噪输出
+  kBypass,  // 插件内部错误，已将 in 直通到 out（降级，不中断音频流）
+  kError,   // 不可恢复错误（模型损坏/反复失败），调用方应 flush/重置或切插件
+};
+
 // 降噪处理附加结果（可选）
 struct DenoiseResult {
+  ProcessStatus status{ProcessStatus::kOk};  // 见下方"实时安全契约"
   bool has_vad{false};      // 该插件是否产出 VAD
   float vad_probability{0}; // VAD 概率 [0,1]，仅 RNNoise 等填充
   bool has_snr{false};      // 该插件是否产出 SNR 估计
@@ -223,22 +231,40 @@ class IDenoisePlugin {
   virtual const char* name() const = 0;
   virtual uint32_t native_sample_rate() const = 0;       // 模型原生采样率
   virtual uint32_t algorithmic_latency_samples() const = 0; // 算法引入的固定延迟
-  virtual bool supports_vad() const = 0;                   // 是否产出 VAD
+  virtual bool supports_vad() const = 0;                   // 是否产出 VAD（仅 RNNoise）
+  virtual bool supports_snr() const = 0;                   // 是否产出 SNR 估计（仅 DeepFilterNet，复用 lsnr）
 
   // ── 流式处理（核心）──
   // 输入任意长度样本，输出降噪样本，返回实际输出样本数。
   // out 容量需 >= n_in + latency。result 可选。
   // 注意：首帧可能因算法延迟不立即产出，输出数 <= 输入数是正常的。
+  // 调用方契约：DenoiseProcessor 预分配 out 缓冲容量 = max_frame + latency，
+  // 每次调用后仅消费返回值 n 个样本（非 n_out_max）。若 n < n_in（首帧延迟
+  // 或插件内部缓冲未满），不足部分在后续调用中补回（流式保证：长期输入 N
+  // 样本，输出收敛到 N - latency）。flush() 取出残余。
   virtual size_t process(const float* in, size_t n_in,
                          float* out, size_t n_out_max,
                          DenoiseResult* result = nullptr) = 0;
 
+  // ── 实时安全契约（所有 adapter 必须遵守，RT 线程调用）──
+  // 1. 错误降级：ONNX 推理抛错/shape 不配/OOM/LSTM 状态发散时，adapter
+  //    不得在 RT 线程抛异常，必须将 in 直通到 out（min(n_in, n_out_max) 样本）
+  //    并置 result->status = kBypass；不可恢复置 kError。音频流绝不因插件
+  //    错误中断。
+  // 2. 数值清洗：process() 返回前必须 clamp 输出到 [-1,1]，NaN/Inf 替换为 0。
+  //    （NaN 喂 ALSA 放音 = 满幅 DC/爆音，可能损设备。）
+
   // ── 排空缓冲（停止时调用，取出残余样本）──
   virtual size_t flush(float* out, size_t n_out_max) = 0;
 
-  // ── 动态参数（运行时可调）──
+  // ── 动态参数（仅控制线程调用；与 RT process() 并发，实现须线程安全）──
+  // dry_wet_ 须为 std::atomic<float>（relaxed 序，RT 可容忍一帧旧值）。
+  // params 须为不可变快照：set_param 构造新 shared_ptr<const ParamMap> 原子换，
+  // process() 每次顶部 load 快照。绝不让控制线程写 unordered_map 的同时 RT 读
+  // （rehash 中途遍历 = UB/可能崩）。详见 §4.2 准热切换的线程模型。
+  // set_param 返回 bool：true=参数已接受并生效，false=无效 key/value（HTTP 400）。
   virtual void set_dry_wet(float ratio) = 0;              // 0~1
-  virtual void set_param(const std::string& key,
+  virtual bool set_param(const std::string& key,
                          const std::string& value) = 0;
   virtual std::string get_param(const std::string& key) const = 0;
 };
@@ -273,10 +299,13 @@ class IDenoisePlugin {
 class RnnoiseAdapter : public IDenoisePlugin {
  public:
   bool init(const PluginConfig& cfg) override {
-    // 1. 加载模型（cfg.model_path 空=内置默认模型）
+    // 1. 加载模型（cfg.model_path 空=内置默认模型）。rnnoise_create/model_from_filename
+    //    返回值须校验：失败返回 false 并清理已分配资源（RAII：用 unique_ptr<_,RnnoiseDeleter>
+    //    管理 model_ 与 state_，析构自动 rnnoise_destroy/rnnoise_model_free，杜绝部分 init 泄漏）。
     model_ = cfg.model_path.empty()
         ? rnnoise_create(nullptr)
         : rnnoise_create(rnnoise_model_from_filename(cfg.model_path.c_str()));
+    if (!model_) return false;  // 模型加载失败 -> 降级由 DenoiseProcessor 切默认插件
     // 2. native_sample_rate_ = 48000（固定）
     // 3. 重采样器：若 cfg.sample_rate_in != 48000 则建
   }
@@ -313,10 +342,17 @@ class RnnoiseAdapter : public IDenoisePlugin {
 class DtlnAdapter : public IDenoisePlugin {
  public:
   bool init(const PluginConfig& cfg) override {
-    // 1. 加载两个 ONNX 模型（cfg.model_path 指向 model_1.onnx）
-    //    model_2 路径从 model_1 推导（同目录 model_2.onnx）
-    sess1_ = CreateOnnxSession(cfg.model_path);           // model_1.onnx
-    sess2_ = CreateOnnxSession(cfg.model_path_model2);   // model_2.onnx
+    // 1. 加载两个 ONNX 模型。cfg.model_path 指向 model_1.onnx；
+    //    model_2 路径按约定从 model_1 推导（同目录，文件名末尾 _1 -> _2，
+    //    即 model_N.onnx）。不在 PluginConfig 增加 model_path_model2 字段，
+    //    避免调用方需同时提供两个耦合路径。
+    sess1_ = CreateOnnxSession(cfg.model_path);                        // model_1.onnx
+    sess2_ = CreateOnnxSession(DeriveSiblingModel(cfg.model_path, 2)); // model_2.onnx
+    // CreateOnnxSession(path) 内部调用 Ort::Session(env_, path, options)。
+    // env_ 是进程级单例 Ort::Env（在首次 CreateOnnxSession 时初始化，
+    // 析构晚于所有 Session——由 daemon main() 生命周期保证）。
+    // Session 析构（Ort::Session::~Session）释放 ONNX 图/权重，
+    // 毫秒级耗时不允许在 RT 线程，由 retire 队列延迟到控制线程回收。
     // 2. 初始化两个模型的 LSTM 状态张量（按签名 §1.2 预分配）
     state1_ = AllocStateTensor(sess1_);   // input_1
     state2_ = AllocStateTensor(sess2_);   // input_1
@@ -343,6 +379,9 @@ class DtlnAdapter : public IDenoisePlugin {
  private:
   Ort::Session* sess1_{nullptr};   // model_1.onnx
   Ort::Session* sess2_{nullptr};   // model_2.onnx
+  // RAII：sess1_/sess2_ 用 unique_ptr<Ort::Session, OnnxSessionDeleter> 管理，
+  // 析构自动释放 ONNX 图/权重。部分 init 失败时（如 sess2 创建失败），
+  // 已创建的 sess1 由 unique_ptr 析构器自动释放，杜绝泄漏。
   Ort::Value state1_, state2_;      // 跨帧 LSTM 状态（核心）
   float frame_buffer_[512];         // STFT 滑动窗口
   float out_buffer_[512];           // overlap-add 累积
@@ -369,6 +408,7 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
     enc_    = CreateOnnxSession(dir + "enc.onnx");
     df_dec_ = CreateOnnxSession(dir + "df_dec.onnx");
     erb_dec_= CreateOnnxSession(dir + "erb_dec.onnx");
+    // CreateOnnxSession 与 Ort::Env 生命周期约定同 §3.2 DtlnAdapter。
     // 路径 B（libDF）：cbindgen 调 df_create() / df_process_frame()
     // native_sample_rate_ = 48000（全频带，无需重采样）
     // postfilter = cfg.params.count("postfilter")
@@ -391,6 +431,9 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   size_t flush(float* out, size_t n_out_max) override {
     // 补 df_lookahead=2 帧 0 样本，触发 enc/df_dec/erb_dec 产出最后 2 帧
   }
+  // RAII：enc_/df_dec_/erb_dec_ 用 unique_ptr<Ort::Session, OnnxSessionDeleter> 管理，
+  // 析构自动释放。部分 init 失败时（如 df_dec 创建失败），已创建的 enc_ 由
+  // unique_ptr 析构器自动释放，杜绝泄漏。STFT 缓冲用 std::vector 自动管理。
 
   uint32_t algorithmic_latency_samples() const override {
     // hop(480) + lookahead*hop(960) = 1440 样本 @48k = 30ms（实测确认）
@@ -410,7 +453,7 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
 | overlap-add | 不需要 | **需要**（75%重叠） | 需要（STFT 重叠） |
 | lookahead | 无 | 无 | **有**（flush 需补零） |
 | VAD 输出 | ✅ 填充 | ❌ has_vad=false | ❌ has_vad=false |
-| 多通道 | ❌ mono | ❌ mono | ✅ |
+| 多通道 | ❌ mono（按通道循环，每通道独立 state） | ❌ mono（按通道循环，每通道独立 LSTM） | ✅ 原生多通道 |
 | 实现复杂度 | 低 | 中 | 高 |
 
 ---
@@ -485,63 +528,95 @@ endif()
 
 ### 4.2 运行时切换（准热切换）
 
-通过 HTTP（`PUT /api/noise/sensor/:id/plugin`）指定插件名，`NoiseManager` 将请求**按 `sensor_id` 路由到该 sensor 对应的 DenoiseProcessor 实例**，由其切换活动插件。DenoiseProcessor 是 per-sensor 的（各实例独立持有自己的 `IDenoisePlugin`，详见架构文档 §3.7），切换某一路只影响该路。采用**准热切换**方案：原子指针交换保证线程安全，切换瞬间静音一个冷启动窗口，不追求无缝过渡。
+通过 HTTP（`PUT /api/noise/sensor/:id/plugin`）指定插件名，`NoiseManager` 将请求**按 `sensor_id` 路由到该 sensor 对应的 DenoiseProcessor 实例**，由其切换活动插件。DenoiseProcessor 是 per-sensor 的（各实例独立持有自己的 `IDenoisePlugin`，详见架构文档 §3.7），切换某一路只影响该路。采用**准热切换**方案：RCU 式原子换指针 + 延迟回收 + 冷启动静音窗口，不追求无缝过渡。
 
 **设计要点**：
 
-1. **原子指针交换**：`plugin_` 用 `std::atomic<std::shared_ptr<IDenoisePlugin>>` 持有（C++20），控制线程替换、音频线程读取，无锁且无 UAF。旧插件引用计数归零后自然释放。
-2. **静音过渡**：新插件从冷态启动，DeepFilterNet 需 `df_lookahead=2` 帧（~30ms）、DTLN LSTM 需数帧才收敛。这期间若直接输出新插件结果会出哑音/错音。对策是切换后静音一个 `mute_duration_ms`（默认 50ms，按新插件延迟上限 + 收敛余量取值），输出 0 样本，让新插件"空跑"填满内部缓冲与状态，再开声。
-3. **不做 crossfade**：不并行运行新旧插件。代价是切换瞬间有 ~50ms 静音；收益是实现简单、CPU 不翻倍、无两路对齐问题。
-4. **延迟跳变上报**：切换后通过事件通知下游 `algorithmic_latency_samples()` 变化（如 RNNoise 480 -> DeepFilterNet 1440），便于音视频对齐。
+1. **RCU 原子换指针 + 延迟回收**：`plugin_` 用 `RcuPtr<PluginSlot>` 持有（C++17 自实现，见下"前提确认"）。控制线程构造新 slot 后 `exchange` 发布；音频线程在**每个 ALSA period 顶部 pin 一次**快照（`pinned_ = rcu_ptr_.load()`），该 period 内所有 480 样本帧复用 `pinned_`，**不每帧做原子操作**。旧 slot 推入 retire 队列，由控制线程 housekeeper 在确认 RT 线程已穿越 ≥2 个 period 边界（静止点，保证无 pinned reader）后释放。**旧插件析构（ONNX `Ort::Session` teardown / `rnnoise_destroy`，毫秒级）绝不发生在 RT 线程**。
+2. **永不为空的默认插件**：构造时即装入 `PassthroughPlugin`（`in->out` 直通），`plugin_`/`pinned_` 永不为空。未 `switch_plugin` 前 process 直通，杜绝空指针解引用（§3.7 列举的 init 竞态/持久化配置未 apply 场景）。
+3. **静音过渡随快照走**：新插件冷启动期（DeepFilterNet `df_lookahead=2` ~30ms、DTLN LSTM 数帧收敛）直接输出会哑音/错音。静音计数封装在 `PluginSlot` 内随快照发布：switch 时控制线程置新 slot 的 `mute_remaining = latency + kConvergenceMargin`；RT 线程仅对自己 pin 到的 slot 做单调递减（仅 RT 写该字段，无 check-then-act 竞态、无无符号下溢）。切换后静音 `mute_duration_ms`（默认 50ms，按新插件延迟上限 + 收敛余量），输出 0 样本让新插件空跑填满内部缓冲与状态，再开声。
+4. **不做 crossfade**：不并行运行新旧插件。代价是切换瞬间有 ~50ms 静音；收益是实现简单、CPU 不翻倍、无两路对齐问题。
+5. **不调旧插件 flush()**：switch 时旧插件直接入 retire 队列，不调其 `flush()` 取残余样本。理由：①静音窗口已覆盖旧插件残余输出区间（mute 期间输出全零，残余样本被丢弃）；②flush 需在 RT 线程调用才有时序保证，但 switch 发生在控制线程；③旧插件即将析构，残余输出无消费者。若未来需 crossfade 方案，则须在 switch 前调 flush 取残余做淡出。
+5. **延迟跳变上报**：切换后通过事件通知下游 `algorithmic_latency_samples()` 变化（如 RNNoise 480 -> DeepFilterNet 1440），便于音视频对齐。`latency_change_cb_` 须在 init 阶段设置完毕（init-only，带启动 barrier），运行期不再改，避免 `std::function` 读写竞态。
 
 ```cpp
 // daemon/noise/denoise_processor.hpp（重构后）
+// 线程模型：
+//   - 控制线程（HTTP，NoiseManager 串行化同 sensor 的控制入口，见架构 §3.7）：
+//     switch_plugin / set_dry_wet / set_param / set_latency_change_cb / drain_retire
+//   - 音频线程（capture 线程，高频）：on_period_begin -> process×N -> on_period_end
+//     读路径全程无锁：仅在 period 顶部 load 一次快照，整周期复用。
 class DenoiseProcessor {
  public:
-  // 切换插件（准热切换：原子替换 + 静音冷启动窗口）
+  DenoiseProcessor() {
+    // 构造即装 PassthroughPlugin（in->out 直通），plugin_ 永不为空。
+    // 未 switch_plugin 前 process 直通，杜绝 init 竞态/持久化配置未 apply 时空指针解引用。
+    auto passthrough = std::make_shared<PassthroughPlugin>();
+    passthrough->init(current_config_);
+    rcu_ptr_.publish(std::make_shared<PluginSlot>(std::move(passthrough), 0));
+  }
+
+  // ── 控制线程 ──
   bool switch_plugin(const std::string& name) {
     auto new_plugin = DenoisePluginRegistry::instance().create(name);
     if (!new_plugin) return false;
-    // 保留公共配置（dry_wet、采样率、通道）传给新插件
-    PluginConfig cfg = current_config_;
-    if (!new_plugin->init(cfg)) return false;
-    // 先设静音窗口，再替换指针——避免音频线程在指针替换后、mute 赋值前
-    // 用新插件处理但未静音，导致冷启动哑音泄漏
+    if (!new_plugin->init(current_config_)) return false;
     uint32_t latency = new_plugin->algorithmic_latency_samples();
-    mute_samples_remaining_ = latency + kConvergenceMargin;  // 默认 +50ms 样本
-    // 原子替换：音频线程下次 process 读到的就是新插件，无锁无 UAF
-    std::atomic_store(&plugin_, std::shared_ptr<IDenoisePlugin>(std::move(new_plugin)));
-    // 通知下游延迟变化
+    // 静音计数随新 slot 走：控制线程发布前置 mute，RT 线程发布后仅递减
+    // 自己 pin 到的 slot（仅 RT 写该字段，无 check-then-act 竞态、无无符号下溢）。
+    auto new_slot = std::make_shared<PluginSlot>(
+        std::move(new_plugin), latency + kConvergenceMargin);
+    auto old = rcu_ptr_.publish(std::move(new_slot));  // 原子发布
+    retire_list_.push(std::move(old));  // 旧 slot 延迟回收，析构不发生在 RT 线程
     if (latency_change_cb_) latency_change_cb_(latency);
     return true;
   }
+  void set_dry_wet(float ratio) { /* 路由到当前活动插件，按 §2.2 契约用 atomic<float> */ }
+  bool set_param(const std::string& k, const std::string& v) { /* 同上，不可变快照换；返回插件是否接受 */ }
 
-  // 音频线程调用（高频，必须无锁）
+  // ── 音频线程：周期顶部 pin 一次，整周期复用，不每帧原子操作 ──
+  void on_period_begin() { pinned_ = rcu_ptr_.load(); /* 永不为空 */ }
   size_t process(const float* in, size_t n_in, float* out, size_t n_out_max,
                  DenoiseResult* result) {
-    auto plugin = std::atomic_load(&plugin_);  // 拿到本次调用的稳定快照
-    size_t n = plugin->process(in, n_in, out, n_out_max, result);
-    // 静音过渡：切换后前若干样本输出 0
-    if (mute_samples_remaining_ > 0) {
-      size_t mute = std::min(mute_samples_remaining_.load(), n);
+    size_t n = pinned_->plugin->process(in, n_in, out, n_out_max, result);
+    // 静音过渡：对本 slot 的 mute 单调递减（仅 RT 写，min 上限保证永不为负）
+    if (pinned_->mute_remaining > 0) {
+      size_t mute = std::min(pinned_->mute_remaining, n);
       std::memset(out, 0, mute * sizeof(float));
-      mute_samples_remaining_ -= mute;
+      pinned_->mute_remaining -= mute;
     }
     return n;
   }
+  void on_period_end() {
+    pinned_.reset();               // 释放本周期局部引用
+    rcu_ptr_.advance_epoch();      // 通知 housekeeper：一个静止点已过
+  }
+  // housekeeper（控制线程定期驱动）：释放穿越 ≥2 静止点的旧 slot。
+  // 旧插件析构（ONNX session teardown / rnnoise_destroy，毫秒级）在此线程完成。
+  void drain_retire() { retire_list_.reclaim_older_than(rcu_ptr_.epoch() - 1); }
 
   std::vector<std::string> list_plugins() const {
     return DenoisePluginRegistry::instance().list();
   }
   using LatencyChangeCb = std::function<void(uint32_t)>;
-  void set_latency_change_cb(LatencyChangeCb cb) { latency_change_cb_ = std::move(cb); }
+  void set_latency_change_cb(LatencyChangeCb cb) {  // init-only，运行期不再改
+    latency_change_cb_ = std::move(cb);
+  }
 
  private:
-  std::shared_ptr<IDenoisePlugin> plugin_;       // 经 atomic_load/store 访问
+  // 随快照发布的槽：plugin + 该 slot 的静音计数（RT 单调递减）
+  struct PluginSlot {
+    std::shared_ptr<IDenoisePlugin> plugin;
+    size_t mute_remaining;  // RT 线程递减，min 上限保证永不为负
+    PluginSlot(std::shared_ptr<IDenoisePlugin> p, size_t mute)
+        : plugin(std::move(p)), mute_remaining(mute) {}
+  };
+  RcuPtr<PluginSlot> rcu_ptr_;            // 原子插槽 + 静止点回收（C++17 自实现，见下）
+  std::shared_ptr<PluginSlot> pinned_;    // 本周期快照（RT 持有，整周期复用）
+  RetireQueue<PluginSlot> retire_list_;   // 旧 slot 延迟释放队列
   PluginConfig current_config_;
-  std::atomic<size_t> mute_samples_remaining_{0};
-  LatencyChangeCb latency_change_cb_;
-  static constexpr size_t kConvergenceMargin = 2400;  // 50ms @48k 状态收敛余量
+  LatencyChangeCb latency_change_cb_;     // init-only
+  static constexpr size_t kConvergenceMargin = 2400;  // 50ms @48k 收敛余量
 };
 ```
 
@@ -557,11 +632,11 @@ sequenceDiagram
     CTL->>DP: switch_plugin("deepfilternet")
     DP->>NP: create + init(cfg)
     NP-->>DP: ok
-    DP->>DP: atomic_store(plugin_, new)
-    DP->>DP: mute_remaining = 1440 + 2400
+    DP->>DP: rcu_ptr_.publish(new_slot)  // 原子发布，旧 slot 入 retire
+    DP->>DP: mute_remaining = 1440 + 2400  // 随新 slot 走
     DP-->>CTL: 返回 ok (延迟 1440)
 
-    loop 冷启动窗口 (~89ms)
+    loop 冷启动窗口 (~80ms = latency 30ms + 收敛余量 50ms)
         AT->>DP: process()
         AT->>NP: process（内部空跑，填缓冲/状态）
         NP-->>AT: 哑输出
@@ -587,7 +662,7 @@ sequenceDiagram
 
 对噪声**监测**主用途，~50ms 静音完全可接受（人耳对短暂静音不敏感，且仅在主动切换时发生一次）。实时直播监听场景如需无间断，后续再升级为无缝方案。
 
-> **前提确认**：`std::atomic<std::shared_ptr>` 的原子操作在 C++20 才保证无锁；C++17 需用 `std::atomic_load(&shared_ptr)`（已废弃但可用）或外层读写锁。本项目 daemon 用 C++17，实际实现用专用 `RcuPtr`/双缓冲或细粒度读写锁（切换低频，读高频）替代，对外接口不变。
+> **前提确认**：`std::atomic<std::shared_ptr>` 的原子操作在 C++20 才保证无锁；C++17 的自由函数 `std::atomic_load/store(&shared_ptr)` 已废弃且**非无锁**（libstdc++/libc++ 内部用自旋锁），在每帧调用的 RT 线程上会产生优先级反转致 xrun。本项目 daemon 用 C++17，因此**不采用** `std::atomic_load/store(shared_ptr)`，改用上述 `RcuPtr`（自实现：`std::atomic<PluginSlot*>` 原子发布 + 单调 epoch 计数 + retire 队列延迟回收）或等价的 hazard-pointer 方案。对外接口不变；读路径仅 period 顶部一次原子 load，整 period 无锁复用；旧插件析构由控制线程 housekeeper 在静止点后完成，绝不发生在 RT 线程。
 
 
 
@@ -686,7 +761,7 @@ flowchart LR
       "name": "deepfilternet",
       "native_sample_rate": 48000,
       "supports_vad": false,
-      "algorithmic_latency_ms": 50.0,
+      "algorithmic_latency_ms": 30.0,
       "params": ["postfilter", "model", "compensate_delay"]
     }
   ]
@@ -854,11 +929,11 @@ daemon/noise/
 | 4 | overlap-add 实现正确性 | DTLN/DFN 降噪质量直接依赖 | 写单元测试验证重建信号完整性 |
 | 5 | lookahead 模型 flush 处理 | DeepFilterNet 末尾丢帧 | flush() 补 df_lookahead=2 帧 0 样本触发残余输出 |
 | 6 | 插件切换瞬态噪声 | 新插件冷启动期输出哑音/错音 | 准热切换：切换后静音 `延迟+50ms` 窗口（§4.2） |
-| 7 | 切换线程安全 / UAF | 控制线程换指针时音频线程用后释放 | `std::atomic<shared_ptr>` 原子交换（§4.2 前提确认段） |
+| 7 | 切换线程安全 / UAF / 析构在 RT 线程 | 控制线程换指针时音频线程用后释放；旧插件析构（ONNX teardown）落在 RT 线程致 xrun | `RcuPtr` 原子发布 + period 顶部 pin + retire 队列延迟回收；旧插件在静止点后由控制线程 housekeeper 析构（§4.2） |
 | 8 | 切换延迟跳变 | RNNoise↔DeepFilterNet 延迟差 960 样本致音视频错位 | 切换后上报新 `algorithmic_latency_samples()`，下游补偿 |
 | 9 | DTLN 双模型状态管理 | 状态张量喂回错误导致降噪失效 | 按 §3.2 流程，单测验证状态传递 |
 | 10 | DeepFilterNet 三子图编排 | ONNX 调用顺序错误导致无输出 | 按 §3.3 流程，先复跑仓库 Python 参考验证 |
-| 11 | 多通道 vs 单通道接口 | DeepFilterNet 多通道，RNNoise/DTLN 单 | 接口支持 channels，单通道插件内部循环 |
+| 11 | 多通道 vs 单通道接口 | DeepFilterNet 多通道，RNNoise/DTLN 单 | 接口支持 channels，单通道插件内部按通道循环处理（每通道独立 DenoiseState/LSTM 状态，互不干扰）。见 §3.4 Adapter 对照"多通道"行 |
 
 > **可行性结论**：三个模型的集成路径（原生 C / ONNX / ONNX 或 libDF）均已通过克隆仓库的**实际源码和模型文件验证**，不存在阻塞性技术障碍。主要工作量在 DTLN/DeepFilterNet 的状态管理和子图编排，属实现复杂度而非可行性问题。
 

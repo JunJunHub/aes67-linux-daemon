@@ -2047,7 +2047,7 @@ components:
           description: |
             算法引入的固定延迟（ms）。
             RNNoise = 10ms（1 帧），DTLN ≈ 34ms（1 帧 + 重采样），
-            DeepFilterNet ≈ 50ms（hop + lookahead）。
+            DeepFilterNet ≈ 30ms（hop + lookahead = 480 + 960 样本 @48kHz）。
           example: 10.0
         params:
           type: array

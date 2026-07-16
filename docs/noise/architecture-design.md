@@ -461,8 +461,8 @@ flowchart TB
 
 | 层 | 方案 | 延迟 | 依赖 | Phase | 说明 |
 |----|------|------|------|-------|------|
-| **L1** | 规则式频谱分析 | <0.5ms | 零（仅需 FFT） | **Phase 2** | 必做。覆盖白/粉红/哼声/脉冲等常见类型 |
-| **L2** | 噪声样本模板匹配 | <0.1ms | 零（FFT + 余弦相似度） | **Phase 3** | 支持自定义录入，弥补规则式无法识别具体噪声源 |
+| **L1** | 规则式频谱分析 | <0.5ms | 零（仅需 FFT） | **Phase 1** | 必做。覆盖白/粉红/哼声/脉冲等常见类型 |
+| **L2** | 噪声样本模板匹配 | <0.1ms | 零（FFT + 余弦相似度） | **Phase 1** | 支持自定义录入，弥补规则式无法识别具体噪声源 |
 
 #### 3.3.3 分析维度
 
@@ -1347,7 +1347,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ### Phase 1 — 最小可用（MVP）
 
-**目标**：多 Sink 噪声检测 + RNNoise 降噪 + HTTP API（单 capture 线程逐帧处理，并发数受 CPU 约束，见 §1.2.1）
+**目标**：多 Sink 噪声检测 + 噪声分类（L1 规则式 + L2 模板匹配）+ RNNoise 降噪 + HTTP API（单 capture 线程逐帧处理，并发数受 CPU 约束，见 §1.2.1）
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
@@ -1355,34 +1355,34 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 1.2 | Streamer 重构：从 Bridge 拿帧，删除 snd_pcm_open/readi | 回归测试：AAC 流功能不变 |
 | 1.3 | NoiseManager（多 sensor map + per-sensor 生命周期）+ AudioCapture：从 Bridge FrameProvider 接收帧，按 sink_id 路由分发到对应 sensor 的处理组件 | 单元测试：帧回调触发；多 sensor 路由 |
 | 1.4 | NoiseDetector：WebRTC VAD + 频谱平坦度 | 单元测试：白噪声/语音/静音 |
-| 1.5 | DenoiseProcessor：RNNoise 集成 + 三路输出（原始/降噪/噪声） | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪 |
-| 1.6 | NoiseMetrics：指标聚合 + HTTP API | 集成测试：API 响应 |
-| 1.7 | Streamer 三路 AAC 流 API | 集成测试：原始/降噪/噪声流可访问 |
-| 1.8 | CMake WITH_NOISE 选项 + 构建验证 | buildfake.sh 通过 |
+| 1.5 | NoiseAnalyzer：L1 规则式分类 + 置信度 + 混合噪声判定 + L2 模板匹配（噪声样本录入与余弦相似度匹配） | 单元测试：白噪声/哼声/脉冲分类；模板录入+匹配 |
+| 1.6 | DenoiseProcessor：RNNoise 集成 + 三路输出（原始/降噪/噪声） | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪 |
+| 1.7 | NoiseMetrics：指标聚合 + HTTP API | 集成测试：API 响应 |
+| 1.8 | Streamer 三路 AAC 流 API | 集成测试：原始/降噪/噪声流可访问 |
+| 1.9 | CMake WITH_NOISE 选项 + 构建验证 | buildfake.sh 通过 |
 
 **预计工期**：2-3 周
 
 ### Phase 2 — 完整功能
 
-**目标**：噪声分类 + 参考比对 + 告警 + HTTP SSE 实时推送
+**目标**：参考比对 + 告警 + HTTP SSE 实时推送 + 传感器配置完善
 
 | 步骤 | 内容 |
 |------|------|
-| 2.1 | NoiseAnalyzer：L1 规则式分类 + 置信度 + 混合噪声判定 |
-| 2.2 | RefComparator：参考音比对噪声检测 |
-| 2.3 | 噪声传感器 HTTP 配置 API（PUT/DELETE /api/noise/sensor/:id），NoiseManager 扩展为多 sensor map + per-sensor 生命周期（创建/释放 DenoiseProcessor 及插件实例） |
-| 2.4 | HTTP SSE 实时推送噪声指标与告警 |
-| 2.5 | 告警规则引擎 + HTTP SSE 推送 |
+| 2.1 | RefComparator：参考音比对噪声检测 |
+| 2.2 | 噪声传感器 HTTP 配置 API 完善（PUT/DELETE /api/noise/sensor/:id 参数校验、持久化到 status_file） |
+| 2.3 | HTTP SSE 实时推送噪声指标与告警 |
+| 2.4 | 告警规则引擎 + HTTP SSE 推送 |
 
 ### Phase 3 — 生产增强
 
-**目标**：性能优化 + 自定义模型 + 监听回放
+**目标**：性能优化 + 自定义模型 + 监听回放 + ML 噪声分类
 
 | 步骤 | 内容 |
 |------|------|
 | 3.1 | 自定义 RNNoise 模型加载（针对广播噪声训练） |
 | 3.2 | 降噪后音频回注 ALSA 播放 |
-| 3.3 | 噪声样本数据集比对 |
+| 3.3 | L3 ML 噪声分类（PANNs/VGGish 嵌入，ONNX Runtime，处理 L1/L2 无法识别的未知噪声） |
 | 3.4 | 指标持久化 + 历史查询 |
 | 3.5 | 多 Sink 并行处理优化 |
 

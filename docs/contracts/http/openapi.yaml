@@ -1,12 +1,12 @@
 openapi: 3.1.0
 
 info:
-  title: AES67 Daemon — Noise Analysis & Denoise API
+  title: AES67 Daemon — Full HTTP REST API
   description: |
-    噪声分析与降噪模块的 HTTP REST API，涵盖噪声传感器管理、降噪插件控制、
-    噪声模板库管理、Streamer 三路音频流扩展。
-    本文档仅包含噪声模块新增和扩展的接口；daemon 原有接口
-    （/api/config、/api/source、/api/sink 等）见 daemon 主 OpenAPI 文档。
+    AES67 daemon 完整 HTTP REST API，包含：
+    - 基础接口：daemon 版本/配置、PTP 状态、RTP Source/Sink 管理、远端源浏览、Streamer
+    - 噪声模块接口：传感器管理、降噪插件控制、噪声模板库、Streamer 三路音频流扩展
+    噪声模块接口仅在 WITH_NOISE=ON 编译时可用，否则返回 404。
   version: 0.1.0
   contact:
     name: AES67 Daemon Team
@@ -22,6 +22,20 @@ servers:
         description: daemon.conf 中配置的 HTTP 端口号
 
 tags:
+  - name: Daemon
+    description: daemon 版本与全局配置查询
+  - name: PTP
+    description: PTP 时钟配置与状态查询
+  - name: RTP Source
+    description: RTP 发送端（Talker）的增删改查与 SDP 获取
+  - name: RTP Sink
+    description: RTP 接收端（Listener）的增删改查与状态查询
+  - name: Streams
+    description: 所有已配置 Source 和 Sink 的聚合查询
+  - name: Browse
+    description: 远端 RTP Source 发现（SAP/mDNS）
+  - name: Streamer
+    description: HTTP Streamer 音频流分发（AAC 编码/PCM 直通）
   - name: Noise Sensor
     description: 噪声传感器的增删改查、指标查询与实时音频流
   - name: Denoise Plugin
@@ -30,8 +44,427 @@ tags:
     description: 噪声频谱模板的录入、匹配与管理
   - name: Streamer Extension
     description: Streamer 三路（原始/降噪/噪声）× 双模式（AAC/PCM）音频流
+  - name: Streamer Extension
+    description: Streamer 三路（原始/降噪/噪声）× 双模式（AAC/PCM）音频流
 
 paths:
+
+  # ──────────────────────────────────────────────
+  # Daemon 基础接口
+  # ──────────────────────────────────────────────
+
+  /api/version:
+    get:
+      tags: [Daemon]
+      summary: 获取 daemon 版本
+      description: 返回 daemon 版本字符串，用于版本检测和兼容性判断。
+      operationId: getVersion
+      responses:
+        "200":
+          description: 成功返回版本信息
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version]
+                properties:
+                  version:
+                    type: string
+                    description: daemon 版本字符串，格式 bondagit-X.Y.Z
+                    example: "bondagit-3.1.0"
+
+  /api/config:
+    get:
+      tags: [Daemon]
+      summary: 获取 daemon 配置
+      description: 返回 daemon 当前运行的完整配置参数。
+      operationId: getConfig
+      responses:
+        "200":
+          description: 成功返回配置
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DaemonConfig"
+
+    post:
+      tags: [Daemon]
+      summary: 修改 daemon 配置
+      description: |
+        更新 daemon 配置参数。部分参数修改后需重启 daemon 生效（如 sample_rate），
+        部分参数立即生效（如 log_severity）。请求体中未提供的字段保持原值不变。
+      operationId: setConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DaemonConfig"
+      responses:
+        "200":
+          description: 配置已更新
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DaemonConfig"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  # ──────────────────────────────────────────────
+  # PTP
+  # ──────────────────────────────────────────────
+
+  /api/ptp/config:
+    get:
+      tags: [PTP]
+      summary: 获取 PTP 配置
+      description: 返回 PTP 时钟的域和 DSCP 配置。
+      operationId: getPtpConfig
+      responses:
+        "200":
+          description: 成功返回 PTP 配置
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PtpConfig"
+
+    post:
+      tags: [PTP]
+      summary: 修改 PTP 配置
+      description: 更新 PTP 域和/或 DSCP 配置，立即生效。
+      operationId: setPtpConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PtpConfig"
+      responses:
+        "200":
+          description: PTP 配置已更新
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PtpConfig"
+
+  /api/ptp/status:
+    get:
+      tags: [PTP]
+      summary: 获取 PTP 状态
+      description: 返回 PTP 从属时钟当前状态，包括锁定状态、GrandMaster ID 和抖动。
+      operationId: getPtpStatus
+      responses:
+        "200":
+          description: 成功返回 PTP 状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PtpStatus"
+
+  # ──────────────────────────────────────────────
+  # RTP Source
+  # ──────────────────────────────────────────────
+
+  /api/source/{id}:
+    put:
+      tags: [RTP Source]
+      summary: 添加或更新 RTP Source
+      description: |
+        创建或更新指定 ID 的 RTP Source（发送端/Talker）。
+        Source 向网络发送 RTP 组播音频流，SDP 由 daemon 自动生成。
+      operationId: putSource
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RtpSourceConfig"
+      responses:
+        "200":
+          description: Source 已创建或更新
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+    delete:
+      tags: [RTP Source]
+      summary: 删除 RTP Source
+      description: 停止并删除指定 ID 的 RTP Source，释放组播地址和驱动资源。
+      operationId: deleteSource
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      responses:
+        "200":
+          description: Source 已删除
+
+  /api/source/sdp/{id}:
+    get:
+      tags: [RTP Source]
+      summary: 获取 Source 的 SDP 文件
+      description: 返回指定 Source 的 SDP（Session Description Protocol）文件，供远端 Sink 发现和连接。
+      operationId: getSourceSdp
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      responses:
+        "200":
+          description: SDP 文件内容
+          content:
+            application/sdp:
+              schema:
+                type: string
+                description: SDP v=0 会话描述
+
+  /api/sources:
+    get:
+      tags: [RTP Source]
+      summary: 获取所有已配置的 RTP Source
+      description: 返回所有已配置 Source 的列表，含 ID 和完整配置参数。
+      operationId: listSources
+      responses:
+        "200":
+          description: 成功返回 Source 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources]
+                properties:
+                  sources:
+                    type: array
+                    description: 所有已配置的 RTP Source
+                    items:
+                      $ref: "#/components/schemas/RtpSource"
+
+  # ──────────────────────────────────────────────
+  # RTP Sink
+  # ──────────────────────────────────────────────
+
+  /api/sink/{id}:
+    put:
+      tags: [RTP Sink]
+      summary: 添加或更新 RTP Sink
+      description: |
+        创建或更新指定 ID 的 RTP Sink（接收端/Listener）。
+        Sink 从远端 Source 接收 RTP 组播音频流。
+        use_sdp=true 时从 source URL 获取 SDP，false 时使用 sdp 字段中的内联 SDP。
+      operationId: putSink
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RtpSinkConfig"
+      responses:
+        "200":
+          description: Sink 已创建或更新
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+    delete:
+      tags: [RTP Sink]
+      summary: 删除 RTP Sink
+      description: 停止并删除指定 ID 的 RTP Sink，释放驱动资源。
+      operationId: deleteSink
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      responses:
+        "200":
+          description: Sink 已删除
+
+  /api/sink/status/{id}:
+    get:
+      tags: [RTP Sink]
+      summary: 获取 Sink 接收状态
+      description: |
+        返回指定 Sink 的 RTP 接收状态标志和最小到达时间，
+        用于判断是否正在接收音频、是否有序列错误/SSRC 错误等。
+      operationId: getSinkStatus
+      parameters:
+        - $ref: "#/components/parameters/sourceOrSinkId"
+      responses:
+        "200":
+          description: 成功返回 Sink 状态
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RtpSinkStatus"
+
+  /api/sinks:
+    get:
+      tags: [RTP Sink]
+      summary: 获取所有已配置的 RTP Sink
+      description: 返回所有已配置 Sink 的列表，含 ID 和完整配置参数。
+      operationId: listSinks
+      responses:
+        "200":
+          description: 成功返回 Sink 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sinks]
+                properties:
+                  sinks:
+                    type: array
+                    description: 所有已配置的 RTP Sink
+                    items:
+                      $ref: "#/components/schemas/RtpSink"
+
+  # ──────────────────────────────────────────────
+  # Streams（Source + Sink 聚合）
+  # ──────────────────────────────────────────────
+
+  /api/streams:
+    get:
+      tags: [Streams]
+      summary: 获取所有已配置的 Source 和 Sink
+      description: 一次性返回所有 Source 和 Sink 的配置，减少请求次数。
+      operationId: listStreams
+      responses:
+        "200":
+          description: 成功返回所有流配置
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sources, sinks]
+                properties:
+                  sources:
+                    type: array
+                    description: 所有已配置的 RTP Source
+                    items:
+                      $ref: "#/components/schemas/RtpSource"
+                  sinks:
+                    type: array
+                    description: 所有已配置的 RTP Sink
+                    items:
+                      $ref: "#/components/schemas/RtpSink"
+
+  # ──────────────────────────────────────────────
+  # Browse（远端源发现）
+  # ──────────────────────────────────────────────
+
+  /api/browse/sources/{scope}:
+    get:
+      tags: [Browse]
+      summary: 获取远端 RTP Source
+      description: |
+        返回通过 SAP 和/或 mDNS 发现的远端 RTP Source 列表。
+        scope=all 返回所有来源，scope=sap 仅 SAP 发现，scope=mdns 仅 mDNS 发现。
+      operationId: browseRemoteSources
+      parameters:
+        - name: scope
+          in: path
+          required: true
+          description: 发现协议范围。all=全部，sap=仅SAP，mdns=仅mDNS
+          schema:
+            type: string
+            enum: [all, sap, mdns]
+      responses:
+        "200":
+          description: 成功返回远端源列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [remote_sources]
+                properties:
+                  remote_sources:
+                    type: array
+                    description: 发现的远端 RTP Source 列表
+                    items:
+                      $ref: "#/components/schemas/RemoteSource"
+
+  # ──────────────────────────────────────────────
+  # Streamer（原有接口）
+  # ──────────────────────────────────────────────
+
+  /api/streamer/info/{sinkId}:
+    get:
+      tags: [Streamer]
+      summary: 获取 Sink 的 Streamer 信息
+      description: 返回指定 Sink 的 Streamer 状态和配置，包括当前文件 ID、通道数、格式和采样率。
+      operationId: getStreamerInfo
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+      responses:
+        "200":
+          description: 成功返回 Streamer 信息
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamerInfo"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/streamer/stream/{sinkId}:
+    get:
+      tags: [Streamer]
+      summary: 原始 AAC live 流
+      description: |
+        获取指定 Sink 的原始 AAC 实时流（ADTS AAC-LC 帧），兼容已有接口。
+        通过 format 查询参数可切换为 PCM 直通模式。
+      operationId: streamAacLive
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - $ref: "#/components/parameters/streamFormat"
+      responses:
+        "200":
+          description: AAC 或 PCM 实时流
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+                description: ADTS AAC-LC 帧流
+            audio/pcm:
+              schema:
+                type: string
+                format: binary
+                description: 16-bit signed LE interleaved PCM 流（48kHz）
+
+  /api/streamer/stream/{sinkId}/{fileId}:
+    get:
+      tags: [Streamer]
+      summary: 原始 AAC 文件
+      description: |
+        获取指定 Sink 的原始 AAC 文件片段（fileId 为环形缓冲中的文件序号）。
+        响应头 X-File-Count/X-File-Current-Id/X-File-Start-Id 提供文件元信息。
+      operationId: getAacFile
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - name: fileId
+          in: path
+          required: true
+          description: 环形缓冲中的文件序号（0 到 streamer_files_num-1）
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: AAC 文件内容
+          headers:
+            X-File-Count:
+              schema:
+                type: integer
+              description: 环形缓冲中的文件总数
+            X-File-Current-Id:
+              schema:
+                type: integer
+              description: 当前正在写入的文件 ID
+            X-File-Start-Id:
+              schema:
+                type: integer
+              description: 最旧文件的 ID（读取起始位置）
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+                description: ADTS AAC-LC 音频帧
 
   # ──────────────────────────────────────────────
   # 噪声传感器
@@ -702,15 +1135,19 @@ components:
 
   parameters:
 
-    sensorId:
+    sourceOrSinkId:
       name: id
       in: path
       required: true
-      description: 噪声传感器 ID，对应 /api/noise/sensor/:id 路径参数。范围 0-63，与 Sink ID 独立。
+      description: |
+        RTP Source 或 Sink ID（0-63），对应 /api/source/:id 或 /api/sink/:id 路径参数。
+        daemon 最多支持 64 路 Source 和 64 路 Sink。
       schema:
         type: integer
         minimum: 0
         maximum: 63
+
+    sensorId:
 
     templateId:
       name: templateId
@@ -765,6 +1202,479 @@ components:
             description: '错误描述，如 "invalid noise_type: foo"'
 
   schemas:
+
+    # ──────────────────────────────────────────
+    # Daemon 配置
+    # ──────────────────────────────────────────
+
+    DaemonConfig:
+      type: object
+      description: daemon 全局配置参数，对应 daemon.conf
+      properties:
+        interface_name:
+          type: string
+          description: |
+            网络接口名，用于 daemon 和驱动的网络通信。
+            两接口逗号分隔时启用 ST-2022-7（冗余路径），如 "enp1s0,enp1s1"。
+          example: "lo"
+        http_port:
+          type: integer
+          description: HTTP 服务器端口号
+          example: 8080
+        rtsp_port:
+          type: integer
+          description: RTSP 服务器端口号
+          example: 8854
+        log_severity:
+          type: integer
+          description: |
+            日志严重级别（0-5）。0=trace, 1=debug, 2=info, 3=warning, 4=error, 5=fatal。
+            仅输出级别 ≥ 此值 的日志。
+          example: 2
+        syslog_proto:
+          type: string
+          description: |
+            syslog 协议。空字符串=本地 syslog，"udp"=远程 syslog，"none"=标准输出。
+          example: "none"
+        syslog_server:
+          type: string
+          description: 远程 syslog 服务器地址（syslog_proto 为 udp 时有效）
+          example: "255.255.255.254:1234"
+        rtp_mcast_base:
+          type: string
+          description: |
+            RTP 组播基址。Source 的实际地址 = 基址 + source_id。
+            如基址 239.2.0.1，source_id=1 → 239.2.0.2。
+          example: "239.2.0.1"
+        rtp_mcast_base_sec:
+          type: string
+          description: ST-2022-7 第二接口的 RTP 组播基址
+          example: "239.2.0.1"
+        status_file:
+          type: string
+          description: |
+            会话状态文件路径。daemon 启动时加载、退出时保存，
+            包含所有已配置 Source 和 Sink 的配置。
+          example: "./status.json"
+        rtp_port:
+          type: string
+          description: Source 使用的 RTP 端口号
+          example: "5004"
+        rtp_port_sec:
+          type: string
+          description: ST-2022-7 第二接口的 RTP 端口号
+          example: "5006"
+        ptp_domain:
+          type: integer
+          description: PTP 时钟域，daemon 尝试同步到此域的主时钟
+          example: 0
+        ptp_dscp:
+          type: integer
+          description: |
+            PTP 流量的 IP DSCP 值。有效值：48（CS6）或 46（EF）。
+          example: 46
+        sample_rate:
+          type: integer
+          description: |
+            默认采样率（Hz）。有效值：44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000。
+          example: 44100
+        playout_delay:
+          type: integer
+          description: 默认安全播放延迟（1FS 采样数）
+          example: 0
+        tic_frame_size_at_1fs:
+          type: integer
+          description: |
+            1FS 下的 TIC 帧大小（采样数），范围 32-192。
+            决定驱动基础定时周期。如 192 → 4ms 周期 @48kHz。
+          example: 192
+        max_tic_frame_size:
+          type: integer
+          description: 最大 TIC 帧大小，当前固定 1024
+          example: 1024
+        sap_mcast_addr:
+          type: string
+          description: |
+            SAP 组播地址。RFC 默认 224.2.127.254，很多设备用 239.255.255.255。
+          example: "239.255.255.255"
+        sap_interval:
+          type: integer
+          description: |
+            SAP 通告间隔（秒）。0=自动按 RFC 计算，默认 30 秒。
+          example: 30
+        mac_addr:
+          type: string
+          description: 网络设备 MAC 地址（只读，不可设置）
+          example: "01:00:5e:01:00:01"
+        ip_addr:
+          type: string
+          description: |
+            网络设备 IP 地址。可设置指定首选 IP；若无效则自动检测。
+          example: "127.0.0.1"
+        mdns_enabled:
+          type: boolean
+          description: 是否启用 mDNS 发现（需 WITH_AVAHI=ON 编译）
+          example: false
+        node_id:
+          type: string
+          description: |
+            节点唯一标识（只读）。用于 mDNS/SAP/SDP 服务标识。
+            custom_node_id 非空时取其值，否则按 IP 地址自动生成。
+          example: "AES67 daemon d9aca383"
+        custom_node_id:
+          type: string
+          description: |
+            自定义节点 ID。空=自动生成；非空时由用户负责唯一性以避免名称冲突。
+          example: ""
+        auto_sinks_update:
+          type: boolean
+          description: |
+            是否自动更新 Sink 配置。启用时 daemon 根据 SAP/mDNS 发现的远端 Source
+            自动匹配和更新 Sink 的 SDP（按 Originator o= 行匹配）。
+          example: true
+        ptp_status_script:
+          type: string
+          description: |
+            PTP 状态变化时执行的脚本路径。脚本接收 unlocked/locking/locked 作为参数。
+          example: "./scripts/ptp_status.sh"
+        streamer_enabled:
+          type: boolean
+          description: 是否启用 HTTP Streamer（需 WITH_STREAMER=ON 编译）
+          example: false
+        streamer_channels:
+          type: integer
+          description: Streamer 采集的通道数（从通道 0 开始）
+          example: 8
+        streamer_files_num:
+          type: integer
+          description: Streamer 环形缓冲文件数
+          example: 6
+        streamer_file_duration:
+          type: integer
+          description: 每个 Streamer 文件的时长（秒）
+          example: 1
+        streamer_player_buffer_files_num:
+          type: integer
+          description: Streamer 播放器缓冲文件数
+          example: 1
+
+    # ──────────────────────────────────────────
+    # PTP
+    # ──────────────────────────────────────────
+
+    PtpConfig:
+      type: object
+      description: PTP 时钟配置
+      required: [domain, dscp]
+      properties:
+        domain:
+          type: integer
+          description: PTP 时钟域，daemon 尝试同步到此域的主时钟
+          example: 0
+        dscp:
+          type: integer
+          description: PTP 流量的 IP DSCP 值。有效值：48（CS6）或 46（EF）
+          example: 46
+
+    PtpStatus:
+      type: object
+      description: PTP 从属时钟当前状态
+      required: [status, gmid, jitter]
+      properties:
+        status:
+          type: string
+          description: |
+            PTP 锁定状态。unlocked=未锁定，locking=正在锁定，locked=已锁定。
+            仅 locked 状态下音频流时序可靠。
+          enum: [unlocked, locking, locked]
+          example: "unlocked"
+        gmid:
+          type: string
+          description: 当前同步的 GrandMaster 时钟 ID
+          example: "00-00-00-FF-FE-00-00-00"
+        jitter:
+          type: integer
+          description: 测量的 PTP 包延迟抖动（纳秒）
+          example: 0
+
+    # ──────────────────────────────────────────
+    # RTP Source / Sink
+    # ──────────────────────────────────────────
+
+    RtpSourceConfig:
+      type: object
+      description: RTP Source 的可配置参数（PUT 请求体）
+      properties:
+        enabled:
+          type: boolean
+          description: 是否启用此 Source。启用后向外发送 RTP 组播音频并通告 SDP
+          example: true
+        name:
+          type: string
+          description: Source 名称，用于标识和显示
+          example: "ALSA Source 0"
+        io:
+          type: string
+          description: IO 名称，通常为 "Audio Device"
+          example: "Audio Device"
+        codec:
+          type: string
+          description: |
+            音频编码格式。L16=16-bit 线性 PCM，L24=24-bit 线性 PCM，
+            AM824=32-bit AM824（兼容 L32）。
+          enum: [L16, L24, AM824]
+          example: "L16"
+        address:
+          type: string
+          description: |
+            目的地组播地址。空=使用默认地址（rtp_mcast_base + source_id）。
+            单播地址需目标主机在本地网络活跃。
+          example: ""
+        max_samples_per_packet:
+          type: integer
+          description: |
+            每个 RTP 包的最大采样数。有效值：12, 16, 48, 96, 192。
+            值越大单包时长越长、延迟越高。
+          enum: [12, 16, 48, 96, 192]
+          example: 48
+        ttl:
+          type: integer
+          description: RTP 包的 Time To Live
+          example: 15
+        payload_type:
+          type: integer
+          description: RTP 载荷类型
+          example: 98
+        dscp:
+          type: integer
+          description: |
+            RTP 流量的 IP DSCP 值。有效值：46（EF），34（AF41），26（AF31），0（BE）。
+          example: 34
+        refclk_ptp_traceable:
+          type: boolean
+          description: PTP 参考时钟是否可溯源。可溯源表示时钟源已知且可信
+          example: true
+        map:
+          type: array
+          description: |
+            RTP Source 到 ALSA 播放设备通道的映射。
+            数组长度决定 Source 的通道数，每个元素为 ALSA 通道索引。
+          items:
+            type: integer
+          example: [0, 1]
+
+    RtpSource:
+      type: object
+      description: RTP Source 完整信息（含 ID）
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+              description: Source ID（0-63）
+              example: 0
+        - $ref: "#/components/schemas/RtpSourceConfig"
+
+    RtpSinkConfig:
+      type: object
+      description: RTP Sink 的可配置参数（PUT 请求体）
+      properties:
+        name:
+          type: string
+          description: Sink 名称
+          example: "ALSA Sink 0"
+        io:
+          type: string
+          description: IO 名称
+          example: "Audio Device"
+        delay:
+          type: integer
+          description: |
+            播放延迟（采样数）。不得小于 Source SDP 中声明的 max samples size。
+          example: 576
+        use_sdp:
+          type: boolean
+          description: |
+            SDP 来源方式。true=从 source URL 获取 SDP（HTTP/RTSP），
+            false=使用 sdp 字段中的内联 SDP。
+          example: false
+        source:
+          type: string
+          description: |
+            SDP 文件的 URL（use_sdp=true 时有效）。支持 HTTP 和 RTSP 协议。
+            use_sdp=false 时可为空字符串。
+          example: "http://127.0.0.1:8080/api/source/sdp/0"
+        sdp:
+          type: string
+          description: |
+            内联 SDP 内容（use_sdp=false 时有效）。use_sdp=true 时可为空字符串。
+          example: ""
+        ignore_refclk_gmid:
+          type: boolean
+          description: |
+            是否忽略 SDP 中的 GrandMaster 参考时钟 ID 比对。
+            true=不比对，允许接收不同主时钟的流。
+          example: false
+        map:
+          type: array
+          description: |
+            RTP Sink 到 ALSA 采集设备通道的映射。
+            数组长度决定 Sink 的通道数，每个元素为 ALSA 通道索引。
+          items:
+            type: integer
+          example: [0, 1]
+
+    RtpSink:
+      type: object
+      description: RTP Sink 完整信息（含 ID）
+      allOf:
+        - type: object
+          required: [id]
+          properties:
+            id:
+              type: integer
+              description: Sink ID（0-63）
+              example: 0
+        - $ref: "#/components/schemas/RtpSinkConfig"
+
+    RtpSinkStatus:
+      type: object
+      description: RTP Sink 的接收状态标志
+      required: [sink_flags, sink_min_time]
+      properties:
+        sink_flags:
+          type: object
+          description: RTP 接收状态标志集
+          required:
+            - rtp_seq_id_error
+            - rtp_ssrc_error
+            - rtp_payload_type_error
+            - rtp_sac_error
+            - receiving_rtp_packet
+            - some_muted
+            - all_muted
+            - muted
+          properties:
+            rtp_seq_id_error:
+              type: boolean
+              description: 是否检测到 RTP 序列号错误（丢包或乱序）
+            rtp_ssrc_error:
+              type: boolean
+              description: 是否检测到 RTP SSRC 错误（非预期源贡献数据）
+            rtp_payload_type_error:
+              type: boolean
+              description: 是否收到错误 RTP 载荷类型
+            rtp_sac_error:
+              type: boolean
+              description: 是否收到错误 RTP 时间戳
+            receiving_rtp_packet:
+              type: boolean
+              description: Sink 当前是否正在接收 RTP 包
+            some_muted:
+              type: boolean
+              description: 部分通道被静音（当前未使用）
+            all_muted:
+              type: boolean
+              description: 所有通道被静音（当前未使用）
+            muted:
+              type: boolean
+              description: Sink 当前是否被静音
+        sink_min_time:
+          type: integer
+          description: 最小 Source RTP 包到达时间
+
+    # ──────────────────────────────────────────
+    # 远端源
+    # ──────────────────────────────────────────
+
+    RemoteSource:
+      type: object
+      description: 通过 SAP/mDNS 发现的远端 RTP Source
+      required: [source, id, name, address, sdp, last_seen, announce_period]
+      properties:
+        source:
+          type: string
+          description: 发现协议，SAP 或 mDNS
+          enum: [SAP, mDNS]
+          example: "SAP"
+        id:
+          type: string
+          description: 远端源唯一标识（十六进制字符串）
+          example: "d00000a611d"
+        name:
+          type: string
+          description: 远端源名称
+          example: "ALSA Source 2"
+        domain:
+          type: string
+          description: 远端源域（仅 mDNS 源有值，SAP 源为空）
+          example: ""
+        address:
+          type: string
+          description: 远端源 IP 地址
+          example: "10.0.0.13"
+        sdp:
+          type: string
+          description: 远端源的完整 SDP 内容
+        last_seen:
+          type: integer
+          description: 上次通告距今的秒数
+          example: 2768
+        announce_period:
+          type: integer
+          description: |
+            测量的通告周期（秒）。若远端源超过 announce_period × 10 秒未通告，
+            daemon 自动移除该源。
+          example: 30
+
+    # ──────────────────────────────────────────
+    # Streamer
+    # ──────────────────────────────────────────
+
+    StreamerInfo:
+      type: object
+      description: Sink 的 Streamer 状态和配置信息
+      required: [status, file_duration, files_num, player_buffer_files_num, start_file_id, current_file_id, channels, format, rate]
+      properties:
+        status:
+          type: integer
+          description: |
+            Streamer 状态码。0=OK，1=PTP 未锁定，2=通道未采集，
+            3=缓冲中，4=Streamer 未启用，5=无效 Sink，6=无法获取 Sink。
+          example: 0
+        file_duration:
+          type: integer
+          description: 每个文件的时长（秒）
+          example: 1
+        files_num:
+          type: integer
+          description: 环形缓冲文件总数
+          example: 8
+        start_file_id:
+          type: integer
+          description: 最旧文件的 ID（读取起始位置）
+          example: 3
+        current_file_id:
+          type: integer
+          description: 当前正在写入的文件 ID
+          example: 0
+        player_buffer_files_num:
+          type: integer
+          description: 播放器缓冲文件数
+          example: 1
+        channels:
+          type: integer
+          description: 音频通道数
+          example: 2
+        format:
+          type: string
+          description: PCM 编码格式
+          example: "s16"
+        rate:
+          type: integer
+          description: 采样率（Hz）
+          example: 48000
 
     # ──────────────────────────────────────────
     # 噪声传感器

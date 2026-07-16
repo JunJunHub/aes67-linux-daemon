@@ -1,0 +1,1184 @@
+openapi: 3.1.0
+
+info:
+  title: AES67 Daemon — Noise Analysis & Denoise API
+  description: |
+    噪声分析与降噪模块的 HTTP REST API，涵盖噪声传感器管理、降噪插件控制、
+    噪声模板库管理、Streamer 三路音频流扩展。
+    本文档仅包含噪声模块新增和扩展的接口；daemon 原有接口
+    （/api/config、/api/source、/api/sink 等）见 daemon 主 OpenAPI 文档。
+  version: 0.1.0
+  contact:
+    name: AES67 Daemon Team
+
+servers:
+  - url: http://localhost:{httpPort}
+    description: |
+      daemon HTTP 服务器。httpPort 取自 daemon.conf 的 http_port 参数，
+      默认 8080；noise-dev.sh 开发模式默认 9999。
+    variables:
+      httpPort:
+        default: "8080"
+        description: daemon.conf 中配置的 HTTP 端口号
+
+tags:
+  - name: Noise Sensor
+    description: 噪声传感器的增删改查、指标查询与实时音频流
+  - name: Denoise Plugin
+    description: 降噪插件列表、切换与参数管理
+  - name: Noise Template
+    description: 噪声频谱模板的录入、匹配与管理
+  - name: Streamer Extension
+    description: Streamer 三路（原始/降噪/噪声）× 双模式（AAC/PCM）音频流
+
+paths:
+
+  # ──────────────────────────────────────────────
+  # 噪声传感器
+  # ──────────────────────────────────────────────
+
+  /api/noise/sensors:
+    get:
+      tags: [Noise Sensor]
+      summary: 列出所有噪声传感器
+      description: 返回当前已配置的所有噪声传感器列表，含各传感器的状态摘要和最新指标快照。
+      operationId: listNoiseSensors
+      responses:
+        "200":
+          description: 成功返回传感器列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sensors]
+                properties:
+                  sensors:
+                    type: array
+                    description: 所有已配置的噪声传感器
+                    items:
+                      $ref: "#/components/schemas/NoiseSensor"
+
+  /api/noise/sensor/{id}:
+    get:
+      tags: [Noise Sensor]
+      summary: 获取传感器状态和指标
+      description: 返回指定噪声传感器的完整状态，包括启停状态、最新噪声指标、降噪配置和告警状态。
+      operationId: getNoiseSensor
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: 成功返回传感器详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseSensor"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags: [Noise Sensor]
+      summary: 创建或更新传感器配置
+      description: |
+        创建新传感器或更新已有传感器配置。请求体中未提供的字段保持原值不变。
+        创建传感器时需指定 sink_id（该传感器监测哪个 Sink 的接收音频）。
+      operationId: putNoiseSensor
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NoiseSensorConfig"
+      responses:
+        "200":
+          description: 传感器配置已更新
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseSensor"
+        "201":
+          description: 传感器已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseSensor"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    delete:
+      tags: [Noise Sensor]
+      summary: 删除传感器
+      description: 停止并删除指定噪声传感器，释放其占用的降噪插件实例和帧回调资源。
+      operationId: deleteNoiseSensor
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: 传感器已删除
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/metrics:
+    get:
+      tags: [Noise Sensor]
+      summary: 获取最新指标快照
+      description: 返回该传感器最近一次指标聚合的完整快照，包含检测结果、分析结果、参考比对结果和降噪效果。
+      operationId: getNoiseSensorMetrics
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: 成功返回指标快照
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseMetricsSnapshot"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/history:
+    get:
+      tags: [Noise Sensor]
+      summary: 获取指标历史
+      description: |
+        返回该传感器过去一段时间内的指标历史序列，按等间隔采样。
+        用于 Web UI 绘制噪声级/SNR 时间曲线。
+      operationId: getNoiseSensorHistory
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+        - name: duration
+          in: query
+          description: 查询历史的时间跨度（秒），默认 60 秒
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 3600
+            default: 60
+        - name: interval
+          in: query
+          description: 采样间隔（秒），默认 1 秒。interval 越大返回点越少
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 60
+            default: 1
+      responses:
+        "200":
+          description: 成功返回指标历史序列
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [history]
+                properties:
+                  history:
+                    type: array
+                    description: 按时间顺序排列的指标快照序列
+                    items:
+                      $ref: "#/components/schemas/NoiseMetricsSnapshot"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/denoised:
+    get:
+      tags: [Noise Sensor]
+      summary: SSE 实时推送降噪后 PCM 音频
+      description: |
+        通过 Server-Sent Events (SSE) 实时推送该传感器的降噪后 PCM 音频帧。
+        每个事件 data 字段为 base64 编码的 float32 PCM 帧块（48kHz, mono）。
+        客户端通过 EventSource 建立长连接接收。
+      operationId: streamDenoisedAudio
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: SSE 流已建立，持续推送降噪后 PCM 帧
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/SsePcmStream"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/noise:
+    get:
+      tags: [Noise Sensor]
+      summary: SSE 实时推送噪声分量 PCM 音频
+      description: |
+        通过 SSE 实时推送该传感器的噪声分量 PCM 音频帧（= 原始 - 降噪）。
+        用于实时监听被去除的噪声，判断降噪是否过度或不足。
+        每个事件 data 字段为 base64 编码的 float32 PCM 帧块（48kHz, mono）。
+      operationId: streamNoiseAudio
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: SSE 流已建立，持续推送噪声分量 PCM 帧
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/SsePcmStream"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ──────────────────────────────────────────────
+  # 降噪插件
+  # ──────────────────────────────────────────────
+
+  /api/noise/plugins:
+    get:
+      tags: [Denoise Plugin]
+      summary: 列出可用降噪插件
+      description: |
+        返回编译期可用的所有降噪插件及其元信息（原生采样率、是否支持 VAD、
+        算法延迟、可配置参数列表）。用于 Web UI 展示插件选型下拉框。
+      operationId: listDenoisePlugins
+      responses:
+        "200":
+          description: 成功返回插件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plugins]
+                properties:
+                  plugins:
+                    type: array
+                    description: 编译期可用的降噪插件列表
+                    items:
+                      $ref: "#/components/schemas/PluginInfo"
+
+  /api/noise/sensor/{id}/plugin:
+    put:
+      tags: [Denoise Plugin]
+      summary: 切换降噪插件
+      description: |
+        为指定传感器切换降噪插件。切换采用准热切换：原子替换插件实例，
+        切换后静音一个冷启动窗口（约 50-90ms）让新插件填满内部缓冲与状态，
+        然后恢复正常输出。切换瞬间有短暂静音，无需重启 daemon。
+      operationId: switchDenoisePlugin
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: |
+                    目标插件名称，必须是 /api/noise/plugins 返回的插件之一。
+                    可选值：rnnoise、dtln、deepfilternet（取决于编译选项）。
+                  example: rnnoise
+      responses:
+        "200":
+          description: 插件已切换，返回新降噪配置
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DenoiseConfig"
+        "400":
+          description: 请求的插件名不存在或未编译
+          content:
+            text/plain:
+              schema:
+                type: string
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/plugin/params:
+    get:
+      tags: [Denoise Plugin]
+      summary: 读取插件特有参数
+      description: |
+        返回当前插件的所有特有参数键值对。
+        各插件可配置参数不同（如 rnnoise 的 model、dtln 的 quantized、
+        deepfilternet 的 postfilter），详见 /api/noise/plugins 返回的 params 列表。
+      operationId: getPluginParams
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: 成功返回插件参数
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginParams"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags: [Denoise Plugin]
+      summary: 写入插件特有参数
+      description: |
+        批量设置当前插件的特有参数。未知 key 被忽略，不报错。
+        部分参数变更可能触发插件内部重初始化（如切换 model 文件）。
+      operationId: setPluginParams
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PluginParams"
+      responses:
+        "200":
+          description: 参数已更新，返回更新后的完整参数集
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PluginParams"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/sensor/{id}/denoise:
+    get:
+      tags: [Denoise Plugin]
+      summary: 获取当前降噪配置
+      description: 返回该传感器的降噪配置摘要，包括当前插件名、dry/wet 比和算法延迟。
+      operationId: getDenoiseConfig
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
+      responses:
+        "200":
+          description: 成功返回降噪配置
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DenoiseConfig"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  # ──────────────────────────────────────────────
+  # 噪声模板库
+  # ──────────────────────────────────────────────
+
+  /api/noise/templates:
+    get:
+      tags: [Noise Template]
+      summary: 列出所有噪声模板
+      description: 返回当前模板库中的所有噪声频谱模板，含标签、描述、录入时间等元信息。
+      operationId: listNoiseTemplates
+      responses:
+        "200":
+          description: 成功返回模板列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates:
+                    type: array
+                    description: 模板库中所有噪声模板
+                    items:
+                      $ref: "#/components/schemas/NoiseTemplate"
+
+  /api/noise/template:
+    post:
+      tags: [Noise Template]
+      summary: 录入新噪声模板
+      description: |
+        上传一段噪声示例音频，系统自动提取 32 维 Bark 频带能量作为模板特征，
+        存入模板库供实时匹配使用。请求为 multipart/form-data，包含 WAV 音频文件
+        和模板元信息（标签、描述）。
+      operationId: createNoiseTemplate
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [wav, label]
+              properties:
+                wav:
+                  type: string
+                  format: binary
+                  description: |
+                    噪声示例音频文件（WAV 格式，任意采样率，系统自动重采样到 48kHz）。
+                    建议时长 2-10 秒，包含目标噪声的典型片段。
+                label:
+                  type: string
+                  description: |
+                    噪声类型标签（中文），如"空调噪声"、"50Hz工频哼声"、"风扇噪声"。
+                    用于匹配结果展示和告警描述。
+                  example: "空调噪声"
+                description:
+                  type: string
+                  description: |
+                    模板的详细描述（可选），如"机房精密空调低频隆隆声+风道共振"。
+                    供运维人员理解模板含义。
+      responses:
+        "201":
+          description: 模板已创建
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseTemplate"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/noise/template/{templateId}:
+    delete:
+      tags: [Noise Template]
+      summary: 删除噪声模板
+      description: 从模板库中删除指定模板。删除后实时匹配不再使用该模板。
+      operationId: deleteNoiseTemplate
+      parameters:
+        - $ref: "#/components/parameters/templateId"
+      responses:
+        "200":
+          description: 模板已删除
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    put:
+      tags: [Noise Template]
+      summary: 更新模板标签或描述
+      description: 修改已有模板的 label 和/或 description，不改变其频谱特征。
+      operationId: updateNoiseTemplate
+      parameters:
+        - $ref: "#/components/parameters/templateId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label:
+                  type: string
+                  description: 新的噪声类型标签
+                description:
+                  type: string
+                  description: 新的模板描述
+      responses:
+        "200":
+          description: 模板已更新
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NoiseTemplate"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/template/{templateId}/test:
+    post:
+      tags: [Noise Template]
+      summary: 测试模板匹配
+      description: |
+        上传一段测试音频，返回该音频与指定模板的匹配结果（余弦相似度）。
+        用于录入模板后验证其匹配效果，或调试模板库的识别准确度。
+      operationId: testNoiseTemplate
+      parameters:
+        - $ref: "#/components/parameters/templateId"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [wav]
+              properties:
+                wav:
+                  type: string
+                  format: binary
+                  description: 测试音频文件（WAV 格式）
+      responses:
+        "200":
+          description: 匹配测试结果
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [template_id, label, similarity]
+                properties:
+                  template_id:
+                    type: integer
+                    description: 被测试的模板 ID
+                  label:
+                    type: string
+                    description: 模板的噪声类型标签
+                  similarity:
+                    type: number
+                    format: float
+                    description: |
+                      余弦相似度 [0, 1]。>0.75 通常表示匹配成功，
+                      <0.5 表示该音频与模板不相似。
+                    example: 0.89
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/templates/export:
+    get:
+      tags: [Noise Template]
+      summary: 导出模板库
+      description: |
+        将整个模板库序列化为 JSON 导出，支持跨设备共享模板库。
+        导出内容包含所有模板的元信息和频谱特征向量。
+      operationId: exportNoiseTemplates
+      responses:
+        "200":
+          description: 模板库 JSON 导出
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [templates]
+                properties:
+                  templates:
+                    type: array
+                    description: 导出的模板列表（含完整频谱特征）
+                    items:
+                      $ref: "#/components/schemas/NoiseTemplate"
+
+  /api/noise/templates/import:
+    post:
+      tags: [Noise Template]
+      summary: 导入模板库
+      description: |
+        从 JSON 导入模板库，合并到当前模板库中。
+        已有模板按 label 去重：若导入模板的 label 与已有模板相同，则跳过。
+      operationId: importNoiseTemplates
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [templates]
+              properties:
+                templates:
+                  type: array
+                  description: 待导入的模板列表
+                  items:
+                    $ref: "#/components/schemas/NoiseTemplate"
+      responses:
+        "200":
+          description: 导入完成，返回实际导入的模板数量
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [imported_count]
+                properties:
+                  imported_count:
+                    type: integer
+                    description: 实际导入的模板数量（去重后）
+                  skipped_count:
+                    type: integer
+                    description: 因 label 重复而跳过的模板数量
+
+  # ──────────────────────────────────────────────
+  # Streamer 三路音频流扩展
+  # ──────────────────────────────────────────────
+
+  /api/streamer/stream/{sinkId}/denoised:
+    get:
+      tags: [Streamer Extension]
+      summary: 降噪后 AAC live 流
+      description: |
+        获取指定 Sink 的降噪后 AAC 实时流（ADTS AAC-LC 帧）。
+        仅在该 Sink 已启用噪声传感器且降噪开启时可用，否则返回 404。
+        通过 Accept 头或 format 查询参数选择 AAC 编码或 PCM 直通模式。
+      operationId: streamDenoisedAac
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - $ref: "#/components/parameters/streamFormat"
+      responses:
+        "200":
+          description: |
+            降噪后音频流。默认 Content-Type 为 audio/aac（ADTS AAC-LC 帧）；
+            若 format=pcm 则为 audio/pcm（16-bit signed LE interleaved, 48kHz）。
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+                description: ADTS AAC-LC 帧流，持续推送直到客户端断开
+            audio/pcm:
+              schema:
+                type: string
+                format: binary
+                description: 16-bit signed LE interleaved PCM 流（48kHz），延迟更低
+        "404":
+          description: 该 Sink 未启用噪声传感器或降噪未开启
+
+  /api/streamer/stream/{sinkId}/noise:
+    get:
+      tags: [Streamer Extension]
+      summary: 噪声分量 AAC live 流
+      description: |
+        获取指定 Sink 的噪声分量 AAC 实时流（= 原始 - 降噪）。
+        用于监听被去除的噪声，判断降噪效果。仅在该 Sink 已启用噪声传感器且降噪开启时可用。
+      operationId: streamNoiseAac
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - $ref: "#/components/parameters/streamFormat"
+      responses:
+        "200":
+          description: 噪声分量音频流（AAC 或 PCM，同 denoised 接口）
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+            audio/pcm:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: 该 Sink 未启用噪声传感器或降噪未开启
+
+  /api/streamer/stream/{sinkId}/{fileId}/denoised:
+    get:
+      tags: [Streamer Extension]
+      summary: 降噪后 AAC 文件
+      description: |
+        获取指定 Sink 的降噪后 AAC 文件片段（fileId 为环形缓冲中的文件序号）。
+        用于回放历史降噪音频。仅在该 Sink 已启用噪声传感器且降噪开启时可用。
+      operationId: getDenoisedAacFile
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - name: fileId
+          in: path
+          required: true
+          description: |
+            环形缓冲中的文件序号（0 到 streamer_files_num-1）。
+            通过 /api/streamer/info/:sinkId 获取当前文件范围。
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: 降噪后 AAC 文件内容
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: 文件不存在或该 Sink 未启用降噪
+
+  /api/streamer/stream/{sinkId}/{fileId}/noise:
+    get:
+      tags: [Streamer Extension]
+      summary: 噪声分量 AAC 文件
+      description: |
+        获取指定 Sink 的噪声分量 AAC 文件片段。
+        用于回放历史噪声音频。仅在该 Sink 已启用噪声传感器且降噪开启时可用。
+      operationId: getNoiseAacFile
+      parameters:
+        - $ref: "#/components/parameters/sinkId"
+        - name: fileId
+          in: path
+          required: true
+          description: 环形缓冲中的文件序号
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: 噪声分量 AAC 文件内容
+          content:
+            audio/aac:
+              schema:
+                type: string
+                format: binary
+        "404":
+          description: 文件不存在或该 Sink 未启用降噪
+
+components:
+
+  parameters:
+
+    sensorId:
+      name: id
+      in: path
+      required: true
+      description: 噪声传感器 ID，对应 /api/noise/sensor/:id 路径参数。范围 0-63，与 Sink ID 独立。
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 63
+
+    templateId:
+      name: templateId
+      in: path
+      required: true
+      description: 噪声模板 ID，由系统在录入时自动分配的递增唯一标识。
+      schema:
+        type: integer
+        minimum: 0
+
+    sinkId:
+      name: sinkId
+      in: path
+      required: true
+      description: |
+        RTP Sink ID（0-63），对应 daemon 已有 /api/sink/:id。
+        Streamer 按 Sink ID 分发音频流。
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 63
+
+    streamFormat:
+      name: format
+      in: query
+      required: false
+      description: |
+        音频流输出格式。默认 aac（ADTS AAC-LC 编码）。
+        设为 pcm 时跳过 AAC 编码，直接输出 16-bit signed LE interleaved PCM（48kHz），
+        延迟更低（省去 faacEncEncode ~1ms），适合低延迟监听和波形分析。
+      schema:
+        type: string
+        enum: [aac, pcm]
+        default: aac
+
+  responses:
+
+    NotFound:
+      description: 请求的资源不存在（传感器/模板/Sink ID 无效）
+      content:
+        text/plain:
+          schema:
+            type: string
+            description: 错误描述，如 "sensor 5 not found"
+
+    BadRequest:
+      description: 请求体格式错误或参数值不合法
+      content:
+        text/plain:
+          schema:
+            type: string
+            description: '错误描述，如 "invalid noise_type: foo"'
+
+  schemas:
+
+    # ──────────────────────────────────────────
+    # 噪声传感器
+    # ──────────────────────────────────────────
+
+    NoiseSensor:
+      type: object
+      description: 噪声传感器的完整状态，含配置和最新指标
+      required: [id, sink_id, enabled]
+      properties:
+        id:
+          type: integer
+          description: 传感器 ID（0-63），由 PUT 请求路径指定
+          example: 0
+        sink_id:
+          type: integer
+          description: |
+            该传感器监测的 Sink ID（0-63）。
+            传感器从该 Sink 的接收音频中提取噪声指标和执行降噪。
+          example: 3
+        enabled:
+          type: boolean
+          description: 传感器是否启用。禁用时停止帧回调，不消耗 CPU
+          example: true
+        noise_level_dbfs:
+          type: number
+          format: float
+          description: |
+            最新噪声级（dBFS）。相对于数字满幅的分贝值：
+            -60 dBFS 为良好链路噪声底，-30 dBFS 为可闻噪声，-20 dBFS 为严重噪声。
+            仅在检测到噪声时有意义。
+          example: -42.3
+        noise_type:
+          $ref: "#/components/schemas/NoiseType"
+        estimated_snr_db:
+          type: number
+          format: float
+          description: |
+            估算信噪比（dB）。信号功率与噪声功率的比值：
+            >30dB 几乎无感知噪声，20-30dB 微噪声，<20dB 噪声明显，<10dB 严重影响可懂度。
+          example: 28.5
+        noise_confidence:
+          type: number
+          format: float
+          description: 噪声检测置信度 [0, 1]，越高表示当前帧越确定含噪声
+          example: 0.92
+        denoise_enabled:
+          type: boolean
+          description: 是否对该传感器的音频执行降噪处理
+          example: true
+        denoise_dry_wet:
+          type: number
+          format: float
+          description: |
+            干湿比 [0, 1]。0 = 完全旁通原音，1 = 全降噪，
+            中间值保留部分环境感（适合音乐场景）。
+          example: 0.8
+        denoise_plugin:
+          type: string
+          description: 当前使用的降噪插件名称
+          example: rnnoise
+        denoise_latency_ms:
+          type: number
+          format: float
+          description: 当前插件的算法延迟（ms），只读
+          example: 10.0
+        noise_reduction_db:
+          type: number
+          format: float
+          description: 降噪量（dB）= 输入级 - 输出级，衡量降噪效果
+          example: 18.2
+        alert_threshold_dbfs:
+          type: number
+          format: float
+          description: |
+            噪声告警阈值（dBFS）。noise_level_dbfs 超过此值时触发 Warning 告警。
+            默认 -30 dBFS。
+          example: -30.0
+        is_alerting:
+          type: boolean
+          description: 当前是否处于告警状态（噪声级超过阈值）
+          example: false
+        ref_source_id:
+          type: integer
+          description: |
+            参考音 Sink ID（用于参考比对模式）。255 表示未配置参考音，
+            此时仅做盲检测（单路信号噪声分析）。
+          example: 255
+        spectral_centroid_hz:
+          type: number
+          format: float
+          description: |
+            频谱质心（Hz），表征噪声的"亮度"。
+            白噪声质心偏高（~8kHz），工频哼声质心偏低（~150Hz）。
+          example: 3200.0
+        hum_strength_db:
+          type: number
+          format: float
+          description: 工频哼声强度（dB）。-65 以下为无哼声，-40 以上为明显哼声
+          example: -65.0
+
+    NoiseSensorConfig:
+      type: object
+      description: 噪声传感器的可配置参数（PUT 请求体）
+      properties:
+        sink_id:
+          type: integer
+          description: 监测的 Sink ID（0-63）。创建时必填，创建后不可更改
+          example: 3
+        enabled:
+          type: boolean
+          description: 是否启用传感器
+          example: true
+        denoise_enabled:
+          type: boolean
+          description: 是否启用降噪处理
+          example: true
+        denoise_dry_wet:
+          type: number
+          format: float
+          description: 干湿比 [0, 1]
+          example: 0.8
+        alert_threshold_dbfs:
+          type: number
+          format: float
+          description: 噪声告警阈值（dBFS）
+          example: -30.0
+        ref_source_id:
+          type: integer
+          description: 参考音 Sink ID（255 = 不使用参考比对）
+          example: 255
+
+    NoiseType:
+      type: string
+      description: |
+        噪声类型枚举。由 NoiseAnalyzer 的分层分类器产出：
+        L1 规则式频谱分析识别常见类型，L2 模板匹配识别自定义类型，
+        无法识别的归为 Unknown。
+      enum:
+        - Clean
+        - White
+        - Pink
+        - Hum50Hz
+        - Hum60Hz
+        - Impulse
+        - Broadband
+        - Digital
+        - Unknown
+      x-enum-descriptions:
+        - "干净音频，未检测到噪声"
+        - "白噪声，频谱平坦度 > 0.7（热噪声、DAC 底噪、量化噪声）"
+        - "粉红噪声，频谱斜率 ≈ -3dB/oct（模拟电路 1/f 噪声）"
+        - "50Hz 工频哼声，50Hz 及倍频有窄带峰值（接地环路、电源滤波不良）"
+        - "60Hz 工频哼声，60Hz 及倍频有窄带峰值（北美 60Hz 电力系统）"
+        - "脉冲噪声，短时能量突变 > 6σ（继电器切换、静电放电、时钟跳变）"
+        - "宽带噪声，频谱平坦度 0.3~0.7（风扇气流、空调出风、多源叠加）"
+        - "数字噪声，高频段（>8kHz）有周期性毛刺（时钟 PLL 不稳、采样抖动）"
+        - "未知噪声，L1/L2 均无法识别"
+
+    # ──────────────────────────────────────────
+    # 指标快照
+    # ──────────────────────────────────────────
+
+    NoiseMetricsSnapshot:
+      type: object
+      description: |
+        噪声指标的时间点快照，由 NoiseMetrics 聚合模块产出。
+        包含检测结果、分析结果、参考比对结果和降噪效果四个维度。
+      required: [timestamp_ms, is_noisy]
+      properties:
+        timestamp_ms:
+          type: integer
+          format: int64
+          description: 快照时间戳（毫秒，Unix epoch）
+          example: 1721095200000
+        is_noisy:
+          type: boolean
+          description: 当前帧是否检测到噪声
+          example: true
+        noise_confidence:
+          type: number
+          format: float
+          description: 噪声检测置信度 [0, 1]
+          example: 0.92
+        noise_type:
+          $ref: "#/components/schemas/NoiseType"
+        noise_level_dbfs:
+          type: number
+          format: float
+          description: 噪声级（dBFS）
+          example: -42.3
+        estimated_snr_db:
+          type: number
+          format: float
+          description: 估算信噪比（dB）
+          example: 28.5
+        spectral_centroid_hz:
+          type: number
+          format: float
+          description: 频谱质心（Hz）
+          example: 3200.0
+        hum_strength_db:
+          type: number
+          format: float
+          description: 工频哼声强度（dB）
+          example: -65.0
+        impulse_count:
+          type: number
+          format: float
+          description: 脉冲计数/秒，衡量脉冲噪声频率
+          example: 0.0
+        ref_similarity:
+          type: number
+          format: float
+          description: |
+            参考比对相似度 [0, 1]（仅参考比对模式有效）。
+            <0.8 通常表示主备链路内容不一致或噪声显著。
+          example: 0.95
+        ref_noise_db:
+          type: number
+          format: float
+          description: 参考比对加性噪声估计（dB）（仅参考比对模式有效）
+          example: -55.0
+        ref_delay_ms:
+          type: number
+          format: float
+          description: 参考比对两路信号延时差（ms）（仅参考比对模式有效）
+          example: 0.3
+        input_level_dbfs:
+          type: number
+          format: float
+          description: 降噪前输入级（dBFS）
+          example: -24.1
+        output_level_dbfs:
+          type: number
+          format: float
+          description: 降噪后输出级（dBFS）
+          example: -42.3
+        noise_reduction_db:
+          type: number
+          format: float
+          description: 降噪量（dB）= input_level_dbfs - output_level_dbfs
+          example: 18.2
+
+    # ──────────────────────────────────────────
+    # 降噪插件
+    # ──────────────────────────────────────────
+
+    PluginInfo:
+      type: object
+      description: 降噪插件的元信息，描述其能力和配置选项
+      required: [name, native_sample_rate, supports_vad, algorithmic_latency_ms, params]
+      properties:
+        name:
+          type: string
+          description: |
+            插件唯一标识名。用于 PUT /api/noise/sensor/:id/plugin 切换插件时指定目标。
+          example: rnnoise
+        native_sample_rate:
+          type: integer
+          description: |
+            模型原生采样率（Hz）。若与 daemon 采样率不同，adapter 内部自动重采样。
+            RNNoise/DeepFilterNet = 48000，DTLN = 16000。
+          example: 48000
+        supports_vad:
+          type: boolean
+          description: |
+            该插件是否产出 VAD（语音活动检测）概率。
+            仅 RNNoise 的 process() 返回值包含 VAD；DTLN/DeepFilterNet 无 VAD，
+            需依赖独立的 WebRTC VAD 模块。
+          example: true
+        algorithmic_latency_ms:
+          type: number
+          format: float
+          description: |
+            算法引入的固定延迟（ms）。
+            RNNoise = 10ms（1 帧），DTLN ≈ 34ms（1 帧 + 重采样），
+            DeepFilterNet ≈ 50ms（hop + lookahead）。
+          example: 10.0
+        params:
+          type: array
+          description: 该插件支持的可配置参数 key 列表
+          items:
+            type: string
+          example: ["model"]
+
+    DenoiseConfig:
+      type: object
+      description: 降噪配置摘要
+      required: [denoise_plugin, available_plugins, denoise_dry_wet, denoise_latency_ms]
+      properties:
+        denoise_plugin:
+          type: string
+          description: 当前使用的降噪插件名
+          example: rnnoise
+        available_plugins:
+          type: array
+          description: 编译期可用的插件名列表（只读）
+          items:
+            type: string
+          example: ["rnnoise", "dtln", "deepfilternet"]
+        denoise_dry_wet:
+          type: number
+          format: float
+          description: 干湿比 [0, 1]
+          example: 0.8
+        denoise_latency_ms:
+          type: number
+          format: float
+          description: 当前插件算法延迟（ms），只读
+          example: 10.0
+        plugin_params:
+          type: object
+          description: 当前插件的特有参数键值表
+          additionalProperties:
+            type: string
+          example:
+            model: "/etc/rnnoise/custom-model.bin"
+
+    PluginParams:
+      type: object
+      description: 插件特有参数的键值表
+      additionalProperties:
+        type: string
+      description: |
+        各插件可配置参数不同：
+        - rnnoise: model（.bin 模型文件路径）
+        - dtln: model（ONNX 文件路径）、quantized（true/false，用量化模型）
+        - deepfilternet: postfilter（true/false，后置滤波）、model（.tar.gz 路径）、
+          compensate_delay（true/false，补偿 STFT 前视延迟）
+      example:
+        postfilter: "true"
+        model: "/etc/deepfilternet/DeepFilterNet3_onnx.tar.gz"
+
+    # ──────────────────────────────────────────
+    # 噪声模板
+    # ──────────────────────────────────────────
+
+    NoiseTemplate:
+      type: object
+      description: |
+        噪声频谱模板，用于 L2 模板匹配识别。
+        由运维人员录入噪声示例音频，系统自动提取 32 维 Bark 频带能量作为特征向量。
+      required: [id, label, bark_spectrum, reference_level_dbfs, created_at]
+      properties:
+        id:
+          type: integer
+          description: 模板 ID，由系统在录入时自动分配
+          example: 1
+        label:
+          type: string
+          description: 噪声类型标签（中文），如"空调噪声"、"50Hz工频哼声"
+          example: "空调噪声"
+        description:
+          type: string
+          description: 模板的详细描述，供运维人员理解模板含义
+          example: "机房精密空调低频隆隆声+风道共振"
+        bark_spectrum:
+          type: array
+          description: |
+            归一化的 32 维 Bark 频带能量向量。
+            Bark 频带按人耳听觉临界频带划分（0~20kHz 分为 32 带，低频窄、高频宽）。
+            归一化后各分量之和为 1，用于余弦相似度匹配。
+          items:
+            type: number
+            format: float
+          minItems: 32
+          maxItems: 32
+        reference_level_dbfs:
+          type: number
+          format: float
+          description: 录入时该噪声示例的参考噪声级（dBFS），用于量级比较
+          example: -35.0
+        created_at:
+          type: integer
+          format: int64
+          description: 录入时间戳（毫秒，Unix epoch）
+          example: 1721095200000
+        source:
+          type: string
+          description: |
+            模板来源。manual = 运维人员手动录入，
+            cluster = 系统自动聚类生成（Phase 2）。
+          enum: [manual, cluster]
+          default: manual
+
+    # ──────────────────────────────────────────
+    # SSE 流
+    # ──────────────────────────────────────────
+
+    SsePcmStream:
+      type: object
+      description: |
+        Server-Sent Events (SSE) 实时 PCM 音频流。
+        每个 SSE 事件的 data 字段为 base64 编码的 float32 PCM 帧块。
+        事件格式：
+          event: pcm
+          data: <base64 编码的 float32 PCM 帧>
+          id: <递增序列号>
+
+        客户端通过 EventSource API 建立长连接：
+          const es = new EventSource('/api/noise/sensor/0/denoised');
+          es.addEventListener('pcm', (e) => {
+            const pcm = Float32Array.from(atob(e.data), c => c.charCodeAt(0) / 128 - 1);
+          });
+      properties:
+        event:
+          type: string
+          description: SSE 事件类型，固定为 "pcm"
+          example: pcm
+        data:
+          type: string
+          format: byte
+          description: base64 编码的 float32 PCM 帧块（48kHz, mono, 范围 [-1, 1]）
+        id:
+          type: string
+          description: 递增序列号，用于断线重连时从上次位置续传

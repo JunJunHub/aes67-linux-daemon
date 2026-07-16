@@ -485,7 +485,7 @@ endif()
 
 ### 4.2 运行时切换（准热切换）
 
-通过 HTTP 指定插件名，`DenoiseProcessor` 切换活动插件。采用**准热切换**方案：原子指针交换保证线程安全，切换瞬间静音一个冷启动窗口，不追求无缝过渡。
+通过 HTTP（`PUT /api/noise/sensor/:id/plugin`）指定插件名，`NoiseManager` 将请求**按 `sensor_id` 路由到该 sensor 对应的 DenoiseProcessor 实例**，由其切换活动插件。DenoiseProcessor 是 per-sensor 的（各实例独立持有自己的 `IDenoisePlugin`，详见架构文档 §3.7），切换某一路只影响该路。采用**准热切换**方案：原子指针交换保证线程安全，切换瞬间静音一个冷启动窗口，不追求无缝过渡。
 
 **设计要点**：
 
@@ -550,7 +550,7 @@ class DenoiseProcessor {
 ```mermaid
 sequenceDiagram
     participant CTL as 控制线程
-    participant DP as DenoiseProcessor
+    participant DP as DenoiseProcessor (该 sensor 实例)
     participant NP as 新插件
     participant AT as 音频线程
 

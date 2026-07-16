@@ -690,9 +690,10 @@ paths:
       tags: [Denoise Plugin]
       summary: 切换降噪插件
       description: |
-        为指定传感器切换降噪插件。切换采用准热切换：原子替换插件实例，
-        切换后静音一个冷启动窗口（约 50-90ms）让新插件填满内部缓冲与状态，
-        然后恢复正常输出。切换瞬间有短暂静音，无需重启 daemon。
+        为指定传感器切换降噪插件。每个传感器独立持有自己的插件实例，
+        切换某一路只静音该路约 50-90ms，不影响其它传感器。
+        切换采用准热切换：原子替换插件实例，切换后静音一个冷启动窗口
+        让新插件填满内部缓冲与状态，然后恢复正常输出。切换瞬间有短暂静音，无需重启 daemon。
       operationId: switchDenoisePlugin
       parameters:
         - $ref: "#/components/parameters/sensorId"

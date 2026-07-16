@@ -207,7 +207,9 @@ flowchart TB
     PCS -->|FrameProvider 回调| STR
     PCS -->|FrameProvider 回调| BRIDGE_IF
     BRIDGE_IF --> CAP
-    CAP --> DET & ANA & DNR & REF
+    CAP --> DET & DNR & REF
+    CAP -.->|降噪关闭: 原始 PCM| ANA
+    DNR -.->|降噪开启: 噪声 PCM| ANA
     DET & ANA --> MET
     REF --> MET
     MET --> HTTP & NoiseSSE
@@ -222,7 +224,9 @@ flowchart TB
 >
 > **Streamer 重构**：Streamer 不再持有 `capture_handle_`，不再调用 `snd_pcm_open()`/`snd_pcm_readi()`，改为从 `PcmCaptureService` 注册 FrameProvider 拿帧。Streamer 支持 **AAC 编码**和 **PCM 直通**两种输出模式，可选择编码原始 PCM、降噪 PCM 或噪声 PCM（= 原始 - 降噪）三路之一。
 >
-> **AudioCapture 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内的 `AudioCapture` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后分发给 NoiseDetector/Analyzer/DenoiseProcessor/RefComparator。两者职责不同，不在同一抽象层次。
+> **AudioCapture 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内的 `AudioCapture` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后分发给 NoiseDetector/DenoiseProcessor/RefComparator。两者职责不同，不在同一抽象层次。
+>
+> **NoiseAnalyzer 输入源选择**（虚线箭头）：降噪开启时，NoiseAnalyzer 从 DenoiseProcessor 获取**噪声 PCM**（= original - denoised）做频谱分析——纯噪声信号不含语音分量，分类更准（详见 [§3.3.1](#331-分析输入源选择)）；降噪关闭时，NoiseAnalyzer 从 AudioCapture 获取原始 PCM，需 VAD 过滤语音段。两种路径互斥，由 NoiseManager 按传感器配置自动选择。
 >
 > **DenoiseProcessor 三路输出**：对每帧同时输出原始 PCM（旁通）、降噪后 PCM、噪声 PCM（= original - denoised），供 Streamer 和 SSE 按需选用。
 
@@ -1414,40 +1418,42 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
-| 1.1 | NoiseSessionManagerBridge：独占 ALSA capture + FrameProvider 分发 | 单元测试：帧回调触发 |
-| 1.2 | Streamer 重构：从 Bridge 拿帧，删除 snd_pcm_open/readi | 回归测试：AAC 流功能不变 |
-| 1.3 | NoiseManager（多 sensor map + per-sensor 生命周期）+ AudioCapture：从 Bridge FrameProvider 接收帧，按 sink_id 路由分发到对应 sensor 的处理组件 | 单元测试：帧回调触发；多 sensor 路由 |
-| 1.4 | NoiseDetector：WebRTC VAD + 频谱平坦度 | 单元测试：白噪声/语音/静音 |
-| 1.5 | NoiseAnalyzer：L1 规则式分类 + 置信度 + 混合噪声判定 + L2 模板匹配（噪声样本录入与余弦相似度匹配） | 单元测试：白噪声/哼声/脉冲分类；模板录入+匹配 |
-| 1.6 | DenoiseProcessor：RNNoise 集成 + 三路输出（原始/降噪/噪声） | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪 |
-| 1.7 | NoiseMetrics：指标聚合 + HTTP API | 集成测试：API 响应 |
-| 1.8 | Streamer 三路 AAC 流 API | 集成测试：原始/降噪/噪声流可访问 |
-| 1.9 | CMake WITH_NOISE 选项 + 构建验证 | buildfake.sh 通过 |
+| 1.1 | PcmCaptureService：独占 ALSA capture + FrameProvider 分发机制 + PTP observer + FAKE_DRIVER fake_capture_loop | 单元测试：帧回调触发；FAKE_DRIVER 模式帧可达 |
+| 1.2 | Streamer 重构：删除 snd_pcm_open/readi，从 PcmCaptureService 注册 FrameProvider 拿帧 | 回归测试：WITH_NOISE=OFF 时 AAC 流功能不变 |
+| 1.3 | NoiseSessionManagerBridge + AudioCapture：实现 NoiseAudioBridge 纯虚接口（委托 PcmCaptureService），格式转换（uint8_t→float）+ 通道解复用 + 帧分发入口 | 单元测试：Bridge 帧回调触发；格式转换精度 |
+| 1.4 | RcuPtr\<T\> + NoiseManager：自实现 RCU 同步原语（原子发布 + period 顶部 pin + retire 队列）+ per-sensor 生命周期管理（SensorTable COW + 帧路由） | 单元测试：多 sensor 路由；sensor 增删不阻塞帧处理 |
+| 1.5 | NoiseDetector：WebRTC VAD 集成 + 频谱平坦度 + 噪声底估计（最小统计法） | 单元测试：白噪声/语音/静音检测 |
+| 1.6 | DenoiseProcessor + RnnoiseAdapter：IDenoisePlugin 纯虚接口 + DenoisePluginRegistry + RNNoise 集成 + 三路输出（原始/降噪/噪声）+ 准热切换 + dry/wet 混合 | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪；插件切换静音窗口 |
+| 1.7 | NoiseAnalyzer：L1 规则式分类（白/粉红/哼声/脉冲/宽带）+ 连续置信度 + 混合噪声判定 + 分析输入源选择（降噪开启→噪声 PCM，降噪关闭→原始 PCM + VAD） | 单元测试：白噪声/哼声/脉冲分类；混合噪声判定 |
+| 1.8 | NoiseTemplateDB + L2 模板匹配：Bark 频带特征提取 + 余弦相似度匹配 + 模板持久化（JSON）+ HTTP API（CRUD + 导入/导出 + 测试匹配） | 单元测试：模板录入+匹配+删除；持久化往返 |
+| 1.9 | NoiseMetrics + HTTP REST API：指标聚合 + 告警规则（噪声级/SNR/哼声）+ sensor CRUD + metrics/history 端点 | 集成测试：API 响应；告警触发 |
+| 1.10 | Streamer 三路 AAC 流 API + CMake WITH_NOISE + 构建验证 | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 daemon 行为零变化 |
 
-**预计工期**：2-3 周
+**预计工期**：3-4 周
 
 ### Phase 2 — 完整功能
 
-**目标**：参考比对 + 告警 + HTTP SSE 实时推送 + 传感器配置完善
+**目标**：参考比对 + 告警完善 + HTTP SSE 实时推送 + 传感器配置持久化
 
-| 步骤 | 内容 |
-|------|------|
-| 2.1 | RefComparator：参考音比对噪声检测 |
-| 2.2 | 噪声传感器 HTTP 配置 API 完善（PUT/DELETE /api/noise/sensor/:id 参数校验、持久化到 status_file） |
-| 2.3 | HTTP SSE 实时推送噪声指标与告警 |
-| 2.4 | 告警规则引擎 + HTTP SSE 推送 |
+| 步骤 | 内容 | 验证 |
+|------|------|------|
+| 2.1 | RefComparator：参考音比对噪声检测（双路环形缓冲 + 时间戳对齐 + 自适应滤波残差 → NoiseAnalyzer） | 单元测试：延时估计精度；残差噪声分析 |
+| 2.2 | 噪声传感器配置完善：PUT/DELETE 参数校验 + 持久化到 status_file + 重启恢复 | 集成测试：重启后配置恢复 |
+| 2.3 | HTTP SSE 实时推送：噪声指标快照 + 告警事件 + 降噪后/噪声 PCM 流（base64 编码） | 集成测试：SSE 事件到达；PCM 流解码 |
+| 2.4 | 告警规则引擎：可配置阈值 + 告警级别（Info/Warning/Critical）+ 告警去抖 + 告警历史 + HTTP SSE 推送 | 集成测试：阈值触发告警；SSE 推送 |
 
 ### Phase 3 — 生产增强
 
-**目标**：性能优化 + 自定义模型 + 监听回放 + ML 噪声分类
+**目标**：多采样率适配 + 多降噪插件 + ML 噪声分类 + 并行优化 + 回放
 
-| 步骤 | 内容 |
-|------|------|
-| 3.1 | 自定义 RNNoise 模型加载（针对广播噪声训练） |
-| 3.2 | 降噪后音频回注 ALSA 播放 |
-| 3.3 | L3 ML 噪声分类（PANNs/VGGish 嵌入，ONNX Runtime，处理 L1/L2 无法识别的未知噪声） |
-| 3.4 | 指标持久化 + 历史查询 |
-| 3.5 | 多 Sink 并行处理优化 |
+| 步骤 | 内容 | 验证 |
+|------|------|------|
+| 3.1 | 入口重采样（resampler.hpp）：原生采样率↔48kHz 适配，解除 Phase 1 的 48kHz 限制 | 单元测试：44.1k/96k 重采样精度 |
+| 3.2 | DTLN / DeepFilterNet 插件适配器 + 自定义 RNNoise 模型加载 | 单元测试：各插件降噪量；A/B 对比实验 |
+| 3.3 | L3 ML 噪声分类（PANNs/VGGish 嵌入，ONNX Runtime，处理 L1/L2 无法识别的未知噪声） | 单元测试：未知噪声分类 |
+| 3.4 | 降噪后音频回注 ALSA 播放 | 集成测试：ALSA 播放输出 |
+| 3.5 | 指标持久化 + 历史查询 | 集成测试：历史数据查询 |
+| 3.6 | 多 Sink 并行处理优化 + CPU 过载降级：per-sink 线程池 + xrun 计数监控 + 自动切换轻量插件 | 性能测试：8 路并行 CPU 占用；过载触发降级 |
 
 ---
 

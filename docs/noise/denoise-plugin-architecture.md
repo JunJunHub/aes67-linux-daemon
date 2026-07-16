@@ -196,6 +196,8 @@ namespace noise {
 struct DenoiseResult {
   bool has_vad{false};      // 该插件是否产出 VAD
   float vad_probability{0}; // VAD 概率 [0,1]，仅 RNNoise 等填充
+  bool has_snr{false};      // 该插件是否产出 SNR 估计
+  float estimated_snr_db{0}; // 局部 SNR 估计 (dB)，仅 DeepFilterNet 等填充
 };
 
 // 插件配置（初始化时传入）
@@ -267,7 +269,7 @@ class IDenoisePlugin {
 最简单：frame=hop，无重叠，无需 overlap-add。
 
 ```cpp
-// daemon/noise/adapters/rnnoise_adapter.hpp
+// daemon/noise/model-adapters/rnnoise/rnnoise_adapter.hpp
 class RnnoiseAdapter : public IDenoisePlugin {
  public:
   bool init(const PluginConfig& cfg) override {
@@ -307,7 +309,7 @@ class RnnoiseAdapter : public IDenoisePlugin {
 > 实测：DTLN 用两个 ONNX（model_1 + model_2）。每帧先跑 model_1（输入归一化幅度谱 + 上轮 LSTM 状态），输出掩蔽 + 新状态；掩蔽应用后 IFFT 还原时域块，喂给 model_2（输入时域块 + 上轮 LSTM 状态），输出增强时域块 + 新状态。两个状态张量都要存下来下帧喂回。完整逻辑见仓库 `real_time_processing_onnx.py`。
 
 ```cpp
-// daemon/noise/adapters/dtln_adapter.hpp
+// daemon/noise/model-adapters/dtln/dtln_adapter.hpp
 class DtlnAdapter : public IDenoisePlugin {
  public:
   bool init(const PluginConfig& cfg) override {
@@ -359,7 +361,7 @@ class DtlnAdapter : public IDenoisePlugin {
 > **简化路径**：可直接用 Rust libDF（仓库 `libDF/src/lib.rs` 有 `process_frame(input, output)` 高层 API），它内部封装了三子图编排，C++ 经 cbindgen 生成的 C 头调用。若不想引入 Rust 工具链，则走 ONNX 路径自行编排三子图。
 
 ```cpp
-// daemon/noise/adapters/deepfilternet_adapter.hpp
+// daemon/noise/model-adapters/deepfilternet/deepfilternet_adapter.hpp
 class DeepFilterNetAdapter : public IDenoisePlugin {
  public:
   bool init(const PluginConfig& cfg) override {
@@ -463,18 +465,18 @@ option(NOISE_PLUGIN_DTLN         "Build DTLN denoise plugin"        OFF)
 option(NOISE_PLUGIN_DEEPFILTER   "Build DeepFilterNet denoise plugin" OFF)
 
 if(NOISE_PLUGIN_RNNOISE)
-  target_sources(noise PRIVATE adapters/rnnoise_adapter.cpp)
+  target_sources(noise PRIVATE model-adapters/rnnoise/rnnoise_adapter.cpp)
   target_link_libraries(noise PRIVATE rnnoise)
 endif()
 
 if(NOISE_PLUGIN_DTLN)
-  target_sources(noise PRIVATE adapters/dtln_adapter.cpp)
+  target_sources(noise PRIVATE model-adapters/dtln/dtln_adapter.cpp)
   # 需引入 ONNX Runtime
   target_link_libraries(noise PRIVATE onnxruntime)
 endif()
 
 if(NOISE_PLUGIN_DEEPFILTER)
-  target_sources(noise PRIVATE adapters/deepfilternet_adapter.cpp)
+  target_sources(noise PRIVATE model-adapters/deepfilternet/deepfilternet_adapter.cpp)
   # 需引入 libDF 或 ONNX Runtime
 endif()
 ```
@@ -503,11 +505,12 @@ class DenoiseProcessor {
     // 保留公共配置（dry_wet、采样率、通道）传给新插件
     PluginConfig cfg = current_config_;
     if (!new_plugin->init(cfg)) return false;
+    // 先设静音窗口，再替换指针——避免音频线程在指针替换后、mute 赋值前
+    // 用新插件处理但未静音，导致冷启动哑音泄漏
+    uint32_t latency = new_plugin->algorithmic_latency_samples();
+    mute_samples_remaining_ = latency + kConvergenceMargin;  // 默认 +50ms 样本
     // 原子替换：音频线程下次 process 读到的就是新插件，无锁无 UAF
     std::atomic_store(&plugin_, std::shared_ptr<IDenoisePlugin>(std::move(new_plugin)));
-    // 计算并设置静音窗口 = 新插件算法延迟 + 收敛余量
-    uint32_t latency = plugin_atomic_load()->algorithmic_latency_samples();
-    mute_samples_remaining_ = latency + kConvergenceMargin;  // 默认 +50ms 样本
     // 通知下游延迟变化
     if (latency_change_cb_) latency_change_cb_(latency);
     return true;
@@ -824,10 +827,16 @@ daemon/noise/
 ├── denoise_plugin_factory.hpp/cpp # 插件注册与工厂
 ├── denoise_processor.hpp/cpp       # 持有插件实例，对外暴露（重构 §3.4）
 ├── resampler.hpp/cpp               # 重采样封装（libsamplerate/SpeexDSP）
-├── adapters/                       # 各模型 adapter
-│   ├── rnnoise_adapter.hpp/cpp
-│   ├── dtln_adapter.hpp/cpp
-│   └── deepfilternet_adapter.hpp/cpp
+├── model-adapters/                 # 降噪插件适配器（每个模型一个子目录）
+│   ├── rnnoise/
+│   │   ├── rnnoise_adapter.hpp     # RnnoiseAdapter : IDenoisePlugin
+│   │   └── rnnoise_adapter.cpp     # 原生 C 后端，frame=hop=480，无 overlap-add
+│   ├── dtln/
+│   │   ├── dtln_adapter.hpp        # DtlnAdapter : IDenoisePlugin
+│   │   └── dtln_adapter.cpp        # ONNX 后端，双模型串联 + LSTM 状态传递
+│   └── deepfilternet/
+│       ├── deepfilternet_adapter.hpp  # DeepFilterNetAdapter : IDenoisePlugin
+│       └── deepfilternet_adapter.cpp  # ONNX 三子图编排 or Rust libDF
 └── tests/
     ├── plugin_test.cpp             # 接口一致性测试
     └── ab_compare.py               # A/B 对比实验脚本
@@ -847,9 +856,9 @@ daemon/noise/
 | 6 | 插件切换瞬态噪声 | 新插件冷启动期输出哑音/错音 | 准热切换：切换后静音 `延迟+50ms` 窗口（§4.2） |
 | 7 | 切换线程安全 / UAF | 控制线程换指针时音频线程用后释放 | `std::atomic<shared_ptr>` 原子交换（§4.2 前提确认段） |
 | 8 | 切换延迟跳变 | RNNoise↔DeepFilterNet 延迟差 960 样本致音视频错位 | 切换后上报新 `algorithmic_latency_samples()`，下游补偿 |
-| 7 | DTLN 双模型状态管理 | 状态张量喂回错误导致降噪失效 | 按 §3.2 流程，单测验证状态传递 |
-| 8 | DeepFilterNet 三子图编排 | ONNX 调用顺序错误导致无输出 | 按 §3.3 流程，先复跑仓库 Python 参考验证 |
-| 9 | 多通道 vs 单通道接口 | DeepFilterNet 多通道，RNNoise/DTLN 单 | 接口支持 channels，单通道插件内部循环 |
+| 9 | DTLN 双模型状态管理 | 状态张量喂回错误导致降噪失效 | 按 §3.2 流程，单测验证状态传递 |
+| 10 | DeepFilterNet 三子图编排 | ONNX 调用顺序错误导致无输出 | 按 §3.3 流程，先复跑仓库 Python 参考验证 |
+| 11 | 多通道 vs 单通道接口 | DeepFilterNet 多通道，RNNoise/DTLN 单 | 接口支持 channels，单通道插件内部循环 |
 
 > **可行性结论**：三个模型的集成路径（原生 C / ONNX / ONNX 或 libDF）均已通过克隆仓库的**实际源码和模型文件验证**，不存在阻塞性技术障碍。主要工作量在 DTLN/DeepFilterNet 的状态管理和子图编排，属实现复杂度而非可行性问题。
 

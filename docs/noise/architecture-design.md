@@ -576,7 +576,9 @@ private:
 
 > 噪声 PCM 的计算开销极低（逐样本减法），且对调试和运维极具价值——可以**听到**被去除的噪声长什么样，判断降噪是否过度或不足。
 
-**三路输出缓冲所有权**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配三个缓冲（`original_buf_`/`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体（三路只读指针 + 有效帧数），Streamer 按需读取，无需额外拷贝。
+**三路输出缓冲所有权与跨线程同步**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配三个缓冲（`original_buf_`/`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体（三路只读指针 + 有效帧数）。
+
+> **跨线程同步**：DenoiseProcessor 在 capture 线程写入三路缓冲，Streamer 在自身线程读取——两者访问同一缓冲区需同步。采用**双缓冲 + period 边界 swap** 方案：DenoiseProcessor 持 front/back 两套三路缓冲；capture 线程每 period 写 back 缓冲，period 结束时原子 swap front/back 指针（`std::atomic<DenoiseOutput*>`，release 序）；Streamer 在自身线程读 front 缓冲（acquire 序）。swap 发生在 `on_period_end()`，与 RCU epoch 推进同一静止点，保证 Streamer 读到完整 period 数据而非半写状态。front/back 缓冲构造时分配，运行时零堆分配。
 
 ```cpp
 struct DenoiseOutput {
@@ -773,6 +775,65 @@ class NoiseManager {
 
 ---
 
+### 3.8 RcuPtr<T> — RT 路径无锁读同步原语
+
+`RcuPtr<T>` 是本模块自实现的 RCU（Read-Copy-Update）指针，用于 RT 音频线程无锁读取控制线程发布的可变数据。DenoiseProcessor（§3.4）和 NoiseManager（§3.7）均依赖此原语。
+
+**接口**：
+
+```cpp
+// daemon/noise/rcu_ptr.hpp
+template <typename T>
+class RcuPtr {
+ public:
+  RcuPtr() = default;
+  explicit RcuPtr(std::shared_ptr<T> init);
+
+  // ── 控制线程（发布端）──
+  // 发布新值，返回旧值（推入 retire 队列延迟释放）。
+  // 内存序：release（保证新值写入对 RT 线程可见）。
+  std::shared_ptr<T> publish(std::shared_ptr<T> new_val);
+
+  // ── RT 线程（读取端）──
+  // 在 period 顶部调用，获取当前值的 shared_ptr（引用计数 +1）。
+  // 内存序：acquire（与 publish 的 release 配对）。
+  // 返回的 shared_ptr 在 on_period_end() 前（或 reset() 前）保持有效。
+  std::shared_ptr<T> load() const;
+
+  // 通知 RT 线程已穿越一个静止点（在 on_period_end() 中调用）。
+  // 推进单调 epoch 计数，供 housekeeper 判断旧值可安全释放。
+  void advance_epoch();
+
+  // 当前 epoch（供 housekeeper 查询）
+  uint64_t epoch() const;
+
+ private:
+  std::atomic<T*> ptr_{nullptr};         // 原子裸指针（核心）
+  std::atomic<uint64_t> epoch_{0};       // 单调递增 epoch
+  // shared_ptr 引用计数由 load() 返回的 shared_ptr 自身管理
+};
+```
+
+**同步协议**：
+
+| 角色 | 操作 | 时机 | 内存序 |
+|------|------|------|--------|
+| 控制线程 | `publish(new_val)` | switch_plugin / add_sensor / remove_sensor | release |
+| RT 线程 | `load()` → `pinned_` | `on_period_begin()`（period 顶部，整 period 复用） | acquire |
+| RT 线程 | `pinned_.reset()` + `advance_epoch()` | `on_period_end()`（period 结尾） | release |
+| 控制线程 | `reclaim_older_than(epoch - 1)` | housekeeper 定期驱动 | — |
+
+**关键约束**：
+
+1. **RT 线程不每帧做原子操作**：`load()` 仅在 period 顶部调用一次，整 period 内所有帧复用 `pinned_`，零开销。
+2. **旧值延迟释放**：publish 返回的旧 `shared_ptr<T>` 推入 retire 队列，由 housekeeper 在确认 RT 线程已穿越 ≥2 个静止点（epoch 差 ≥ 2）后释放。保证 RT 线程读到的旧值在释放时已无引用。
+3. **永不为空**：DenoiseProcessor 构造时即 publish `PassthroughPlugin`，`load()` 永不返回 nullptr。
+4. **COW 廉价共享**：`SensorContext` 成员用 `shared_ptr`（非 `unique_ptr`），使 NoiseManager 的 `RcuPtr<const SensorTable>` 在 COW 建新表时无需深拷贝每个 sensor——未改动的 sensor 共享同一 `shared_ptr` 引用。
+
+**与 `std::atomic<std::shared_ptr<T>>` 的关系**：C++20 的 `std::atomic<std::shared_ptr<T>>` 保证无锁，但本项目用 C++17。C++17 的 `std::atomic_load/store(&shared_ptr)` 已废弃且**非无锁**（libstdc++/libc++ 内部用自旋锁），RT 线程访问会优先级反转致 xrun。因此自实现 `RcuPtr<T>`，核心用 `std::atomic<T*>`（裸指针原子操作，所有平台 lock-free）+ `shared_ptr` 引用计数管理生命周期。
+
+---
+
 ## 4. daemon 核心桥接
 
 噪声模块不直接依赖 `SessionManager`/`Config` 等 daemon 核心类，经纯虚接口 `NoiseAudioBridge` 接入，保证模块可独立编译与单元测试（`WITH_NOISE` 关闭时 daemon 行为零变化）。实现位于 daemon 根目录 `noise_session_manager_bridge.hpp/cpp`。
@@ -901,7 +962,7 @@ private:
 - Streamer：按 AAC 编码帧长拆分
 - Noise AudioCapture：拆成 480 样本帧给 NoiseDetector/DenoiseProcessor
 
-**FAKE_DRIVER 模式**：fake driver 的 PTP 永远 UNLOCKED，PcmCaptureService 无法从真实 ALSA 设备读取。此时从 WAV 文件循环读取 PCM 帧作为替代数据源，可重复测试，且可准备含噪声的测试音频做降噪验证。通过配置 `fake_pcm_source` 指定 WAV 文件路径。
+**FAKE_DRIVER 模式**：fake driver 的 PTP 永远 UNLOCKED，PcmCaptureService 无法从真实 ALSA 设备读取。此时 **PcmCaptureService 忽略 PTP 状态**，直接启动 `fake_capture_loop()` 从 WAV 文件循环读取 PCM 帧作为替代数据源。这样 FAKE_DRIVER 模式下帧始终可达，消费者无需关心 PTP 状态——与真实模式下"PTP locked 才有帧"的行为对齐（区别仅在于帧来源）。可通过配置 `fake_pcm_source` 指定 WAV 文件路径；未指定时使用内置静音帧。
 
 ```cpp
 // daemon/pcm_capture_service.hpp
@@ -1000,6 +1061,8 @@ private:
 | `/api/noise/sensor/:id/history` | GET | 获取指标历史（可选 `?duration=60&interval=1`） |
 | `/api/noise/sensor/:id/denoised` | GET | SSE 流，实时推送降噪后 PCM 音频 |
 | `/api/noise/sensor/:id/noise` | GET | SSE 流，实时推送噪声分量 PCM 音频（= 原始 - 降噪） |
+
+> **SSE PCM 流效率权衡**：SSE 基于 HTTP 文本协议，PCM 帧需 base64 编码（+33% 开销）+ SSE 事件帧（`data: ...\n\n`）。48kHz 单声道 float32 = 1920 bytes/10ms 帧，base64 后 ≈2600 bytes，总带宽 ~260 KB/s/路。多路并发时带宽显著。Phase 1 采用 SSE（实现简单、浏览器原生 `EventSource` 支持）；Phase 2 考虑 WebSocket binary frame 替代（零编码开销，带宽降至 ~192 KB/s/路），需 Web UI 同步升级。
 
 ### 5.2 Streamer 扩展 API（三路 × 双模式）
 
@@ -1403,7 +1466,8 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 9 | PcmCaptureService 帧回调内联执行，慢消费者阻塞全局 | 任一 FrameProvider 回调阻塞（如 Streamer 文件 I/O）会拖慢整个 capture 线程，导致 ALSA xrun | Phase 1 帧回调必须快速返回（只做内存拷贝 + 环形缓冲写入），重操作（AAC 编码、文件写入）延后到消费者自身线程 |
 | 10 | Phase 1 多 Sink 帧处理在单 capture 线程内逐帧执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无 per-sink 并行。§1.2.1 的"≥8 路"基于单线程逐帧处理的保守估计 | Phase 1 单线程逐帧处理（各 Sink 交替处理，非串行等待）；Phase 3 步骤 3.5 引入 per-sink 线程池做真正并行 |
 | 11 | RT 路径同步原语非无锁 | `std::atomic_load/store(shared_ptr)`（C++17 废弃自由函数）内部用自旋锁，每帧调用致优先级反转/xrun；旧插件析构（ONNX teardown）若在 RT 线程触发同样致 xrun | **不采用** `atomic_load/store(shared_ptr)`。DenoiseProcessor / NoiseManager 统一用 `RcuPtr<T>`：`atomic<T*>` 原子发布 + period 顶部 pin（整 period 复用，不每帧原子操作）+ retire 队列延迟回收（旧插件析构由控制线程 housekeeper 在静止点后完成，绝不在 RT 线程）。`SensorContext` 用 `shared_ptr` 成员使 sensor 表 COW 廉价共享。详见 §3.7 帧回调线程安全 / 降噪插件文档 §4.2 |
-| 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐；或注册两路回调后在同一 process 调用中匹配 |
+| 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐。设计要点：①两路 Sink 在同一 PTP 域下，帧对齐精度取决于 PTP 同步精度（通常 <1ms），帧回调时机差 ≤1 个 ALSA period；②环形缓冲容量 = 2 × period 样本数（~128ms @48kHz），溢出时丢弃最旧帧并计数告警；③时间戳对齐：按帧序号（PTP 时间戳换算）或按帧到达时间插值，精度要求 ≤1ms（与已有算法 MFCC 互相关对齐精度一致）；④延时差超过 10ms 时标记 `delay_anomaly = true`，不丢弃数据但上报告警供运维排查 |
+| 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
 
 ---
 

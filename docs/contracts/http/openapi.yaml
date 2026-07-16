@@ -1002,7 +1002,8 @@ paths:
       summary: 导入模板库
       description: |
         从 JSON 导入模板库，合并到当前模板库中。
-        已有模板按 label 去重：若导入模板的 label 与已有模板相同，则跳过。
+        已有模板按 label 去重：若导入模板的 label 与已有模板相同，默认跳过；
+        设 overwrite=true 时覆盖已有模板（保留原 id，更新频谱特征和描述）。
       operationId: importNoiseTemplates
       requestBody:
         required: true
@@ -1017,6 +1018,12 @@ paths:
                   description: 待导入的模板列表（每项不含 id/created_at，系统自动分配）
                   items:
                     $ref: "#/components/schemas/NoiseTemplateImport"
+                overwrite:
+                  type: boolean
+                  description: |
+                    是否覆盖已有同名模板。false（默认）= label 重复时跳过；
+                    true = label 重复时覆盖频谱特征和描述（保留原 id 和 created_at）。
+                  default: false
       responses:
         "200":
           description: 导入完成，返回实际导入的模板数量
@@ -1174,7 +1181,10 @@ components:
       name: id
       in: path
       required: true
-      description: 噪声传感器 ID（0-63），对应 /api/noise/sensor/:id 路径参数。
+      description: |
+        噪声传感器 ID（0-63），对应 /api/noise/sensor/:id 路径参数。
+        软上限由 daemon.conf 的 noise_max_sensors（默认 16）控制，超出时 PUT 返回 400。
+        硬限制受 AES67 Sink 上限（64）约束。
       schema:
         type: integer
         minimum: 0
@@ -2131,10 +2141,12 @@ components:
           description: |
             归一化的 32 维 Bark 频带能量向量。
             Bark 频带按人耳听觉临界频带划分（0~20kHz 分为 32 带，低频窄、高频宽）。
-            归一化后各分量之和为 1，用于余弦相似度匹配。
+            归一化后各分量 ≥0 且之和 ≈ 1.0（容差 ±0.01），用于余弦相似度匹配。
+            服务端应校验：数组长度恰好 32、无负值、sum ∈ [0.99, 1.01]；不满足时返回 400。
           items:
             type: number
             format: float
+            minimum: 0
           minItems: 32
           maxItems: 32
         reference_level_dbfs:

@@ -258,7 +258,10 @@ class IDenoisePlugin {
   virtual size_t flush(float* out, size_t n_out_max) = 0;
 
   // ── 动态参数（仅控制线程调用；与 RT process() 并发，实现须线程安全）──
-  // dry_wet_ 须为 std::atomic<float>（relaxed 序，RT 可容忍一帧旧值）。
+  // dry_wet_ 须为 std::atomic<uint32_t>（存储 IEEE 754 位模式，std::memcpy 做
+  // float↔uint32_t 转换）。不直接用 std::atomic<float>：C++ 标准不保证
+  // atomic<float> 是 lock-free，ARM 等平台可能内部用自旋锁致 RT 优先级反转。
+  // atomic<uint32_t> 保证 lock-free（IS_ALWAYS_LOCK_FREE = true on all targets）。
   // params 须为不可变快照：set_param 构造新 shared_ptr<const ParamMap> 原子换，
   // process() 每次顶部 load 快照。绝不让控制线程写 unordered_map 的同时 RT 读
   // （rehash 中途遍历 = UB/可能崩）。详见 §4.2 准热切换的线程模型。
@@ -571,7 +574,7 @@ class DenoiseProcessor {
     if (latency_change_cb_) latency_change_cb_(latency);
     return true;
   }
-  void set_dry_wet(float ratio) { /* 路由到当前活动插件，按 §2.2 契约用 atomic<float> */ }
+  void set_dry_wet(float ratio) { /* 路由到当前活动插件，按 §2.2 契约用 atomic<uint32_t> + memcpy */ }
   bool set_param(const std::string& k, const std::string& v) { /* 同上，不可变快照换；返回插件是否接受 */ }
 
   // ── 音频线程：周期顶部 pin 一次，整周期复用，不每帧原子操作 ──
@@ -936,6 +939,31 @@ daemon/noise/
 | 11 | 多通道 vs 单通道接口 | DeepFilterNet 多通道，RNNoise/DTLN 单 | 接口支持 channels，单通道插件内部按通道循环处理（每通道独立 DenoiseState/LSTM 状态，互不干扰）。见 §3.4 Adapter 对照"多通道"行 |
 
 > **可行性结论**：三个模型的集成路径（原生 C / ONNX / ONNX 或 libDF）均已通过克隆仓库的**实际源码和模型文件验证**，不存在阻塞性技术障碍。主要工作量在 DTLN/DeepFilterNet 的状态管理和子图编排，属实现复杂度而非可行性问题。
+
+### 9.1 ONNX Runtime 线程安全约定
+
+ONNX Runtime 在本系统中的线程模型约定：
+
+| 对象 | 线程安全要求 | 本系统约定 |
+|------|------------|-----------|
+| `Ort::Env` | 进程级单例，**可从多线程并发**访问 | 由 `main()` 生命周期保证：在首次 `CreateOnnxSession` 时初始化，析构晚于所有 `Ort::Session`（daemon 退出时统一释放） |
+| `Ort::Session` | **不可**从多线程并发调用同一 Session 的 `Run()` | 每个 `Ort::Session` 被 per-sensor adapter 独占，仅从该 sensor 的 capture 线程调用 `Run()`，无并发 |
+| `Ort::Session` 析构 | 释放 ONNX 图/权重，耗时毫秒级 | **绝不在 RT 线程析构**。由 `RcuPtr` retire 队列延迟到控制线程 housekeeper 在静止点后执行（§4.2） |
+| `Ort::Value`（LSTM 状态张量） | 非 thread-safe | per-sensor 独占，仅从该 sensor 的 capture 线程读写，无跨线程共享 |
+
+### 9.2 ONNX 推理失败恢复协议
+
+adapter 在 RT 线程 `process()` 中可能遇到 ONNX 推理失败（shape 不配、OOM、数值异常）。恢复协议：
+
+| 阶段 | 条件 | 动作 | `DenoiseResult.status` |
+|------|------|------|------------------------|
+| **单帧降级** | `Session::Run()` 抛异常或返回错误 | 将 `in` 直通到 `out`（`memcpy`），clamp 输出 | `kBypass` |
+| **数值清洗** | 输出含 NaN/Inf 或能量突增 >100× | NaN/Inf 替换为 0，能量异常帧直通 | `kBypass` |
+| **连续降级升级** | 连续 N 帧（默认 N=10）返回 `kBypass` | 标记为不可恢复错误，请求 NoiseManager 切换到 PassthroughPlugin | `kError` |
+| **状态重置** | LSTM 状态发散（输出能量持续 >100× 输入能量） | 置 `kError`，由 NoiseManager 调 `plugin->reset()` 重置状态 | `kError` |
+| **恢复** | NoiseManager 收到 `kError` | 切换该 sensor 到 PassthroughPlugin + 上报 HTTP 告警（`/api/noise/sensor/:id` 的 `is_alerting=true`） | — |
+
+**关键约束**：adapter 在 RT 线程中**绝不抛异常**——所有 ONNX 调用必须 try/catch 包裹，异常时走降级路径。音频流绝不因插件错误中断。
 
 ---
 

@@ -253,7 +253,27 @@ daemon/
 │   ├── audio_capture.hpp/cpp           # 帧分发（noise 模块内部入口，不持有 ALSA 句柄）
 │   ├── noise_detector.hpp/cpp          # 噪声检测 (VAD + 频谱平坦度 + SNR)
 │   ├── noise_analyzer.hpp/cpp          # 噪声特征分析 (频谱 + 分类)
-│   ├── denoise_processor.hpp/cpp       # 降噪 (三路输出: 原始/降噪/噪声)
+│   ├── denoise_processor.hpp/cpp       # 降噪处理器（三路输出: 原始/降噪/噪声）
+│   │                                    # 持有 IDenoisePlugin 实例，管理插件生命周期
+│   │                                    # 准热切换（原子指针 + 冷启动静音窗口）
+│   ├── denoise_plugin.hpp              # IDenoisePlugin 纯虚接口 + PluginConfig + DenoiseResult
+│   ├── denoise_plugin_factory.hpp      # DenoisePluginRegistry 单例（注册/创建插件）
+│   ├── model-adapters/                       # 降噪插件适配器（每个模型一个子目录）
+│   │   ├── rnnoise/                    # RNNoise 适配器
+│   │   │   ├── rnnoise_adapter.hpp     # RnnoiseAdapter : IDenoisePlugin
+│   │   │   └── rnnoise_adapter.cpp     # 原生 C 后端，frame=hop=480，无 overlap-add
+│   │   │                                # 编译条件: NOISE_PLUGIN_RNNOISE=ON（默认 ON）
+│   │   ├── dtln/                       # DTLN 适配器
+│   │   │   ├── dtln_adapter.hpp        # DtlnAdapter : IDenoisePlugin
+│   │   │   └── dtln_adapter.cpp        # ONNX 后端，双模型串联 + LSTM 状态传递
+│   │   │                                # 48k↔16k 重采样 + overlap-add（hop=128, frame=512）
+│   │   │                                # 编译条件: NOISE_PLUGIN_DTLN=ON（默认 OFF）
+│   │   └── deepfilternet/             # DeepFilterNet 适配器
+│   │       ├── deepfilternet_adapter.hpp  # DeepFilterNetAdapter : IDenoisePlugin
+│   │       └── deepfilternet_adapter.cpp  # ONNX 三子图编排 (enc/df_dec/erb_dec)
+│   │                                       # 或 Rust libDF 路径（cbindgen C 头调用）
+│   │                                       # STFT 重叠 + lookahead=2（flush 补零）
+│   │                                       # 编译条件: NOISE_PLUGIN_DEEPFILTER=ON（默认 OFF）
 │   ├── ref_comparator.hpp/cpp          # 参考音比对噪声检测
 │   ├── noise_metrics.hpp/cpp           # 指标聚合与告警
 │   ├── noise_audio_bridge.hpp          # 桥接纯虚接口
@@ -267,6 +287,16 @@ daemon/
 │                                        # Sink 状态查询委托 SessionManager
 └── ...
 ```
+
+> **插件目录设计要点**：
+>
+> - `model-adapters/` 下每个降噪模型独占一个子目录（`rnnoise/`、`dtln/`、`deepfilternet/`），各自包含 `.hpp` + `.cpp`，实现 `IDenoisePlugin` 接口。
+> - 各 adapter 子目录**自包含**——模型特有的重采样、overlap-add、状态管理、多模型编排逻辑全部封装在 adapter 内部，不泄漏到公共接口。
+> - CMake 通过 `NOISE_PLUGIN_*` 选项按需编译 adapter 子目录，默认仅 RNNoise 开启，DTLN/DeepFilterNet 需显式开启（引入 ONNX Runtime / Rust libDF 依赖）。
+> - 新增降噪模型只需在 `model-adapters/` 下新建子目录 + 实现 `IDenoisePlugin` + 在 `.cpp` 中静态注册到 `DenoisePluginRegistry`，无需改动 `denoise_processor.hpp` 或公共接口。
+> - `denoise_plugin.hpp`（纯虚接口）和 `denoise_plugin_factory.hpp`（注册/创建）位于 `noise/` 根目录，是所有 adapter 的公共依赖。
+>
+> 详细的插件接口、各 adapter 实现逻辑、准热切换时序、CMake 集成见 [降噪模块插件化架构设计](denoise-plugin-architecture.md)。
 
 ---
 
@@ -887,13 +917,14 @@ PcmCaptureService (ALSA period = 6144 样本 ≈ 128ms @48kHz)
 
 ### 7.1 新增依赖
 
-| 依赖 | 版本 | 许可 | 用途 | 集成方式 |
-|------|------|------|------|---------|
-| RNNoise | master | BSD-3 | 降噪 | CMake FetchContent or 子模块 |
-| WebRTC VAD | (from webrtc) | BSD-3 | VAD | 源码内嵌（~500 行 C） |
-| SpeexDSP | 1.2.1 | BSD-3 | 重采样 + 备选 VAD | 系统包 or FetchContent |
-| kiss_fft | (from rnnoise) | BSD-3 | FFT | 复用 RNNoise 内嵌版本 |
-| pffft | (可选) | BSD-3 | 高性能 FFT | 替代 kiss_fft |
+| 依赖 | 版本 | 许可 | 用途 | 集成方式 | 编译条件 |
+|------|------|------|------|---------|---------|
+| RNNoise | master | BSD-3 | RNNoise 降噪插件 | CMake FetchContent | `NOISE_PLUGIN_RNNOISE=ON` |
+| WebRTC VAD | (from webrtc) | BSD-3 | VAD | 源码内嵌（~500 行 C） | `WITH_NOISE=ON` |
+| SpeexDSP | 1.2.1 | BSD-3 | 重采样（DTLN 48k↔16k）+ 备选 VAD | 系统包 or FetchContent | `NOISE_PLUGIN_DTLN=ON` |
+| ONNX Runtime | ≥1.16 | MIT | DTLN / DeepFilterNet 推理后端 | 系统包 or FetchContent | `NOISE_PLUGIN_DTLN=ON` ∨ `NOISE_PLUGIN_DEEPFILTER=ON` |
+| kiss_fft | (from rnnoise) | BSD-3 | FFT | 复用 RNNoise 内嵌版本 | `WITH_NOISE=ON` |
+| pffft | (可选) | BSD-3 | 高性能 FFT | 替代 kiss_fft | `WITH_NOISE=ON` |
 
 ### 7.2 CMake 集成
 
@@ -921,13 +952,63 @@ endif()
 
 if(WITH_NOISE)
   add_subdirectory(noise)
-  # RNNoise
+  target_link_libraries(aes67-daemon PRIVATE noise)
+endif()
+```
+
+`daemon/noise/CMakeLists.txt` 负责编译噪声模块核心源码和按需引入各降噪插件 adapter：
+
+```cmake
+# daemon/noise/CMakeLists.txt
+
+# 噪声模块核心源码（始终编译）
+set(NOISE_SOURCES
+  audio_capture.cpp
+  noise_detector.cpp
+  noise_analyzer.cpp
+  denoise_processor.cpp
+  denoise_plugin_factory.cpp
+  ref_comparator.cpp
+  noise_metrics.cpp
+  noise_manager.cpp)
+
+# ── 降噪插件：按需编译 ──
+option(NOISE_PLUGIN_RNNOISE     "Build RNNoise denoise plugin"     ON)
+option(NOISE_PLUGIN_DTLN         "Build DTLN denoise plugin"        OFF)
+option(NOISE_PLUGIN_DEEPFILTER   "Build DeepFilterNet denoise plugin" OFF)
+
+if(NOISE_PLUGIN_RNNOISE)
+  list(APPEND NOISE_SOURCES model-adapters/rnnoise/rnnoise_adapter.cpp)
   FetchContent_Declare(rnnoise
     GIT_REPOSITORY https://gitlab.xiph.org/xiph/rnnoise.git
     GIT_TAG        master)
   FetchContent_MakeAvailable(rnnoise)
-  target_link_libraries(aes67-daemon PRIVATE noise rnnoise)
+  list(APPEND NOISE_LIBS rnnoise)
 endif()
+
+if(NOISE_PLUGIN_DTLN)
+  list(APPEND NOISE_SOURCES model-adapters/dtln/dtln_adapter.cpp)
+  # 需引入 ONNX Runtime（系统包 or FetchContent）
+  find_package(OnnxRuntime REQUIRED)
+  list(APPEND NOISE_LIBS onnxruntime)
+  # SpeexDSP 重采样（48k↔16k）
+  find_package(SpeexDSP REQUIRED)
+  list(APPEND NOISE_LIBS speexdsp)
+endif()
+
+if(NOISE_PLUGIN_DEEPFILTER)
+  list(APPEND NOISE_SOURCES model-adapters/deepfilternet/deepfilternet_adapter.cpp)
+  # 路径 A: ONNX Runtime（三子图编排）
+  find_package(OnnxRuntime REQUIRED)
+  list(APPEND NOISE_LIBS onnxruntime)
+  # 路径 B: Rust libDF（备选，需 cbindgen + Rust 工具链）
+  # find_library(LIBDF_LIBRARY NAMES deep_filter)
+  # list(APPEND NOISE_LIBS ${LIBDF_LIBRARY})
+endif()
+
+add_library(noise STATIC ${NOISE_SOURCES})
+target_include_directories(noise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 ```
 
 ### 7.3 构建验证
@@ -944,6 +1025,17 @@ endif()
 ```
 
 > **WITH_NOISE 接入说明**：`WITH_NOISE` 选项与 `add_subdirectory(noise)` 属于 Phase 1 落地内容，当前 `noise-dev.sh` 尚未传该参数（模块代码未实现）。Phase 1 在 `daemon/CMakeLists.txt` 增加 §7.2 的 option 后，同步在 `noise-dev.sh` build 流程中加上 `-DWITH_NOISE=ON`，使 `./noise-dev.sh build` 默认开启噪声模块。关闭模块（恢复 daemon 默认行为）时用 `cmake -DFAKE_DRIVER=ON -DWITH_NOISE=OFF ..` 手动构建，或临时改脚本开关。
+
+**降噪插件构建组合**：
+
+| 构建命令 | 含义 |
+|---------|------|
+| `cmake -DWITH_NOISE=ON .` | 噪声模块 + RNNoise 插件（默认最小集） |
+| `cmake -DWITH_NOISE=ON -DNOISE_PLUGIN_DTLN=ON .` | + DTLN 插件（引入 ONNX Runtime + SpeexDSP） |
+| `cmake -DWITH_NOISE=ON -DNOISE_PLUGIN_DEEPFILTER=ON .` | + DeepFilterNet 插件（引入 ONNX Runtime） |
+| `cmake -DWITH_NOISE=ON -DNOISE_PLUGIN_RNNOISE=OFF .` | 不编译 RNNoise（仅用其他插件） |
+
+实验期可全开（`-DNOISE_PLUGIN_RNNOISE=ON -DNOISE_PLUGIN_DTLN=ON -DNOISE_PLUGIN_DEEPFILTER=ON`）做 A/B 对比；生产期按场景只开需要的，减少二进制体积和依赖。
 
 真实音频硬件验证改用 `./noise-dev.sh build --real`（构建真实驱动二进制 + LKM）+ `./noise-dev.sh run-real -i <iface>`（加载模块 + ptp4l + daemon 整体验证），委托 `noise-daemonctl.sh`。
 

@@ -44,8 +44,6 @@ tags:
     description: 噪声频谱模板的录入、匹配与管理
   - name: Streamer Extension
     description: Streamer 三路（原始/降噪/噪声）× 双模式（AAC/PCM）音频流
-  - name: Streamer Extension
-    description: Streamer 三路（原始/降噪/噪声）× 双模式（AAC/PCM）音频流
 
 paths:
 
@@ -1148,6 +1146,14 @@ components:
         maximum: 63
 
     sensorId:
+      name: id
+      in: path
+      required: true
+      description: 噪声传感器 ID（0-63），对应 /api/noise/sensor/:id 路径参数。
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 63
 
     templateId:
       name: templateId
@@ -1996,15 +2002,14 @@ components:
 
     PluginParams:
       type: object
-      description: 插件特有参数的键值表
-      additionalProperties:
-        type: string
       description: |
-        各插件可配置参数不同：
+        插件特有参数的键值表。各插件可配置参数不同：
         - rnnoise: model（.bin 模型文件路径）
         - dtln: model（ONNX 文件路径）、quantized（true/false，用量化模型）
         - deepfilternet: postfilter（true/false，后置滤波）、model（.tar.gz 路径）、
           compensate_delay（true/false，补偿 STFT 前视延迟）
+      additionalProperties:
+        type: string
       example:
         postfilter: "true"
         model: "/etc/deepfilternet/DeepFilterNet3_onnx.tar.gz"

@@ -405,16 +405,24 @@ struct NoiseTemplate {
     float reference_level_dbfs;           // 录入时噪声级
     uint64_t created_at;                  // 录入时间戳
     std::string source;                   // 来源 (手动录入/自动聚类)
+    std::string wav_file;                 // 原始 WAV 文件名 (相对于 template_dir)
 };
 
 class NoiseTemplateDB {
 public:
-    // 模板管理
-    uint32_t add_template(const std::string& label, const float* bark_spectrum,
+    // 初始化：加载索引 + 确认 WAV 文件存在
+    bool load(const std::string& template_dir);
+    // 保存索引（原子写：templates.json.tmp + rename）
+    bool save() const;
+
+    // 模板管理（写入后自动调用 save()）
+    uint32_t add_template(const std::string& label,
+                           const float* wav_data, size_t wav_len,
+                           uint32_t sample_rate,
                            float ref_level, const std::string& desc = "");
-    bool remove_template(uint32_t id);
+    bool remove_template(uint32_t id);  // 同时删除 WAV 文件
     bool update_label(uint32_t id, const std::string& new_label);
-    
+
     // 匹配
     struct MatchResult {
         uint32_t template_id;
@@ -423,13 +431,13 @@ public:
     };
     MatchResult match_best(const float* bark_spectrum) const;
     std::vector<MatchResult> match_top_k(const float* bark_spectrum, int k) const;
-    
-    // 持久化
-    bool save(const std::string& path) const;  // JSON
-    bool load(const std::string& path);
-    
+
+    // 获取模板原始 WAV 路径（供 HTTP API 回听）
+    std::string get_wav_path(uint32_t id) const;
+
 private:
-    std::vector<NoiseTemplate> templates_;
+    std::string template_dir_;              // noise_templates/ 目录
+    std::vector<NoiseTemplate> templates_;  // 内存索引
 };
 ```
 

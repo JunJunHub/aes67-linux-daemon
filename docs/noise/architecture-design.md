@@ -1,8 +1,8 @@
 # 噪声分析与降噪系统 — 架构设计
 
-> **版本**: v0.1-draft
-> **日期**: 2026-07-14
-> **状态**: 初稿，待团队讨论
+> **版本**: v0.2-draft
+> **日期**: 2026-07-17
+> **状态**: 初稿，待团队讨论（v0.2 新增 §7 数据持久化设计）
 > **基于**: aes67-linux-daemon (feature/noise 分支，HTTP-only，不扩展 OCA) + RNNoise
 
 ---
@@ -264,6 +264,8 @@ daemon/
 │   │                                    # 准热切换（原子指针 + 冷启动静音窗口）
 │   ├── denoise_plugin.hpp              # IDenoisePlugin 纯虚接口 + PluginConfig + DenoiseResult
 │   ├── denoise_plugin_factory.hpp      # DenoisePluginRegistry 单例（注册/创建插件）
+│   ├── noise_template.hpp/cpp          # NoiseTemplate 结构 + NoiseTemplateDB 模板库
+│   │                                    # 持久化: templates.json (特征索引) + *.wav (原始音频)
 │   ├── resampler.hpp/cpp               # 入口重采样 native↔48k（libsamplerate/SpeexDSP）；AudioCapture 入口调用，Phase ≥2 非原生 48kHz 时启用；与 adapter 内部 48k↔16k（DTLN 自包含）区分
 │   ├── model-adapters/                       # 降噪插件适配器（每个模型一个子目录）
 │   │   ├── rnnoise/                    # RNNoise 适配器
@@ -284,7 +286,7 @@ daemon/
 │   ├── ref_comparator.hpp/cpp          # 参考音比对噪声检测
 │   ├── noise_metrics.hpp/cpp           # 指标聚合与告警
 │   ├── noise_audio_bridge.hpp          # 桥接纯虚接口
-│   ├── noise_manager.hpp/cpp           # 模块总管（生命周期 + 配置）
+│   ├── noise_manager.hpp/cpp           # 模块总管（生命周期 + 配置 + 持久化）
 │   └── tests/                          # 模块测试
 │       ├── noise_test.cpp              # Boost.Test 套件
 │       └── test_data/                  # 测试音频文件
@@ -338,7 +340,7 @@ flowchart LR
 - **帧长**：480 样本/帧（10ms @48kHz），与 RNNoise `FRAME_SIZE` 一致
 - **通道选择**：由 `PcmCaptureService` 按 Sink 的 channel map 从 ALSA 交错缓冲区提取，AudioCapture 收到的已是目标通道的连续帧
 - **分发机制**：观察者模式，注册帧回调；多个消费者共享同一帧缓冲（零拷贝读）
-- **采样率适配**：`PcmCaptureService` 始终以 daemon 配置的**原生采样率**分发帧（Streamer 的 faac 按原生采样率打开）。噪声模块在入口（`AudioCapture`）用 `noise/resampler.hpp` 将原生采样率转 48kHz（RNNoise 固定要求）再分发下游；Phase 1 限定 48kHz，原生即 48kHz，重采样为直通。详见 §10 风险 1
+- **采样率适配**：`PcmCaptureService` 始终以 daemon 配置的**原生采样率**分发帧（Streamer 的 faac 按原生采样率打开）。噪声模块在入口（`AudioCapture`）用 `noise/resampler.hpp` 将原生采样率转 48kHz（RNNoise 固定要求）再分发下游；Phase 1 限定 48kHz，原生即 48kHz，重采样为直通。详见 §11 风险 1
 
 **接口**：
 
@@ -727,7 +729,7 @@ flowchart TB
 | `PUT /api/noise/sensor/:id`（新建） | 创建该 sensor 的 DenoiseProcessor + 初始插件实例，向 Bridge 注册 FrameProvider |
 | `DELETE /api/noise/sensor/:id` | 停止该 sensor，释放其 DenoiseProcessor 及插件实例，注销 FrameProvider |
 | `PUT /api/noise/sensor/:id/plugin` | 路由到该 sensor 的 DenoiseProcessor.switch_plugin()，准热切换 |
-| Sink 删除 / PTP 失锁 | 置 `ptp_locked_=false`+`reset_pending_=true`（atomic）；process 跳过；capture 线程静止后由 housekeeper 执行 plugin flush/reset（见下方 PTP 失锁联动），见 §10 风险 9/11 |
+| Sink 删除 / PTP 失锁 | 置 `ptp_locked_=false`+`reset_pending_=true`（atomic）；process 跳过；capture 线程静止后由 housekeeper 执行 plugin flush/reset（见下方 PTP 失锁联动），见 §11 风险 9/11 |
 
 **接口**：
 
@@ -753,6 +755,12 @@ class NoiseManager {
 
   // PTP 失锁联动：不直接 reset 插件（会与 RT process() 竞态）。
   void on_ptp_unlocked();
+
+  // 持久化（控制线程调用）
+  bool load_status(const std::string& noise_status_file,
+                   const std::string& template_dir);
+  bool save_status() const;         // 变更即写（原子：tmp + rename）
+  bool save_status_on_exit() const; // 退出时同步保存
 
  private:
   // per-sensor 处理上下文。成员用 shared_ptr 以便 SensorTable 被
@@ -1201,7 +1209,7 @@ flowchart LR
 
 > **NoiseAnalyzer 输入源选择**（虚线表示按运行模式择一）：降噪开启时分析噪声 PCM（更准，已去语音分量），降噪关闭时分析原始 PCM（需 VAD 过滤语音段）。详见 [§3.3.1](#331-分析输入源选择)。
 
-> **重采样位置**：`RESAMPLE` 在噪声模块入口（`AudioCapture`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §10 风险 1。
+> **重采样位置**：`RESAMPLE` 在噪声模块入口（`AudioCapture`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §11 风险 1。
 
 ### 6.2 帧处理时序
 
@@ -1245,7 +1253,195 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 
 ---
 
-## 7. 依赖与构建
+## 7. 数据持久化设计
+
+### 7.1 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **与 daemon 风格一致** | 一个 JSON 文件管一类数据 + 启动加载/变更即写/退出保存，与 daemon.conf / status.json 模式一致 |
+| **不污染上游格式** | 噪声数据使用独立文件，不塞进 status.json，避免 upstream sync 冲突 |
+| **模块自管序列化** | NoiseManager / NoiseTemplateDB 各自管理自己的 JSON 文件，不依赖 SessionManager |
+| **崩溃安全** | 写入采用"写临时文件 + rename"原子操作，避免半写状态；传感器/模板变更时即保存，不等到退出 |
+| **WITH_NOISE=OFF 零残留** | 噪声模块关闭时噪声持久化文件不存在，对 daemon 零影响 |
+
+### 7.2 存储文件一览
+
+| 数据 | 文件 | 管理者 | 格式 | 保存时机 |
+|------|------|--------|------|---------|
+| Sink/Source 配置 | `status.json`（`Config::status_file_`） | SessionManager | JSON | 退出时（已有，不变） |
+| 噪声传感器配置 | `noise_status.json`（`Config::noise_status_file_`） | NoiseManager | JSON | 传感器增删改时 + 退出时 |
+| 噪声模板索引 + 特征 | `noise_templates/templates.json` | NoiseTemplateDB | JSON | 模板增删时 + 退出时 |
+| 模板原始 WAV | `noise_templates/*.wav` | NoiseTemplateDB | WAV 二进制 | HTTP 上传时 |
+| 降噪模型文件 | 外部路径（`PluginConfig::model_path`） | IDenoisePlugin | ONNX/.bin | init 时只读 |
+
+运行时目录结构示例：
+
+```
+<daemon 工作目录>/
+├── daemon.conf              # 全局配置（Config，已有）
+├── status.json              # Source/Sink 流配置（SessionManager，已有）
+├── noise_status.json        # 噪声传感器配置（NoiseManager，新增）
+└── noise_templates/         # 噪声模板库目录（新增）
+    ├── templates.json       # 模板元数据 + 32 维 Bark 特征索引
+    ├── template-001.wav     # 模板原始音频（保留，供回听/重新提取）
+    ├── template-002.wav
+    └── ...
+```
+
+### 7.3 Config 新增字段
+
+在 `daemon.conf` 中新增两个噪声相关路径配置（与 `status_file` 平行）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `noise_status_file` | string | `"./noise_status.json"` | 噪声传感器配置文件路径。空字符串禁用传感器持久化 |
+| `noise_template_dir` | string | `"./noise_templates"` | 噪声模板库目录路径。空字符串禁用模板持久化 |
+
+> **路径解析**：相对路径基于 daemon 工作目录（与 `status_file` 行为一致）。生产环境（systemd）可设为 `/var/lib/aes67-daemon/noise_status.json` 和 `/var/lib/aes67-daemon/noise_templates/`。
+>
+> **目录自动创建**：`noise_template_dir` 指定的目录若不存在，NoiseTemplateDB 在首次保存时自动创建（`std::filesystem::create_directories`）。
+
+### 7.4 noise_status.json 格式
+
+```json
+{
+  "sensors": [
+    {
+      "id": 0,
+      "sink_id": 3,
+      "enabled": true,
+      "denoise_plugin": "rnnoise",
+      "denoise_dry_wet": 0.8,
+      "alert_threshold_dbfs": -30.0,
+      "ref_source_id": 255,
+      "analysis_source": "noise_pcm"
+    }
+  ],
+  "global": {
+    "noise_max_sensors": 16
+  }
+}
+```
+
+**序列化/反序列化**：NoiseManager 自管，不经过 SessionManager。使用与 daemon 一致的 `boost::property_tree` 或 nlohmann/json（取决于项目最终选型）。
+
+### 7.5 noise_templates/templates.json 格式
+
+```json
+{
+  "templates": [
+    {
+      "id": 1,
+      "label": "空调噪声",
+      "description": "机房中央空调出风口",
+      "bark_spectrum": [0.12, 0.34, 0.08, ...],
+      "reference_level_dbfs": -35.2,
+      "created_at": 1721187000000,
+      "source": "manual",
+      "wav_file": "template-001.wav"
+    }
+  ]
+}
+```
+
+> **wav_file 字段**：记录该模板对应的原始 WAV 文件名（相对于 `noise_template_dir`）。保留原始音频的用途：①运维可通过 HTTP API 回听确认模板内容；②未来升级特征提取算法时可重新提取，无需重新录入。
+
+### 7.6 NoiseManager 持久化接口
+
+```cpp
+// daemon/noise/noise_manager.hpp（新增方法）
+class NoiseManager {
+ public:
+  // ── 持久化（控制线程调用）──
+  // 启动时加载传感器配置和模板库
+  bool load_status(const std::string& noise_status_file,
+                   const std::string& template_dir);
+  // 传感器/模板变更后保存（原子写：临时文件 + rename）
+  bool save_status() const;
+  // 退出时同步保存（同 save_status，保证落盘）
+  bool save_status_on_exit() const;
+  // ...
+};
+```
+
+**保存策略**：
+
+- **变更即写**：传感器增删改、模板增删时立即调用 `save_status()`（控制线程，低频操作，不阻塞 RT）
+- **原子写入**：先写 `noise_status.json.tmp`，写完 `fsync` 后 `rename` 为 `noise_status.json`。避免 daemon 崩溃时留下半写文件。与 `status.json` 的直接覆写不同——噪声模块数据对崩溃恢复更敏感（长期运行无人值守监测场景）
+- **退出保存**：`save_status_on_exit()` 在 daemon shutdown 序列调用，与 `SessionManager::save_status()` 平行
+
+### 7.7 NoiseTemplateDB 持久化接口
+
+```cpp
+// daemon/noise/noise_template.hpp（更新）
+struct NoiseTemplate {
+    uint32_t id;
+    std::string label;
+    std::string description;
+    std::array<float, 32> bark_spectrum;  // 归一化 Bark 频带能量
+    float reference_level_dbfs;
+    uint64_t created_at;
+    std::string source;        // "manual" 或 "cluster"
+    std::string wav_file;      // 原始 WAV 文件名（相对于 template_dir）
+};
+
+class NoiseTemplateDB {
+public:
+    // 初始化：加载索引 + 确认 WAV 文件存在
+    bool load(const std::string& template_dir);
+    // 保存索引（原子写：templates.json.tmp + rename）
+    bool save() const;
+
+    // 模板管理（写入后自动调用 save()）
+    uint32_t add_template(const std::string& label,
+                           const float* wav_data, size_t wav_len,
+                           uint32_t sample_rate,
+                           float ref_level, const std::string& desc = "");
+    bool remove_template(uint32_t id);  // 同时删除 WAV 文件
+    bool update_label(uint32_t id, const std::string& new_label);
+
+    // 匹配（纯内存操作，不读文件）
+    MatchResult match_best(const float* bark_spectrum) const;
+    std::vector<MatchResult> match_top_k(const float* bark_spectrum, int k) const;
+
+    // 获取模板原始 WAV（供 HTTP API 回听）
+    std::string get_wav_path(uint32_t id) const;
+
+private:
+    std::string template_dir_;              // noise_templates/ 目录
+    std::vector<NoiseTemplate> templates_;  // 内存索引
+};
+```
+
+**add_template 流程**：
+
+1. HTTP 接收 WAV 二进制 + label + description
+2. 重采样到 48kHz（如需）
+3. 提取 32 维 Bark 频带能量 → 归一化
+4. 生成模板 ID，写入 WAV 文件 `template_dir_/template-NNN.wav`
+5. 追加到内存 `templates_`，设置 `wav_file = "template-NNN.wav"`
+6. 调用 `save()` 原子写入 `templates.json`
+
+**remove_template 流程**：
+
+1. 从内存 `templates_` 移除
+2. 删除对应 WAV 文件（`std::filesystem::remove`）
+3. 调用 `save()` 原子写入 `templates.json`
+
+### 7.8 为什么不统一到 status.json
+
+| 考量 | 统一到 status.json | 独立 noise_status.json |
+|------|-------------------|----------------------|
+| 上游同步 | 噪声数据混入上游格式，每次 sync 冲突风险高 | 零冲突，noise 文件 fork 私有 |
+| 序列化耦合 | SessionManager 须感知噪声模块 | NoiseManager 自管，模块化隔离 |
+| WITH_NOISE=OFF | status.json 残留噪声字段 | noise_status.json 不存在，零影响 |
+| 崩溃安全 | status.json 直接覆写（半写风险） | noise_status.json 可用原子写，更安全 |
+| 文件体积 | 单文件膨胀 | 各文件职责单一，体积可控 |
+
+---
+
+## 8. 依赖与构建
 
 ### 7.1 新增依赖
 
@@ -1373,7 +1569,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ---
 
-## 8. 噪声检测技术选型对比
+## 9. 噪声检测技术选型对比
 
 ### 8.1 VAD 方案对比
 
@@ -1412,7 +1608,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ---
 
-## 9. 实施阶段
+## 10. 实施阶段
 
 ### Phase 1 — 最小可用（MVP）
 
@@ -1427,20 +1623,21 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 1.5 | NoiseDetector：WebRTC VAD 集成 + 频谱平坦度 + 噪声底估计（最小统计法） | 单元测试：白噪声/语音/静音检测 |
 | 1.6 | DenoiseProcessor + RnnoiseAdapter：IDenoisePlugin 纯虚接口 + DenoisePluginRegistry + RNNoise 集成 + 三路输出（原始/降噪/噪声）+ 准热切换 + dry/wet 混合 | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪；插件切换静音窗口 |
 | 1.7 | NoiseAnalyzer：L1 规则式分类（白/粉红/哼声/脉冲/宽带）+ 连续置信度 + 混合噪声判定 + 分析输入源选择（降噪开启→噪声 PCM，降噪关闭→原始 PCM + VAD） | 单元测试：白噪声/哼声/脉冲分类；混合噪声判定 |
-| 1.8 | NoiseTemplateDB + L2 模板匹配：Bark 频带特征提取 + 余弦相似度匹配 + 模板持久化（JSON）+ HTTP API（CRUD + 导入/导出 + 测试匹配） | 单元测试：模板录入+匹配+删除；持久化往返 |
+| 1.8 | NoiseTemplateDB + L2 模板匹配：Bark 频带特征提取 + 余弦相似度匹配 + 模板持久化（`noise_templates/templates.json` + 原始 WAV 保留）+ HTTP API（CRUD + 导入/导出 + 测试匹配 + 回听） | 单元测试：模板录入+匹配+删除；持久化往返；WAV 保留与回读 |
 | 1.9 | NoiseMetrics + HTTP REST API：指标聚合 + 告警规则（噪声级/SNR/哼声）+ sensor CRUD + metrics/history 端点 | 集成测试：API 响应；告警触发 |
-| 1.10 | Streamer 三路 AAC 流 API + CMake WITH_NOISE + 构建验证 | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 daemon 行为零变化 |
+| 1.10 | 数据持久化：`noise_status.json` 传感器配置 + `noise_templates/` 模板库 + Config 新增 `noise_status_file`/`noise_template_dir` 字段 + 原子写入（tmp + rename）+ 启动加载/变更即写/退出保存 | 集成测试：重启后传感器+模板恢复；崩溃后文件完整（无半写） |
+| 1.11 | Streamer 三路 AAC 流 API + CMake WITH_NOISE + 构建验证 | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 daemon 行为零变化 |
 
 **预计工期**：3-4 周
 
 ### Phase 2 — 完整功能
 
-**目标**：参考比对 + 告警完善 + HTTP SSE 实时推送 + 传感器配置持久化
+**目标**：参考比对 + 告警完善 + HTTP SSE 实时推送
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
 | 2.1 | RefComparator：参考音比对噪声检测（双路环形缓冲 + 时间戳对齐 + 自适应滤波残差 → NoiseAnalyzer） | 单元测试：延时估计精度；残差噪声分析 |
-| 2.2 | 噪声传感器配置完善：PUT/DELETE 参数校验 + 持久化到 status_file + 重启恢复 | 集成测试：重启后配置恢复 |
+| 2.2 | 噪声传感器配置完善：PUT/DELETE 参数校验增强 + 持久化验证（Phase 1 已实现基础持久化，此步完善边界场景：配置文件缺失/损坏时的降级恢复、并发写入安全） | 集成测试：损坏文件降级恢复；并发写入无数据丢失 |
 | 2.3 | HTTP SSE 实时推送：噪声指标快照 + 告警事件 + 降噪后/噪声 PCM 流（base64 编码） | 集成测试：SSE 事件到达；PCM 流解码 |
 | 2.4 | 告警规则引擎：可配置阈值 + 告警级别（Info/Warning/Critical）+ 告警去抖 + 告警历史 + HTTP SSE 推送 | 集成测试：阈值触发告警；SSE 推送 |
 
@@ -1459,7 +1656,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ---
 
-## 10. 风险与待决事项
+## 11. 风险与待决事项
 
 | # | 风险/待决 | 影响 | 缓解 |
 |---|----------|------|------|
@@ -1476,6 +1673,8 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 11 | RT 路径同步原语非无锁 | `std::atomic_load/store(shared_ptr)`（C++17 废弃自由函数）内部用自旋锁，每帧调用致优先级反转/xrun；旧插件析构（ONNX teardown）若在 RT 线程触发同样致 xrun | **不采用** `atomic_load/store(shared_ptr)`。DenoiseProcessor / NoiseManager 统一用 `RcuPtr<T>`：`atomic<T*>` 原子发布 + period 顶部 pin（整 period 复用，不每帧原子操作）+ retire 队列延迟回收（旧插件析构由控制线程 housekeeper 在静止点后完成，绝不在 RT 线程）。`SensorContext` 用 `shared_ptr` 成员使 sensor 表 COW 廉价共享。详见 §3.7 帧回调线程安全 / 降噪插件文档 §4.2 |
 | 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐。设计要点：①两路 Sink 在同一 PTP 域下，帧对齐精度取决于 PTP 同步精度（通常 <1ms），帧回调时机差 ≤1 个 ALSA period；②环形缓冲容量 = 2 × period 样本数（~128ms @48kHz），溢出时丢弃最旧帧并计数告警；③时间戳对齐：按帧序号（PTP 时间戳换算）或按帧到达时间插值，精度要求 ≤1ms（与已有算法 MFCC 互相关对齐精度一致）；④延时差超过 10ms 时标记 `delay_anomaly = true`，不丢弃数据但上报告警供运维排查 |
 | 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
+| 14 | JSON 持久化文件损坏 | daemon 崩溃/断电/磁盘满导致 `noise_status.json` 或 `templates.json` 半写 | **原子写入**：先写 `.tmp` 文件 → `fsync` → `rename` 覆盖原文件。POSIX `rename()` 是原子的，崩溃后要么是旧文件要么是新文件，不会出现半写状态。加载时若 JSON 解析失败，日志告警并以空配置启动（不阻塞 daemon 启动） |
+| 15 | 模板 WAV 文件与索引不一致 | 手动删除 WAV 文件或 `templates.json` 引用不存在的文件 | `NoiseTemplateDB::load()` 时逐条检查 WAV 文件是否存在，缺失条目日志告警但仍保留索引（特征向量可用，仅回听不可用）；`get_wav_path()` 返回空串表示无原始音频 |
 
 ---
 

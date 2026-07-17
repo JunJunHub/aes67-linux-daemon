@@ -320,9 +320,9 @@ flowchart LR
     PCS["PcmCaptureService<br/>(daemon 核心层)"] -->|FrameProvider| BRIDGE["NoiseAudioBridge"]
     BRIDGE --> CAP["AudioCapture<br/>(noise 模块)"]
     CAP --> NM["NoiseManager<br/>on_frame()"]
-    NM --> DET["① NoiseDetector"]
-    DET --> DNR["② DenoiseProcessor"]
-    DNR -->|"降噪开启: 噪声 PCM"| ANA["③ NoiseAnalyzer"]
+    NM --> DNR["① DenoiseProcessor<br/>(始终执行，不门控)"]
+    DNR --> DET["② NoiseDetector<br/>(始终执行，纯监测)"]
+    DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA["③ NoiseAnalyzer"]
     DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
     ANA --> MET["④ NoiseMetrics"]
     NM -.->|"双路帧缓冲<br/>(独立于主链路)"| REF["RefComparator"]
@@ -337,7 +337,7 @@ flowchart LR
 | **noise 桥接层** | `NoiseAudioBridge` / `NoiseSessionManagerBridge` | 适配接口，将 PcmCaptureService 的帧桥接到噪声模块 |
 | **noise 模块层** | `AudioCapture` → `NoiseManager` | 帧入口 + 按传感器顺序调度处理链路（①→②→③→④） |
 
-> **顺序处理链路**：单传感器内，NoiseDetector → DenoiseProcessor → NoiseAnalyzer → NoiseMetrics 在**同一 capture 线程**中顺序执行，存在数据依赖（详见 §6.3 线程模型）。RefComparator 不在主链路中，它维护双路环形缓冲，在两路帧都到达时独立触发处理（虚线箭头）。
+> **①→② 顺序执行，但无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不依赖②的结果来决定是否处理，②也不依赖①——两者无数据依赖，但始终顺序执行（NoiseDetector 仅 ~0.3ms，并行省不到 3% 帧预算，不值得引入线程同步开销）。③NoiseAnalyzer 根据降噪模式从①或②取输入。RefComparator 不在主链路中，维护双路环形缓冲独立触发（虚线箭头）。详见 §6.3 线程模型。
 
 **关键设计**：
 
@@ -373,9 +373,19 @@ private:
 };
 ```
 
-### 3.2 NoiseDetector — 噪声检测
+### 3.2 NoiseDetector — 噪声检测（监测角色，非门控）
 
-**职责**：实时判断当前帧是否包含噪声，输出布尔检测结果 + 置信度。
+**职责**：实时判断当前帧是否包含噪声，输出布尔检测结果 + 置信度。**NoiseDetector 的角色是监测与指标提供，不是门控**——它不决定 DenoiseProcessor 是否执行，不决定数据是否继续流动。
+
+> **为什么不门控 DenoiseProcessor**：用 NoiseDetector 的检测结果跳过降噪是危险的——假阴性（漏判噪声）会导致系统在最需要降噪时恰好跳过它；而假阳性（对干净帧执行降噪）代价极低，降噪模型对干净音频 ≈ 直通（各频带增益 ≈ 1.0）。此外，降噪模型（RNNoise/DeepFilterNet）内置噪声估计与 VAD，对干净帧天然安全，跳过它省不了多少 CPU（~0.2-0.5ms），却引入了门控误判风险。
+
+**NoiseDetector 的实际价值**：
+
+| 场景 | NoiseDetector 的作用 | VAD 主来源 |
+|------|---------------------|-----------|
+| **降噪开启** | 提供频谱平坦度、SNR 估算等**监测指标**（与降噪模型互补交叉验证） | **降噪模型的 VAD**（RNNoise 返回值 / DeepFilterNet lsnr） |
+| **降噪关闭** | 提供 VAD 给 NoiseAnalyzer 过滤语音段 + 提供监测指标 | **NoiseDetector VAD**（唯一来源） |
+| **告警** | 噪声级 > 阈值时触发告警 | — |
 
 **检测方法**（三层递进）：
 
@@ -394,7 +404,7 @@ private:
 
 替代方案：SpeexDSP 内置 VAD（已有预处理 API，可同时做噪声抑制）。
 
-**RNNoise VAD 复用**：当降噪启用时，RNNoise 每帧输出 VAD 概率（float，0=噪声 1=语音），可直接作为 NoiseDetector L1 层的 VAD 输入，替代或补充 WebRTC VAD。优势：减少一个外部依赖；RNNoise VAD 与其降噪增益协同训练，在含噪环境下比 WebRTC VAD 更稳定。Phase 1 仍以 WebRTC VAD 为主，RNNoise VAD 复用作为 Phase 2 优化项。
+**RNNoise VAD 复用**：当降噪启用时，RNNoise 每帧输出 VAD 概率（float，0=噪声 1=语音），这是**主 VAD 来源**——RNNoise VAD 与其降噪增益协同训练，在含噪环境下比独立 WebRTC VAD 更稳定。NoiseDetector 的 WebRTC VAD 作为**交叉验证**辅助。当降噪关闭时，NoiseDetector 的 WebRTC VAD 是唯一 VAD 来源。
 
 **L2 — 频谱平坦度（Spectral Flatness）**：
 
@@ -1186,12 +1196,12 @@ flowchart LR
 
     subgraph 顺序处理["单传感器帧处理 (capture 线程, 顺序执行)"]
         RESAMPLE["入口重采样<br/>原生转 48k (如需)"]
-        DET["① NoiseDetector<br/>VAD + 频谱平坦度 + SNR"]
-        DNR["② DenoiseProcessor<br/>降噪 + 三路输出"]
+        DNR["① DenoiseProcessor<br/>始终执行，不门控<br/>降噪 + 三路输出"]
+        DET["② NoiseDetector<br/>始终执行，纯监测<br/>VAD + 频谱平坦度 + SNR"]
         ANA["③ NoiseAnalyzer<br/>L1 规则式 + L2 模板匹配"]
         MET["④ NoiseMetrics<br/>指标聚合 + 告警"]
-        RESAMPLE --> DET --> DNR
-        DNR -->|"降噪开启: 噪声 PCM"| ANA
+        RESAMPLE --> DNR --> DET
+        DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA
         DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
         ANA --> MET
     end
@@ -1207,7 +1217,7 @@ flowchart LR
     MET --> HTTP_SSE
 ```
 
-> **顺序处理链路**：①→②→③→④ 在同一 capture 线程内顺序执行，存在数据依赖——DenoiseProcessor 必须先于 NoiseAnalyzer 完成（降噪开启时 NoiseAnalyzer 的输入是 DenoiseProcessor 输出的噪声 PCM）。降噪关闭时 DenoiseProcessor 走 PassthroughPlugin 直通，NoiseAnalyzer 改为从 NoiseDetector 获取原始 PCM + VAD 结果。详见 §6.3 线程模型。
+> **①→② 顺序执行，无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标，仅 ~0.3ms）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（并行省不到 3% 帧预算，不值得引入线程同步）。③NoiseAnalyzer 根据降噪模式从①或②取输入。详见 §6.3 线程模型。
 
 > **重采样位置**：`RESAMPLE` 在噪声模块入口（`AudioCapture`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §11 风险 1。
 
@@ -1227,13 +1237,13 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
   │     拆成 480 样本帧 (48k 下 6144/480 = 12.8 帧/period)
   │     ──┬──────┬──────┬── ... ──┬──────┬──
   │       │ 帧0  │ 帧1  │         │ 帧11 │ 帧12(部分)
-  │       │ ①DET │ ①DET │         │ ①DET │
-  │       │ ②DNR │ ②DNR │         │ ②DNR │
+  │       │ ①DNR │ ①DNR │         │ ①DNR │  ← 始终执行
+  │       │ ②DET │ ②DET │         │ ②DET │  ← 始终执行(监测)
   │       │ ③ANA │ ③ANA │         │ ③ANA │
   │       │ ④MET │ ④MET │         │ ④MET │
 ```
 
-> ①DET=NoiseDetector ②DNR=DenoiseProcessor ③ANA=NoiseAnalyzer ④MET=NoiseMetrics。每帧内四步**顺序执行**：降噪开启时 ③ANA 的输入是 ②DNR 输出的噪声 PCM（数据依赖）；降噪关闭时 ②DNR 走直通，③ANA 改用 ①DET 的 VAD 结果 + 原始 PCM。③ANA 的 L1 规则式分类每帧执行，L2 模板匹配按分析窗口（2s）执行。
+> ①DNR=DenoiseProcessor ②DET=NoiseDetector ③ANA=NoiseAnalyzer ④MET=NoiseMetrics。①②**无数据依赖**（Phase 1 同线程顺序执行，Phase 3 可并行）。③ANA 的输入由降噪模式决定：降噪开启时取 ①DNR 的噪声 PCM + VAD（RNNoise 返回值，更准）；降噪关闭时取 ②DET 的 VAD + 原始 PCM。③ANA 的 L1 规则式分类每帧执行，L2 模板匹配按分析窗口（2s）执行。
 
 单帧处理延迟预算（@48kHz, 480 样本/帧）：
 
@@ -1261,18 +1271,18 @@ capture 线程（PcmCaptureService 的 ALSA 读取线程）
 │
 ├─ on_frame(sink_id, frames, frame_size)   ← 每帧 480 样本 @48kHz
 │
-├─ ① NoiseDetector::process_frame()
-│     → VAD + 频谱平坦度 + SNR 估算
-│     → 输出: NoiseDetectionResult
-│
-├─ ② DenoiseProcessor::process()
+├─ ① DenoiseProcessor::process()           ← 始终执行，不门控
 │     → IDenoisePlugin::process(in, out)
 │     → 输出: DenoiseOutput { original, denoised, noise }
 │            + DenoiseResult { vad, snr }
 │
+├─ ② NoiseDetector::process_frame()        ← 始终执行，纯监测
+│     → VAD + 频谱平坦度 + SNR 估算
+│     → 输出: NoiseDetectionResult
+│
 ├─ ③ NoiseAnalyzer::analyze()              ← 输入源取决于降噪开关
-│     降噪开启:  输入 = ②DenoiseOutput.noise (噪声 PCM)
-│     降噪关闭:  输入 = 原始 PCM + ①VAD 结果
+│     降噪开启:  输入 = ①DenoiseOutput.noise + ①VAD (RNNoise，更准)
+│     降噪关闭:  输入 = 原始 PCM + ②VAD (NoiseDetector，唯一来源)
 │     → L1 规则式分类 + L2 模板匹配
 │     → 输出: NoiseAnalysisResult
 │
@@ -1283,20 +1293,22 @@ capture 线程（PcmCaptureService 的 ALSA 读取线程）
 └─ （返回，等待下一帧）
 ```
 
-**顺序依赖关系**（不可并行）：
+**①→② 顺序执行，无门控关系**：DenoiseProcessor 不依赖 NoiseDetector 的结果来决定是否处理，NoiseDetector 也不依赖 DenoiseProcessor——两者无数据依赖。但始终顺序执行：NoiseDetector 仅 ~0.3ms，并行省不到 3% 帧预算，不值得引入线程同步开销。真正的并行机会在传感器之间（Phase 3 per-sink 线程池），不在单传感器内部。
+
+**③对①②的依赖**（按降噪模式）：
 
 | 依赖 | 原因 |
 |------|------|
-| ② → ③ | 降噪开启时，NoiseAnalyzer 的输入是 DenoiseProcessor 输出的噪声 PCM（= original - denoised），这是数据依赖，不是可选顺序 |
-| ① → ③ | 降噪关闭时，NoiseAnalyzer 需要 NoiseDetector 的 VAD 结果过滤语音段 |
+| ① → ③ | 降噪开启时，NoiseAnalyzer 的输入是 DenoiseProcessor 输出的噪声 PCM（= original - denoised），这是数据依赖 |
+| ② → ③ | 降噪关闭时，NoiseAnalyzer 需要 NoiseDetector 的 VAD 结果过滤语音段 |
 | ①②③ → ④ | NoiseMetrics 聚合是最后一步，必须等所有上游完成 |
 
 **降噪开关对处理链路的影响**：
 
-| 模式 | ②DenoiseProcessor | ③NoiseAnalyzer 输入 | ③对①的依赖 |
-|------|-------------------|-------------------|-----------|
-| **降噪开启** | 正常降噪，输出三路 PCM | ②的噪声 PCM | 弱（噪声 PCM 已不含语音，VAD 仅作辅助） |
-| **降噪关闭** | PassthroughPlugin 直通 | 原始 PCM + ①的 VAD | 强（需 VAD 过滤语音段，仅分析非语音帧） |
+| 模式 | ①DenoiseProcessor | ②NoiseDetector | ③NoiseAnalyzer 输入 | ③的 VAD 来源 |
+|------|-------------------|----------------|-------------------|-------------|
+| **降噪开启** | 正常降噪，输出三路 PCM | 纯监测指标 | ①的噪声 PCM | **①RNNoise VAD**（主）+ ②交叉验证 |
+| **降噪关闭** | PassthroughPlugin 直通 | VAD + 监测指标 | 原始 PCM | **②NoiseDetector VAD**（唯一来源） |
 
 #### 6.3.2 RefComparator 的线程位置
 

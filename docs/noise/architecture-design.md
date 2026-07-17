@@ -319,10 +319,14 @@ daemon/
 flowchart LR
     PCS["PcmCaptureService<br/>(daemon 核心层)"] -->|FrameProvider| BRIDGE["NoiseAudioBridge"]
     BRIDGE --> CAP["AudioCapture<br/>(noise 模块)"]
-    CAP -->|帧回调| DET["NoiseDetector"]
-    CAP -->|帧回调| ANA["NoiseAnalyzer"]
-    CAP -->|帧回调| DNR["DenoiseProcessor×N<br/>(per-sensor)"]
-    CAP -->|帧回调| REF["RefComparator"]
+    CAP --> NM["NoiseManager<br/>on_frame()"]
+    NM --> DET["① NoiseDetector"]
+    DET --> DNR["② DenoiseProcessor"]
+    DNR -->|"降噪开启: 噪声 PCM"| ANA["③ NoiseAnalyzer"]
+    DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
+    ANA --> MET["④ NoiseMetrics"]
+    NM -.->|"双路帧缓冲<br/>(独立于主链路)"| REF["RefComparator"]
+    REF -.-> MET
 ```
 
 **分层说明**：
@@ -331,7 +335,9 @@ flowchart LR
 |------|------|------|
 | **daemon 核心层** | `PcmCaptureService` | 独占 ALSA capture，读取帧，推送给所有 FrameProvider 消费者 |
 | **noise 桥接层** | `NoiseAudioBridge` / `NoiseSessionManagerBridge` | 适配接口，将 PcmCaptureService 的帧桥接到噪声模块 |
-| **noise 模块层** | `AudioCapture` | 噪声模块内部帧分发，按 Sink 分发给各处理器 |
+| **noise 模块层** | `AudioCapture` → `NoiseManager` | 帧入口 + 按传感器顺序调度处理链路（①→②→③→④） |
+
+> **顺序处理链路**：单传感器内，NoiseDetector → DenoiseProcessor → NoiseAnalyzer → NoiseMetrics 在**同一 capture 线程**中顺序执行，存在数据依赖（详见 §6.3 线程模型）。RefComparator 不在主链路中，它维护双路环形缓冲，在两路帧都到达时独立触发处理（虚线箭头）。
 
 **关键设计**：
 
@@ -1178,36 +1184,30 @@ flowchart LR
         ALSA_R --> CH_EXTRACT
     end
 
-    subgraph 并行处理["噪声模块帧处理 (48kHz, 480 样本/帧)"]
+    subgraph 顺序处理["单传感器帧处理 (capture 线程, 顺序执行)"]
         RESAMPLE["入口重采样<br/>原生转 48k (如需)"]
-        VAD["VAD<br/>WebRTC"]
-        SF["频谱平坦度<br/>+ SNR 估算"]
-        RNN["RNNoise 降噪<br/>三路输出"]
-        ANA["NoiseAnalyzer<br/>L1 规则式 + L2 模板匹配<br/>输出类型+置信度"]
+        DET["① NoiseDetector<br/>VAD + 频谱平坦度 + SNR"]
+        DNR["② DenoiseProcessor<br/>降噪 + 三路输出"]
+        ANA["③ NoiseAnalyzer<br/>L1 规则式 + L2 模板匹配"]
+        MET["④ NoiseMetrics<br/>指标聚合 + 告警"]
+        RESAMPLE --> DET --> DNR
+        DNR -->|"降噪开启: 噪声 PCM"| ANA
+        DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
+        ANA --> MET
     end
 
     subgraph 输出["输出"]
-        METRICS["指标聚合<br/>+ 告警判断"]
         HTTP_SSE["HTTP SSE 推送"]
         STR_OUT["Streamer<br/>AAC/PCM 编码 (原生采样率)"]
     end
 
     CH_EXTRACT --> RESAMPLE
-    RESAMPLE --> VAD
-    RESAMPLE --> SF
-    RESAMPLE --> RNN
-    RESAMPLE -.->|"降噪关闭: 原始 PCM (48k)"| ANA
-    RNN -.->|"降噪开启: 噪声 PCM"| ANA
-    VAD --> METRICS
-    SF --> METRICS
-    ANA -->|"主类型+置信度+候选"| METRICS
-    RNN -->|"降噪效果指标"| METRICS
-    RNN -->|"降噪/噪声 PCM"| STR_OUT
+    DNR -->|"降噪/噪声 PCM"| STR_OUT
     CH_EXTRACT -->|"原始 PCM (原生)"| STR_OUT
-    METRICS --> HTTP_SSE
+    MET --> HTTP_SSE
 ```
 
-> **NoiseAnalyzer 输入源选择**（虚线表示按运行模式择一）：降噪开启时分析噪声 PCM（更准，已去语音分量），降噪关闭时分析原始 PCM（需 VAD 过滤语音段）。详见 [§3.3.1](#331-分析输入源选择)。
+> **顺序处理链路**：①→②→③→④ 在同一 capture 线程内顺序执行，存在数据依赖——DenoiseProcessor 必须先于 NoiseAnalyzer 完成（降噪开启时 NoiseAnalyzer 的输入是 DenoiseProcessor 输出的噪声 PCM）。降噪关闭时 DenoiseProcessor 走 PassthroughPlugin 直通，NoiseAnalyzer 改为从 NoiseDetector 获取原始 PCM + VAD 结果。详见 §6.3 线程模型。
 
 > **重采样位置**：`RESAMPLE` 在噪声模块入口（`AudioCapture`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §11 风险 1。
 
@@ -1222,19 +1222,18 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
   │
   │ → Streamer: 按 AAC 帧长拆分, 编码, HTTP 分发 (原生采样率)
   │
-  │ → NoiseAudioBridge → AudioCapture:
+  │ → NoiseAudioBridge → AudioCapture → NoiseManager.on_frame():
   │     [原生 ≠ 48k 时] 入口重采样 原生转 48k (resampler.hpp)
   │     拆成 480 样本帧 (48k 下 6144/480 = 12.8 帧/period)
   │     ──┬──────┬──────┬── ... ──┬──────┬──
   │       │ 帧0  │ 帧1  │         │ 帧11 │ 帧12(部分)
-  │       │ VAD  │ VAD  │         │ VAD  │
-  │       │ RNN  │ RNN  │         │ RNN  │
-  │       │ ANA  │ ANA  │         │ ANA  │
-  │       │  ↓   │  ↓   │         │  ↓   │
-  │       │ 聚合 │ 聚合 │         │ 聚合 │
+  │       │ ①DET │ ①DET │         │ ①DET │
+  │       │ ②DNR │ ②DNR │         │ ②DNR │
+  │       │ ③ANA │ ③ANA │         │ ③ANA │
+  │       │ ④MET │ ④MET │         │ ④MET │
 ```
 
-> ANA = NoiseAnalyzer。降噪开启时，ANA 在 RNN 之后执行（输入为噪声 PCM，更准）；降噪关闭时，ANA 与 RNN 并行（输入为原始 PCM，需 VAD 过滤语音段）。ANA 的 L1 规则式分类每帧执行，L2 模板匹配按分析窗口（2s）执行。
+> ①DET=NoiseDetector ②DNR=DenoiseProcessor ③ANA=NoiseAnalyzer ④MET=NoiseMetrics。每帧内四步**顺序执行**：降噪开启时 ③ANA 的输入是 ②DNR 输出的噪声 PCM（数据依赖）；降噪关闭时 ②DNR 走直通，③ANA 改用 ①DET 的 VAD 结果 + 原始 PCM。③ANA 的 L1 规则式分类每帧执行，L2 模板匹配按分析窗口（2s）执行。
 
 单帧处理延迟预算（@48kHz, 480 样本/帧）：
 
@@ -1250,6 +1249,91 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 | **单帧处理** | **<2ms** | 远低于 10ms 帧预算，实时性充足 |
 
 > ALSA period 延迟（~128ms）是采集侧的固有等待，不影响帧处理实时性——PcmCaptureService 读满一个 period 后，AudioCapture 在 <2ms 内处理完该 period 内的所有 480 样本帧。
+
+### 6.3 线程模型
+
+#### 6.3.1 单传感器帧处理线程
+
+Phase 1 中，单传感器的所有子模块在**同一 capture 线程**内顺序处理，无并行：
+
+```
+capture 线程（PcmCaptureService 的 ALSA 读取线程）
+│
+├─ on_frame(sink_id, frames, frame_size)   ← 每帧 480 样本 @48kHz
+│
+├─ ① NoiseDetector::process_frame()
+│     → VAD + 频谱平坦度 + SNR 估算
+│     → 输出: NoiseDetectionResult
+│
+├─ ② DenoiseProcessor::process()
+│     → IDenoisePlugin::process(in, out)
+│     → 输出: DenoiseOutput { original, denoised, noise }
+│            + DenoiseResult { vad, snr }
+│
+├─ ③ NoiseAnalyzer::analyze()              ← 输入源取决于降噪开关
+│     降噪开启:  输入 = ②DenoiseOutput.noise (噪声 PCM)
+│     降噪关闭:  输入 = 原始 PCM + ①VAD 结果
+│     → L1 规则式分类 + L2 模板匹配
+│     → 输出: NoiseAnalysisResult
+│
+├─ ④ NoiseMetrics::aggregate()
+│     → 合并 ①②③ 的结果 + 告警判断
+│     → 输出: NoiseMetricsSnapshot
+│
+└─ （返回，等待下一帧）
+```
+
+**顺序依赖关系**（不可并行）：
+
+| 依赖 | 原因 |
+|------|------|
+| ② → ③ | 降噪开启时，NoiseAnalyzer 的输入是 DenoiseProcessor 输出的噪声 PCM（= original - denoised），这是数据依赖，不是可选顺序 |
+| ① → ③ | 降噪关闭时，NoiseAnalyzer 需要 NoiseDetector 的 VAD 结果过滤语音段 |
+| ①②③ → ④ | NoiseMetrics 聚合是最后一步，必须等所有上游完成 |
+
+**降噪开关对处理链路的影响**：
+
+| 模式 | ②DenoiseProcessor | ③NoiseAnalyzer 输入 | ③对①的依赖 |
+|------|-------------------|-------------------|-----------|
+| **降噪开启** | 正常降噪，输出三路 PCM | ②的噪声 PCM | 弱（噪声 PCM 已不含语音，VAD 仅作辅助） |
+| **降噪关闭** | PassthroughPlugin 直通 | 原始 PCM + ①的 VAD | 强（需 VAD 过滤语音段，仅分析非语音帧） |
+
+#### 6.3.2 RefComparator 的线程位置
+
+RefComparator 不在单传感器的帧处理主链路中。它需要**两路 Sink 的帧**，而 capture 线程按 `sink_id` 逐帧回调：
+
+```
+capture 线程:
+  on_frame(sink_id=3, ...)  ← 比对音（备链路 Sink）
+    → 写入 RefComparator 的 cmp 环形缓冲
+  on_frame(sink_id=7, ...)  ← 参考音（主链路 Sink）
+    → 写入 RefComparator 的 ref 环形缓冲
+    → 尝试对齐处理（若两路缓冲都有足够数据）
+      → 输出 RefCompareResult → 写入 NoiseMetrics
+```
+
+RefComparator 维护双路环形缓冲 + 时间戳对齐，在两路帧都到达时触发处理。其结果异步写入 NoiseMetrics，**不阻塞主链路的帧处理时序**。详见 §11 风险 12。
+
+#### 6.3.3 多传感器并发
+
+Phase 1 中，多个传感器的帧处理在**同一 capture 线程**内交替执行（非并行）：
+
+```
+on_frame(sink_id=3, ...) → sensor 0 的 ①②③④
+on_frame(sink_id=5, ...) → sensor 1 的 ①②③④
+on_frame(sink_id=3, ...) → sensor 0 的 ①②③④  （下一帧）
+...
+```
+
+8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 帧预算内但无 per-sink 并行（见 §11 风险 10）。Phase 3 引入 per-sink 线程池做真正并行。
+
+#### 6.3.4 控制线程与 RT 线程的交互
+
+| 线程 | 操作 | 与 RT 线程的同步 |
+|------|------|----------------|
+| **capture 线程（RT）** | on_frame → ①②③④ 顺序处理 | 读路径无锁：period 顶部 load RCU 快照，整 period 复用 |
+| **控制线程（HTTP）** | add/remove_sensor, switch_plugin, set_dry_wet | 写路径：COW 建新表/新 slot → 原子 publish → 旧值入 retire 队列 |
+| **housekeeper（控制线程）** | drain_retire：释放穿越 ≥2 静止点的旧值 | 旧插件析构（ONNX teardown / rnnoise_destroy）在此线程完成，绝不在 RT 线程 |
 
 ---
 

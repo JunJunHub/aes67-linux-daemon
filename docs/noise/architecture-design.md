@@ -524,7 +524,7 @@ flowchart TB
 
 **边界模糊处理**：置信度在阈值附近连续过渡，避免类型跳变。例如 SF 从 0.69→0.71 时，白噪声置信度从 0→0.03 平滑过渡，而非突然切换类型。
 
-#### 3.3.5 L2 模板匹配（Phase 3）
+#### 3.3.5 L2 模板匹配（Phase 1）
 
 L1 规则式只能识别 5-8 种教科书噪声类型，无法区分具体噪声源（如"空调噪声" vs "风扇噪声"）。L2 模板匹配弥补此局限：
 
@@ -1544,7 +1544,7 @@ private:
 
 ## 8. 依赖与构建
 
-### 7.1 新增依赖
+### 8.1 新增依赖
 
 | 依赖 | 版本 | 许可 | 用途 | 集成方式 | 编译条件 |
 |------|------|------|------|---------|---------|
@@ -1555,7 +1555,7 @@ private:
 | kiss_fft | (from rnnoise) | BSD-3 | FFT | 复用 RNNoise 内嵌版本 | `WITH_NOISE=ON` |
 | pffft | (可选) | BSD-3 | 高性能 FFT | 替代 kiss_fft | `WITH_NOISE=ON` |
 
-### 7.2 CMake 集成
+### 8.2 CMake 集成
 
 ```cmake
 # daemon/CMakeLists.txt 新增
@@ -1640,7 +1640,7 @@ target_include_directories(noise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 ```
 
-### 7.3 构建验证
+### 8.3 构建验证
 
 噪声模块的编译验证统一使用 `noise-dev.sh`（out-of-source 构建到 `daemon/build/`，导出 `compile_commands.json` 供 clangd，详见 `.claude/rules/build.md`）。脚本封装 FAKE_DRIVER=ON + WITH_AVAHI=ON + WITH_STREAMER=OFF、不传 WITH_OCA（本分支不接入 OCA）。注意 `WITH_AVAHI=ON` 与标准 CI 路径 `buildfake.sh`（`WITH_AVAHI=OFF`）不同——noise 开发环境需要 mDNS 向局域网发布 daemon 服务，以便 Web UI 或 Fitcan 控制器发现和连接。
 
@@ -1672,7 +1672,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ## 9. 噪声检测技术选型对比
 
-### 8.1 VAD 方案对比
+### 9.1 VAD 方案对比
 
 | 方案 | 语言 | 帧长 | 延迟 | 精度 | 许可 | 推荐度 |
 |------|------|------|------|------|------|--------|
@@ -1683,7 +1683,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 **推荐**：WebRTC VAD 作为主 VAD，RNNoise 返回的 VAD 概率作为辅助交叉验证。
 
-### 8.2 噪声估计方案对比
+### 9.2 噪声估计方案对比
 
 | 方案 | 原理 | 优势 | 劣势 | 适用场景 |
 |------|------|------|------|---------|
@@ -1695,7 +1695,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 **推荐**：频谱平坦度（快速检测）+ 最小统计法（噪声底估计）+ 自适应滤波（参考比对）组合使用。
 
-### 8.3 降噪方案对比
+### 9.3 降噪方案对比
 
 | 方案 | 原理 | 延迟 | 音质 | 计算量 | 许可 |
 |------|------|------|------|--------|------|
@@ -1713,38 +1713,38 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 ### Phase 1 — 最小可用（MVP）
 
-**目标**：多 Sink 噪声检测 + 噪声分类（L1 规则式 + L2 模板匹配）+ RNNoise 降噪 + HTTP API（单 capture 线程逐帧处理，并发数受 CPU 约束，见 §1.2.1）
+**目标**：多 Sink 噪声检测 + 噪声分类（L1 规则式 + L2 模板匹配）+ RNNoise 降噪 + HTTP API + 数据持久化。单 capture 线程逐帧**顺序处理**（①DenoiseProcessor → ②NoiseDetector → ③NoiseAnalyzer → ④NoiseMetrics），①始终执行不门控，②为纯监测角色。并发数受 CPU 约束（见 §1.2.1）。
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
 | 1.1 | PcmCaptureService：独占 ALSA capture + FrameProvider 分发机制 + PTP observer + FAKE_DRIVER fake_capture_loop | 单元测试：帧回调触发；FAKE_DRIVER 模式帧可达 |
 | 1.2 | Streamer 重构：删除 snd_pcm_open/readi，从 PcmCaptureService 注册 FrameProvider 拿帧 | 回归测试：WITH_NOISE=OFF 时 AAC 流功能不变 |
 | 1.3 | NoiseSessionManagerBridge + AudioCapture：实现 NoiseAudioBridge 纯虚接口（委托 PcmCaptureService），格式转换（uint8_t→float）+ 通道解复用 + 帧分发入口 | 单元测试：Bridge 帧回调触发；格式转换精度 |
-| 1.4 | RcuPtr\<T\> + NoiseManager：自实现 RCU 同步原语（原子发布 + period 顶部 pin + retire 队列）+ per-sensor 生命周期管理（SensorTable COW + 帧路由） | 单元测试：多 sensor 路由；sensor 增删不阻塞帧处理 |
-| 1.5 | NoiseDetector：WebRTC VAD 集成 + 频谱平坦度 + 噪声底估计（最小统计法） | 单元测试：白噪声/语音/静音检测 |
-| 1.6 | DenoiseProcessor + RnnoiseAdapter：IDenoisePlugin 纯虚接口 + DenoisePluginRegistry + RNNoise 集成 + 三路输出（原始/降噪/噪声）+ 准热切换 + dry/wet 混合 | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪；插件切换静音窗口 |
-| 1.7 | NoiseAnalyzer：L1 规则式分类（白/粉红/哼声/脉冲/宽带）+ 连续置信度 + 混合噪声判定 + 分析输入源选择（降噪开启→噪声 PCM，降噪关闭→原始 PCM + VAD） | 单元测试：白噪声/哼声/脉冲分类；混合噪声判定 |
+| 1.4 | RcuPtr\<T\> + NoiseManager：自实现 RCU 同步原语（原子发布 + period 顶部 pin + retire 队列）+ per-sensor 生命周期管理（SensorTable COW + 帧路由 + ①→②→③→④ 顺序调度） | 单元测试：多 sensor 路由；sensor 增删不阻塞帧处理 |
+| 1.5 | NoiseDetector（监测角色，非门控）：WebRTC VAD 集成 + 频谱平坦度 + 噪声底估计（最小统计法）。始终执行，输出监测指标；不门控 DenoiseProcessor。VAD 来源优先级：降噪开启时 RNNoise VAD 为主（更准），降噪关闭时 NoiseDetector VAD 为唯一来源 | 单元测试：白噪声/语音/静音检测；VAD 精度 |
+| 1.6 | DenoiseProcessor + RnnoiseAdapter：IDenoisePlugin 纯虚接口 + DenoisePluginRegistry + RNNoise 集成 + 三路输出（原始/降噪/噪声）+ 准热切换 + dry/wet 混合。**始终执行**（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险） | 单元测试：降噪量 > 10dB；噪声 = 原始 - 降噪；插件切换静音窗口 |
+| 1.7 | NoiseAnalyzer：L1 规则式分类（白/粉红/哼声/脉冲/宽带）+ 连续置信度 + 混合噪声判定 + 分析输入源选择（降噪开启→①噪声 PCM + ①RNNoise VAD；降噪关闭→原始 PCM + ②NoiseDetector VAD） | 单元测试：白噪声/哼声/脉冲分类；混合噪声判定；输入源切换 |
 | 1.8 | NoiseTemplateDB + L2 模板匹配：Bark 频带特征提取 + 余弦相似度匹配 + 模板持久化（`noise_templates/templates.json` + 原始 WAV 保留）+ HTTP API（CRUD + 导入/导出 + 测试匹配 + 回听） | 单元测试：模板录入+匹配+删除；持久化往返；WAV 保留与回读 |
-| 1.9 | NoiseMetrics + HTTP REST API：指标聚合 + 告警规则（噪声级/SNR/哼声）+ sensor CRUD + metrics/history 端点 | 集成测试：API 响应；告警触发 |
+| 1.9 | NoiseMetrics + HTTP REST API：指标聚合（合并 ①②③ 结果）+ 告警规则（噪声级/SNR/哼声）+ sensor CRUD + metrics/history 端点 | 集成测试：API 响应；告警触发 |
 | 1.10 | 数据持久化：`noise_status.json` 传感器配置 + `noise_templates/` 模板库 + Config 新增 `noise_status_file`/`noise_template_dir` 字段 + 原子写入（tmp + rename）+ 启动加载/变更即写/退出保存 | 集成测试：重启后传感器+模板恢复；崩溃后文件完整（无半写） |
-| 1.11 | Streamer 三路 AAC 流 API + CMake WITH_NOISE + 构建验证 | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 daemon 行为零变化 |
+| 1.11 | Streamer 三路 AAC 流 API + CMake WITH_NOISE + 构建验证（noise-dev.sh） | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 daemon 行为零变化 |
 
 **预计工期**：3-4 周
 
 ### Phase 2 — 完整功能
 
-**目标**：参考比对 + 告警完善 + HTTP SSE 实时推送
+**目标**：参考比对 + 持久化健壮性 + HTTP SSE 实时推送 + 告警引擎
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
-| 2.1 | RefComparator：参考音比对噪声检测（双路环形缓冲 + 时间戳对齐 + 自适应滤波残差 → NoiseAnalyzer） | 单元测试：延时估计精度；残差噪声分析 |
-| 2.2 | 噪声传感器配置完善：PUT/DELETE 参数校验增强 + 持久化验证（Phase 1 已实现基础持久化，此步完善边界场景：配置文件缺失/损坏时的降级恢复、并发写入安全） | 集成测试：损坏文件降级恢复；并发写入无数据丢失 |
+| 2.1 | RefComparator：参考音比对噪声检测（双路环形缓冲 + 时间戳对齐 + 自适应滤波残差 → NoiseAnalyzer）。独立于主链路，不阻塞帧处理时序（见 §6.3.2） | 单元测试：延时估计精度；残差噪声分析；双路缓冲溢出处理 |
+| 2.2 | 持久化健壮性：配置文件缺失/损坏时降级恢复（空配置启动，不阻塞 daemon）、并发写入安全、WAV 文件与索引不一致检测（load 时逐条检查，见 §7.7 / §11 风险 15） | 集成测试：损坏文件降级恢复；并发写入无数据丢失；WAV 缺失告警 |
 | 2.3 | HTTP SSE 实时推送：噪声指标快照 + 告警事件 + 降噪后/噪声 PCM 流（base64 编码） | 集成测试：SSE 事件到达；PCM 流解码 |
 | 2.4 | 告警规则引擎：可配置阈值 + 告警级别（Info/Warning/Critical）+ 告警去抖 + 告警历史 + HTTP SSE 推送 | 集成测试：阈值触发告警；SSE 推送 |
 
 ### Phase 3 — 生产增强
 
-**目标**：多采样率适配 + 多降噪插件 + ML 噪声分类 + 并行优化 + 回放
+**目标**：多采样率适配 + 多降噪插件 + ML 噪声分类 + 并行优化 + 降噪回放
 
 | 步骤 | 内容 | 验证 |
 |------|------|------|
@@ -1752,7 +1752,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 3.2 | DTLN / DeepFilterNet 插件适配器 + 自定义 RNNoise 模型加载 | 单元测试：各插件降噪量；A/B 对比实验 |
 | 3.3 | L3 ML 噪声分类（PANNs/VGGish 嵌入，ONNX Runtime，处理 L1/L2 无法识别的未知噪声） | 单元测试：未知噪声分类 |
 | 3.4 | 降噪后音频回注 ALSA 播放 | 集成测试：ALSA 播放输出 |
-| 3.5 | 指标持久化 + 历史查询 | 集成测试：历史数据查询 |
+| 3.5 | 指标历史持久化 + 时间序列查询（与 Phase 1 步骤 1.10 传感器配置持久化不同，此步为指标时间序列的长期存储与查询） | 集成测试：历史数据写入+查询 |
 | 3.6 | 多 Sink 并行处理优化 + CPU 过载降级：per-sink 线程池 + xrun 计数监控 + 自动切换轻量插件 | 性能测试：8 路并行 CPU 占用；过载触发降级 |
 
 ---
@@ -1770,12 +1770,20 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 7 | Streamer 重构回归风险 | 删除 ALSA capture 逻辑改为从 PcmCaptureService 拿帧，可能引入回归 | Phase 1 步骤 1.2 专做 Streamer 重构 + 回归测试 |
 | ~~8~~ | ~~WITH_NOISE=OFF 时 Streamer 如何获取 PCM 帧~~ | ~~PCM 分发基础设施不能只在 noise 模块里~~ | **已解决**：PcmCaptureService 独立于 noise 模块，编译条件 `WITH_STREAMER=ON ∨ WITH_NOISE=ON`。详见 §4.3 |
 | 9 | PcmCaptureService 帧回调内联执行，慢消费者阻塞全局 | 任一 FrameProvider 回调阻塞（如 Streamer 文件 I/O）会拖慢整个 capture 线程，导致 ALSA xrun | Phase 1 帧回调必须快速返回（只做内存拷贝 + 环形缓冲写入），重操作（AAC 编码、文件写入）延后到消费者自身线程 |
-| 10 | Phase 1 多 Sink 帧处理在单 capture 线程内逐帧执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无 per-sink 并行。§1.2.1 的"≥8 路"基于单线程逐帧处理的保守估计 | Phase 1 单线程逐帧处理（各 Sink 交替处理，非串行等待）；Phase 3 步骤 3.5 引入 per-sink 线程池做真正并行 |
+| 10 | Phase 1 多 Sink 帧处理在单 capture 线程内逐帧执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无 per-sink 并行。§1.2.1 的"≥8 路"基于单线程逐帧处理的保守估计 | Phase 1 单线程逐帧处理（各 Sink 交替处理，非串行等待）；Phase 3 步骤 3.6 引入 per-sink 线程池做真正并行 |
 | 11 | RT 路径同步原语非无锁 | `std::atomic_load/store(shared_ptr)`（C++17 废弃自由函数）内部用自旋锁，每帧调用致优先级反转/xrun；旧插件析构（ONNX teardown）若在 RT 线程触发同样致 xrun | **不采用** `atomic_load/store(shared_ptr)`。DenoiseProcessor / NoiseManager 统一用 `RcuPtr<T>`：`atomic<T*>` 原子发布 + period 顶部 pin（整 period 复用，不每帧原子操作）+ retire 队列延迟回收（旧插件析构由控制线程 housekeeper 在静止点后完成，绝不在 RT 线程）。`SensorContext` 用 `shared_ptr` 成员使 sensor 表 COW 廉价共享。详见 §3.7 帧回调线程安全 / 降噪插件文档 §4.2 |
 | 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐。设计要点：①两路 Sink 在同一 PTP 域下，帧对齐精度取决于 PTP 同步精度（通常 <1ms），帧回调时机差 ≤1 个 ALSA period；②环形缓冲容量 = 2 × period 样本数（~128ms @48kHz），溢出时丢弃最旧帧并计数告警；③时间戳对齐：按帧序号（PTP 时间戳换算）或按帧到达时间插值，精度要求 ≤1ms（与已有算法 MFCC 互相关对齐精度一致）；④延时差超过 10ms 时标记 `delay_anomaly = true`，不丢弃数据但上报告警供运维排查 |
-| 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
+| 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 步骤 3.6 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
 | 14 | JSON 持久化文件损坏 | daemon 崩溃/断电/磁盘满导致 `noise_status.json` 或 `templates.json` 半写 | **原子写入**：先写 `.tmp` 文件 → `fsync` → `rename` 覆盖原文件。POSIX `rename()` 是原子的，崩溃后要么是旧文件要么是新文件，不会出现半写状态。加载时若 JSON 解析失败，日志告警并以空配置启动（不阻塞 daemon 启动） |
 | 15 | 模板 WAV 文件与索引不一致 | 手动删除 WAV 文件或 `templates.json` 引用不存在的文件 | `NoiseTemplateDB::load()` 时逐条检查 WAV 文件是否存在，缺失条目日志告警但仍保留索引（特征向量可用，仅回听不可用）；`get_wav_path()` 返回空串表示无原始音频 |
+
+### 11.1 待决事项
+
+| # | 事项 | 选项 | 建议 | 影响步骤 |
+|---|------|------|------|---------|
+| D1 | JSON 序列化库选型 | A: `nlohmann/json`（头文件，轻量） B: `boost::property_tree`（项目已有依赖） | **A**，nlohmann/json API 更简洁、JSON 规范符合性更好；boost::property_tree 的 JSON 支持有限（类型推断问题） | 1.10, 1.8 |
+| D2 | FFT 实现选型 | A: kiss_fft（复用 RNNoise 内嵌，零额外依赖） B: pffft（SSE/NEON 优化，性能更好） | **A**（Phase 1），Phase 3 可选切 pffxt | 1.5, 1.7 |
+| D3 | VAD 降级策略 | 降噪开启时 RNNoise VAD 与 WebRTC VAD 不一致如何处理 | RNNoise VAD 为主，WebRTC VAD 仅做交叉验证指标（不影响处理路径）；不一致时取 RNNoise 结果 | 1.5, 1.6 |
 
 ---
 

@@ -1077,8 +1077,13 @@ private:
   void on_sink_remove(uint8_t id);
 
   // ALSA capture 线程（PTP locked 时运行）
+  // PTP unlock 时由控制线程调 snd_pcm_drop() + snd_pcm_close() 中断阻塞读取，
+  // capture 线程在 snd_pcm_readi() 返回错误后检查 stop 标志并退出
   void capture_loop();
   // FAKE_DRIVER: 从 WAV 文件读取的替代 capture 线程
+  // 规格：①每 period 后 sleep_until(next_period_time) 模拟实时节拍；
+  // ②每次回调投递恰好 period_size 样本（与 ALSA 一致）；
+  // ③WAV 采样率 ≠ daemon 配置时拒绝启动并告警
   void fake_capture_loop();
 
   snd_pcm_t* capture_handle_{nullptr};
@@ -1860,6 +1865,14 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 步骤 3.6 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
 | 14 | JSON 持久化文件损坏 | daemon 崩溃/断电/磁盘满导致 `noise_status.json` 或 `templates.json` 半写 | **原子写入**：先写 `.tmp` 文件 → `fsync` → `rename` 覆盖原文件。POSIX `rename()` 是原子的，崩溃后要么是旧文件要么是新文件，不会出现半写状态。加载时若 JSON 解析失败，日志告警并以空配置启动（不阻塞 daemon 启动） |
 | 15 | 模板 WAV 文件与索引不一致 | 手动删除 WAV 文件或 `templates.json` 引用不存在的文件 | `NoiseTemplateDB::load()` 时逐条检查 WAV 文件是否存在，缺失条目日志告警但仍保留索引（特征向量可用，仅回听不可用）；`get_wav_path()` 返回空串表示无原始音频 |
+| 16 | DenoiseOutput.original 零拷贝指针在 Phase 3 per-sink 线程池下悬垂 | Phase 1 ①②③④ 在同一 capture 线程回调内顺序执行，input 指针有效。Phase 3 步骤 3.6 引入 per-sink 线程池后，①②③④ 在 worker 线程执行，capture 线程已处理下一个 sink 的帧并覆写 `convert_buffer_`，`original` 指针悬垂 | Phase 3 必须为 `original` 恢复 per-sensor 缓冲（即 Phase 1 消除的 `original_buf_`），或在 worker 线程启动前快照 `convert_buffer_` 到 per-sensor 缓冲。文档中"跨线程消费者取 PcmCaptureService 原生帧"仅覆盖 Streamer 等外部消费者，不覆盖同链路内的 ②③ |
+| 17 | 双缓冲 swap 无背压：慢 Streamer 读取被 capture 线程覆写 | capture 线程 swap front/back 后立即开始写新 back（旧 front）。若 Streamer 尚未读完 front，capture 线程覆写其正在读的数据。release/acquire 序保证指针可见性，但不保证缓冲内容生命周期 | Phase 1 Streamer 在帧回调中仅做内存拷贝到自身环形缓冲（快速返回），AAC 编码 + HTTP 写入在 Streamer 自身线程完成（§11 风险 9 约束）。若 Streamer 拷贝速度 < 1 period 时需三缓冲；当前每 period ~128ms，拷贝 ~7.7 KB 极快，Phase 1 安全。Phase 3 需评估 |
+| 18 | `convert_buffer_` 裸指针无大小/边界文档 | `NoiseSessionManagerBridge` 的 `convert_buffer_` 声明为 `float*` 但未说明分配大小、分配时机、运行时重配置安全性 | 构造时按 `max_period_samples × max_channels` 分配（6144 × 8 = 49152 float = 192 KB）；若 ALSA period 或通道数运行时变化需重新分配（Phase 1 不支持运行时重配置，安全）。实现时须补全分配逻辑与断言 |
+| 19 | PTP 失锁时 capture 线程阻塞在 `snd_pcm_readi()` | `PcmCaptureService` 在 PTP unlock 时需 join capture 线程，但 `snd_pcm_readi()` 可能无限阻塞。控制线程必须中断阻塞读取才能 join | 控制线程在 PTP unlock 时调 `snd_pcm_drop()` + `snd_pcm_close()` 从外部中断阻塞读取（POSIX ALSA 标准做法），capture 线程在 `snd_pcm_readi()` 返回错误后检查 stop 标志并退出。此中断机制须在 §4.3 补充说明 |
+| 20 | RefComparator 对齐漂移：一路 Sink 暂停后恢复，时间对齐丢失 | 一路 Sink 停发帧（RTP 静默/PTP 失锁），另一路持续到达并丢弃旧帧。恢复后两路缓冲时间窗不对齐，延时估计可能严重偏差 | 每帧携带 PTP 时间戳（或帧序号），RefComparator 检查两路最新帧的时间差是否在合理范围内。一路缓冲溢出时重置对齐状态，要求两路都活跃后重新做完整对齐（MFCC 互相关搜索）。§11 风险 12 的 `delay_anomaly` 检测可复用 |
+| 21 | `fake_capture_loop()` 无节拍/period/采样率规格 | 未说明帧投递节拍（实时 pacing 还是 CPU 全速）、period 大小（是否匹配 ALSA 6144 样本）、WAV 采样率与 daemon 配置不一致时的处理 | `fake_capture_loop()` 必须：①每 period 后 `std::this_thread::sleep_until(next_period_time)` 模拟实时节拍；②每次回调投递恰好 `period_size` 样本（与 ALSA 一致）；③WAV 采样率 ≠ daemon 配置时在入口重采样或拒绝启动并告警。须在 §4.3 补充规格 |
+| 22 | RcuPtr epoch 假设单 RT 线程；Phase 3 多线程打破 2-epoch 保证 | 当前 `advance_epoch()` 由单一 capture 线程驱动，2 epoch 保证所有 RT 读者已释放旧值。Phase 3 per-sink 线程池有多个 RT 线程，各自独立 pin/unpin，单一线程的 epoch 推进不能保证其他线程已释放 | Phase 3 须改为多读者 epoch 方案：每个 RT 线程维护自己的 epoch 号，housekeeper 回收时等待所有 RT 线程的 epoch 都已推进超过目标值。或改用 hazard pointer 方案。Phase 1 单线程安全，此风险仅影响 Phase 3 |
+| 23 | DenoiseOutput 裸指针无所有权/生命周期标注 | `original`/`denoised`/`noise` 均为 `const float*`，无标注说明谁分配、谁释放、跨 period 边界是否失效。实现时易写出跨 period 持有指针的代码 | 实现时为 `DenoiseOutput` 补充注释：`original` 仅在当前 `on_frame` 回调内有效；`denoised`/`noise` 在下次 `on_period_end()` swap 前有效。考虑用 span 或带过期标记的包装类型在编译期捕获误用 |
 
 ### 11.1 待决事项
 

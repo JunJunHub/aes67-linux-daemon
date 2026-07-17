@@ -245,7 +245,7 @@ flowchart TB
 | **桥接解耦** | 噪声模块经纯虚接口 `NoiseAudioBridge` 接入 daemon 核心，不直接依赖 SessionManager/Config |
 | **统一 PCM 分发** | Bridge 实现类独占 ALSA capture 设备，所有帧消费者（AudioCapture、Streamer）通过 FrameProvider 回调获取帧，避免设备冲突和重复读取 |
 | **帧式处理** | 所有分析/降噪以固定帧长（RNNoise = 480 样本 @48kHz = 10ms）为处理单元，保证实时性 |
-| **零拷贝优先** | 音频截取尽量共享缓冲区，避免额外内存拷贝 |
+| **零拷贝优先** | 帧分发全程 const 指针传递（PcmCaptureService → Bridge → AudioCapture → NoiseManager → ①②③④），仅 ALSA 读取和 uint8_t→float 格式转换产生不可消除拷贝；DenoiseProcessor 不拷贝 input（同回调内指针有效，②③零拷贝读）；NoiseAnalyzer 缓冲逐帧特征而非原始 PCM（§3.3.7，-92% 内存） |
 | **HTTP 可控** | 噪声检测/降噪的启停、参数调整均通过 HTTP REST API 暴露，供 Web UI 或外部脚本操作 |
 
 ### 2.3 目录结构
@@ -581,13 +581,40 @@ private:
   // L1: 规则式分类（各规则输出置信度）
   std::vector<NoiseTypeCandidate> classify_rule_based(const float* power_spectrum, int N,
                                                        float sample_rate);
-  // L2: 模板匹配（Phase 3）
+  // L2: 模板匹配（Phase 1）
   NoiseTypeCandidate match_template(const std::array<float, 32>& bark_spectrum);
-  // 滑动窗口缓冲
+  // 逐帧特征环形缓冲（替代原始 PCM 缓冲，见 §3.3.7）
   // kiss_fft / pffft
   // 频带能量计算
 };
 ```
+
+#### 3.3.7 逐帧特征缓冲（替代原始 PCM 窗口）
+
+L1 规则式分类和 L2 模板匹配都不需要跨帧的原始 PCM 数据——它们需要的是**逐帧频谱特征**。原始 PCM 仅在当前帧的 FFT 计算中需要，无需跨帧缓冲。
+
+**优化**：每帧做完 FFT + 特征提取后，只将特征向量推入环形缓冲，不缓冲原始 PCM：
+
+```cpp
+// 每帧提取的特征（152 字节/帧）
+struct FrameFeatures {
+  std::array<float, 32> bark_energy;  // 128 B — L2 模板匹配输入
+  float spectral_flatness;            // 4 B  — L1 白噪声/宽带判定
+  float spectral_centroid_hz;         // 4 B  — 噪声"亮度"
+  float noise_level_dbfs;             // 4 B  — 噪声级
+  float hum_strength_db;              // 4 B  — 工频哼声强度
+  float impulse_count;                // 4 B  — 脉冲计数
+  NoiseType l1_type;                  // 4 B  — L1 主类型（enum）
+  float l1_confidence;                // 4 B  — L1 主类型置信度
+};
+// 2s 窗口 = 200 帧 × 152 B = 29.6 KB/sensor
+// vs 原始 PCM 缓冲: 2s × 48000 × 4B = 375 KB/sensor
+// 节省: 345 KB/sensor (92%)
+```
+
+**窗口内特征聚合**：分析窗口到期时，对环形缓冲中的 200 个 FrameFeatures 做聚合（加权平均 bark_energy → L2 模板匹配输入；取中位数 spectral_flatness → 最终 SF；取 max impulse_count → 脉冲率；投票 L1 type → 窗口级分类结果）。聚合计算量极低（200 次加法/取最大），远低于对 2s 原始 PCM 重新做 FFT。
+
+**内存影响**：8 路传感器下，NoiseAnalyzer 总内存从 3.0 MB 降至 237 KB，**节省 2.8 MB (92%)**。这是整个噪声模块中最大的单项内存优化。
 
 ### 3.4 DenoiseProcessor - 可插拔降噪（三路输出）
 
@@ -605,15 +632,17 @@ private:
 
 > 噪声 PCM 的计算开销极低（逐样本减法），且对调试和运维极具价值——可以**听到**被去除的噪声长什么样，判断降噪是否过度或不足。
 
-**三路输出缓冲所有权与跨线程同步**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配三个缓冲（`original_buf_`/`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体（三路只读指针 + 有效帧数）。
+**三路输出缓冲所有权与跨线程同步**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配两个缓冲（`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体。**不分配 original_buf_**——原始 PCM 通过 input 指针直接暴露（同回调内有效，见下方零拷贝说明）。
 
-> **跨线程同步**：DenoiseProcessor 在 capture 线程写入三路缓冲，Streamer 在自身线程读取——两者访问同一缓冲区需同步。采用**双缓冲 + period 边界 swap** 方案：DenoiseProcessor 持 front/back 两套三路缓冲；capture 线程每 period 写 back 缓冲，period 结束时原子 swap front/back 指针（`std::atomic<DenoiseOutput*>`，release 序）；Streamer 在自身线程读 front 缓冲（acquire 序）。swap 发生在 `on_period_end()`，与 RCU epoch 推进同一静止点，保证 Streamer 读到完整 period 数据而非半写状态。front/back 缓冲构造时分配，运行时零堆分配。
+> **原始 PCM 零拷贝**：②NoiseDetector 和 ③NoiseAnalyzer 在同一 on_frame 回调内顺序执行，此时 Bridge 的 convert_buffer_ 尚未被下一个 sink 覆写，input 指针仍然有效。因此 DenoiseOutput.original 直接指向 input（零拷贝），②③通过该指针读取原始 PCM。这消除了每帧 480×4=1.9 KB 的 input→original_buf_ 拷贝，双缓冲也从 3 路降为 2 路（-3.8 KB/sensor）。
+
+> **跨线程同步**：DenoiseProcessor 在 capture 线程写入 denoised/noise 缓冲，Streamer/SSE 在自身线程读取——两者访问同一缓冲区需同步。采用**双缓冲 + period 边界 swap** 方案：DenoiseProcessor 持 front/back 两套双路缓冲（denoised + noise）；capture 线程每 period 写 back 缓冲，period 结束时原子 swap front/back 指针（`std::atomic<DenoiseOutput*>`，release 序）；Streamer 在自身线程读 front 缓冲（acquire 序）。swap 发生在 `on_period_end()`，与 RCU epoch 推进同一静止点，保证 Streamer 读到完整 period 数据而非半写状态。front/back 缓冲构造时分配，运行时零堆分配。**原始 PCM 不参与双缓冲**——Streamer 原始 AAC 取 PcmCaptureService 原生帧（`CH_EXTRACT → STR_OUT` 路径），不经过 DenoiseProcessor。
 
 ```cpp
 struct DenoiseOutput {
-  const float* original;   // 原始 PCM（输入副本）
-  const float* denoised;   // 降噪 PCM（插件输出）
-  const float* noise;      // 噪声 PCM（原始 - 降噪）
+  const float* original;   // 原始 PCM（指向 input，仅同线程回调内有效；跨线程消费者取 PcmCaptureService 原生帧）
+  const float* denoised;   // 降噪 PCM（插件输出，双缓冲覆盖）
+  const float* noise;      // 噪声 PCM（原始 - 降噪，双缓冲覆盖）
   size_t frame_count;      // 有效帧数
 };
 ```
@@ -1264,6 +1293,34 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 | **单帧处理** | **<2ms** | 远低于 10ms 帧预算，实时性充足 |
 
 > ALSA period 延迟（~128ms）是采集侧的固有等待，不影响帧处理实时性——PcmCaptureService 读满一个 period 后，AudioCapture 在 <2ms 内处理完该 period 内的所有 480 样本帧。
+
+单帧 PCM 数据拷贝链路（480 样本 @48kHz，单通道）：
+
+| 拷贝点 | 操作 | 大小 | 可消除？ |
+|--------|------|------|---------|
+| ❶ ALSA 内核→用户态 | `snd_pcm_readi()` | 480 × 2B = 960 B | ❌ RAVENNA LKM 不支持 mmap |
+| ❸ uint8_t→float + 通道解复用 | Bridge 格式转换 | 480 × 4B = 1,920 B | ❌ 格式边界不可消除 |
+| ❻ ~~input→original_buf_~~ | ~~DenoiseProcessor 输入副本~~ | ~~1,920 B~~ | ✅ **已消除**：同回调内 input 指针有效，②③零拷贝读 |
+| ❽ ~~2s 原始 PCM 窗口~~ | ~~NoiseAnalyzer 滑动缓冲~~ | ~~384,000 B~~ | ✅ **已消除**：改为逐帧特征缓冲 29.6 KB（§3.3.7） |
+
+> ❷❹❺ 为零拷贝的指针传递，不产生数据复制。优化后全链路仅 ❶❸ 两次不可消除拷贝（格式边界），为理论最优。
+
+内存预算（8 通道 ALSA、每 sink 2 通道、8 路传感器）：
+
+| 组件 | 缓冲区 | 大小 |
+|------|--------|------|
+| **全局（共享）** | | |
+| PcmCaptureService | period 缓冲 | 6144 × 8ch × 2B = 96 KB |
+| Bridge | convert_buffer_ | 6144 × 2ch × 4B = 48 KB |
+| **每传感器** | | |
+| DenoiseProcessor | denoised + noise 双缓冲 (front+back) | 480 × 4 × 2 × 2 = 7.7 KB |
+| DenoiseProcessor | RNNoise DenoiseState | ~250 KB |
+| NoiseDetector | FFT + VAD 状态 | ~6 KB |
+| NoiseAnalyzer | 逐帧特征环形缓冲 (200 帧 × 152B) | ~30 KB |
+| NoiseAnalyzer | FFT 缓冲 | ~4 KB |
+| NoiseMetrics | 聚合结构 | ~1 KB |
+| **每传感器合计** | | **~299 KB** |
+| **8 路传感器 + 全局** | | **~2.5 MB** |
 
 ### 6.3 线程模型
 

@@ -190,11 +190,11 @@ flowchart TB
     subgraph NOISE["噪声分析与降噪模块"]
         BRIDGE_IF["NoiseAudioBridge<br/>纯虚桥接接口"]
         CAP["AudioCapture<br/>帧分发 (噪声内部)"]
-        DET["NoiseDetector<br/>噪声检测"]
-        ANA["NoiseAnalyzer<br/>分类 + 置信度"]
-        DNR["DenoiseProcessor×N<br/>降噪 (三路输出)<br/>(per-sensor 各持插件)"]
-        REF["RefComparator<br/>参考音比对"]
-        MET["NoiseMetrics<br/>指标聚合"]
+        DNR["① DenoiseProcessor×N<br/>降噪 (三路输出)<br/>(per-sensor 各持插件)<br/>始终执行，不门控"]
+        DET["② NoiseDetector<br/>噪声检测 (监测角色)<br/>始终执行，纯监测"]
+        ANA["③ NoiseAnalyzer<br/>分类 + 置信度"]
+        REF["RefComparator<br/>参考音比对<br/>(双路缓冲，独立于主链路)"]
+        MET["④ NoiseMetrics<br/>指标聚合"]
     end
 
     subgraph API["暴露层 (HTTP)"]
@@ -209,11 +209,12 @@ flowchart TB
     PCS -->|FrameProvider 回调| STR
     PCS -->|FrameProvider 回调| BRIDGE_IF
     BRIDGE_IF --> CAP
-    CAP --> DET & DNR & REF
-    CAP -.->|降噪关闭: 原始 PCM| ANA
-    DNR -.->|降噪开启: 噪声 PCM| ANA
-    DET & ANA --> MET
-    REF --> MET
+    CAP --> DNR --> DET
+    DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA
+    DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
+    ANA --> MET
+    CAP -.-> REF
+    REF -.-> MET
     MET --> HTTP & NoiseSSE
     PCS -->|原始 PCM 旁通| STR
     DNR -->|降噪/噪声 PCM| STR
@@ -226,11 +227,15 @@ flowchart TB
 >
 > **Streamer 重构**：Streamer 不再持有 `capture_handle_`，不再调用 `snd_pcm_open()`/`snd_pcm_readi()`，改为从 `PcmCaptureService` 注册 FrameProvider 拿帧。Streamer 支持 **AAC 编码**和 **PCM 直通**两种输出模式，可选择编码原始 PCM、降噪 PCM 或噪声 PCM（= 原始 - 降噪）三路之一。
 >
-> **AudioCapture 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内的 `AudioCapture` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后分发给 NoiseDetector/DenoiseProcessor/RefComparator。两者职责不同，不在同一抽象层次。
+> **AudioCapture 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内的 `AudioCapture` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后经 NoiseManager 按传感器调度 ①→②→③→④ 顺序处理链路。两者职责不同，不在同一抽象层次。
 >
-> **NoiseAnalyzer 输入源选择**（虚线箭头）：降噪开启时，NoiseAnalyzer 从 DenoiseProcessor 获取**噪声 PCM**（= original - denoised）做频谱分析——纯噪声信号不含语音分量，分类更准（详见 [§3.3.1](#331-分析输入源选择)）；降噪关闭时，NoiseAnalyzer 从 AudioCapture 获取原始 PCM，需 VAD 过滤语音段。两种路径互斥，由 NoiseManager 按传感器配置自动选择。
+> **①→② 顺序执行，无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（详见 §6.3 线程模型）。
+>
+> **③NoiseAnalyzer 输入源选择**：降噪开启时，NoiseAnalyzer 从 ①DenoiseProcessor 获取**噪声 PCM** + RNNoise VAD（纯噪声信号不含语音分量，分类更准，详见 [§3.3.1](#331-分析输入源选择)）；降噪关闭时，NoiseAnalyzer 从 ②NoiseDetector 获取 VAD + 原始 PCM，需 VAD 过滤语音段。两种路径互斥，由 NoiseManager 按传感器配置自动选择。
 >
 > **DenoiseProcessor 三路输出**：对每帧同时输出原始 PCM（旁通）、降噪后 PCM、噪声 PCM（= original - denoised），供 Streamer 和 SSE 按需选用。
+>
+> **RefComparator 独立于主链路**（虚线箭头）：维护双路环形缓冲，在两路 Sink 帧都到达时触发处理，不阻塞主链路帧处理时序（详见 §6.3.2）。
 
 ### 2.2 设计原则
 

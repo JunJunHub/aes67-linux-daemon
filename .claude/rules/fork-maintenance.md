@@ -65,4 +65,6 @@ AES70 工作使用模块化选项 `WITH_OCA`（默认 `OFF`），实现隔离在
 
 > 注：`WITH_OCA` 与 `WITH_AES70` 指同一件事（AES70 是标准，OCA 是其控制协议），本仓库统一使用 `WITH_OCA`。
 
+噪声模块（`WITH_NOISE`，默认 `OFF`）复用同一上游 sync 友好策略（Taste 决策2）：上游拥有的 `daemon/streamer.cpp` / `daemon/http_server.cpp` 用 `#ifdef _USE_NOISE_` 守卫切换 capture 路径与 `/denoised`/`/noise` 路由，`WITH_NOISE=OFF` 时上游代码逐字节不变，`upstream-sync` 合并冲突仅限 `#ifdef _USE_NOISE_` 块内。`PcmCaptureService`（daemon 根，仅 WITH_NOISE 编译）与 `daemon/noise_session_manager_bridge.*` 为 fork 新增文件（additive），归 `noise` scope。详见 `docs/noise/architecture-design.md` §4.3 组合行为表。
+
 当结构或构建行为变化时，更新构建文档、源码分发说明和 `LICENSE_NOTICES.MD`，使 GPL/LGPL 源码交付义务保持清晰。

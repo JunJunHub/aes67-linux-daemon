@@ -55,7 +55,7 @@ Scope 表示逻辑领域，不等同于物理目录名。按以下规则确定 s
 | Scope | 覆盖模块 / 说明 |
 |-------|----------------|
 | `oca` | `daemon/oca/` 整目录 + `daemon/oca_session_manager_bridge.*` 合并（AES70/OCA 控制协议） |
-| `noise` | `daemon/noise/` 整目录（噪声分析与降噪模块） |
+| `noise` | `daemon/noise/` 整目录 + `daemon/noise_session_manager_bridge.*` + `daemon/pcm_capture_service.*` 合并（噪声分析与降噪模块；后两者在 daemon 根，镜像 `oca` 先例；`pcm_capture_service` 仅 WITH_NOISE 编译故归 noise，Taste 决策2） |
 | `netlink` | `daemon/netlink.*`、`netlink_client.*` 合并 |
 
 ### 跨切面 scope

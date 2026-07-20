@@ -259,7 +259,6 @@ BOOST_AUTO_TEST_SUITE_END()
 #include "tests/synth_audio.hpp"
 
 BOOST_AUTO_TEST_SUITE(noise_detector_tests)
-
 // SimpleEnergyVad: 学完 15 帧静音 noise floor 后,静音判非语音、speech_like
 // 判语音。
 BOOST_AUTO_TEST_CASE(vad_detects_speech_vs_silence) {
@@ -283,6 +282,49 @@ BOOST_AUTO_TEST_CASE(detector_spectral_flatness_white_vs_speech) {
   synth::speech_like(buf, synth::kFrameSize);
   auto r2 = det.process_frame(buf, synth::kFrameSize);
   BOOST_CHECK_LT(r2.spectral_flatness, 0.3f);  // 语音 SF 低
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+#include "denoise_processor.hpp"
+#include "model-adapters/passthrough_plugin.hpp"
+
+BOOST_AUTO_TEST_SUITE(denoise_processor_tests)
+
+// PassthroughPlugin 直通：original/denoised 相同，noise=0
+BOOST_AUTO_TEST_CASE(passthrough_plugin_three_output) {
+  noise::DenoiseProcessor dp;  // 构造装 PassthroughPlugin
+  float in[synth::kFrameSize];
+  synth::white_noise(in, synth::kFrameSize, 1);
+  noise::DenoiseResult result;
+  dp.on_period_begin();
+  size_t n = dp.process(in, synth::kFrameSize, &result);
+  dp.on_period_end();
+  const noise::DenoiseOutput* out = dp.get_output();
+  BOOST_CHECK_EQUAL(out->frame_count, n);
+  // passthrough: denoised == original, noise == 0
+  for (size_t i = 0; i < n; ++i) {
+    BOOST_CHECK_CLOSE(out->denoised[i], out->original[i], 0.01);
+    BOOST_CHECK_SMALL(out->noise[i], 1e-6f);
+  }
+}
+
+// 准热切换：switch 到另一 Passthrough -> 静音窗口 -> 恢复
+BOOST_AUTO_TEST_CASE(switch_plugin_mute_window) {
+  noise::DenoiseProcessor dp;
+  float in[synth::kFrameSize];
+  synth::white_noise(in, synth::kFrameSize, 2);
+  dp.on_period_begin();
+  dp.process(in, synth::kFrameSize, nullptr);
+  dp.on_period_end();
+  BOOST_CHECK(dp.switch_plugin("passthrough"));  // 切到同名（测试用）
+  // 切换后首帧静音（mute_remaining > 0）
+  dp.on_period_begin();
+  dp.process(in, synth::kFrameSize, nullptr);
+  dp.on_period_end();
+  const noise::DenoiseOutput* out = dp.get_output();
+  // denoised 首部应为 0（静音窗口），original/noise 保留
+  BOOST_CHECK_SMALL(out->denoised[0], 1e-6f);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -245,7 +245,7 @@ flowchart TB
 | **桥接解耦** | 噪声模块经纯虚接口 `NoiseAudioBridge` 接入 daemon 核心，不直接依赖 SessionManager/Config |
 | **统一 PCM 分发** | Bridge 实现类独占 ALSA capture 设备，所有帧消费者（AudioCapture、Streamer）通过 FrameProvider 回调获取帧，避免设备冲突和重复读取 |
 | **帧式处理** | 所有分析/降噪以固定帧长（RNNoise = 480 样本 @48kHz = 10ms）为处理单元，保证实时性 |
-| **零拷贝优先** | 帧分发全程 const 指针传递（PcmCaptureService → Bridge → AudioCapture → NoiseManager → ①②③④），仅 ALSA 读取和 uint8_t→float 格式转换产生不可消除拷贝；DenoiseProcessor 不拷贝 input（同回调内指针有效，②③零拷贝读）；NoiseAnalyzer 缓冲逐帧特征而非原始 PCM（§3.3.7，-92% 内存） |
+| **零拷贝优先** | 帧分发全程 const 指针传递（PcmCaptureService → Bridge → AudioCapture → NoiseManager → ①②③④），仅 ALSA 读取和 uint8_t→float 格式转换产生不可消除拷贝；DenoiseProcessor 每帧拷贝 input → original_buf_（1.9 KB，保证 Phase 1/3 线程安全统一）；NoiseAnalyzer 缓冲逐帧特征而非原始 PCM（§3.3.7，-92% 内存） |
 | **HTTP 可控** | 噪声检测/降噪的启停、参数调整均通过 HTTP REST API 暴露，供 Web UI 或外部脚本操作 |
 
 ### 2.3 目录结构
@@ -626,21 +626,21 @@ struct FrameFeatures {
 
 | 输出 | 计算 | 用途 |
 |------|------|------|
-| **原始 PCM** | 直通旁通（零计算） | SSE 推送原始波形 + 分析基准；Streamer 原始 AAC 另取 `PcmCaptureService` 原生帧编码（兼容现有 `/api/streamer/stream/`，`WITH_NOISE=OFF` 也可用） |
+| **原始 PCM** | 逐样本拷贝 input -> original_buf_（1.9 KB/帧） | SSE 推送原始波形 + 分析基准；Streamer 原始 AAC 可从 DenoiseOutput.original 编码，也可另取 `PcmCaptureService` 原生帧（兼容现有 `/api/streamer/stream/`，`WITH_NOISE=OFF` 也可用） |
 | **降噪 PCM** | 插件处理后的干净音频 | Streamer 编码降噪 AAC 流（`/api/streamer/stream/:id/denoised`） |
 | **噪声 PCM** | `original - denoised`（逐样本相减） | Streamer 编码噪声 AAC 流（`/api/streamer/stream/:id/noise`）；SSE 推送噪声波形 |
 
 > 噪声 PCM 的计算开销极低（逐样本减法），且对调试和运维极具价值——可以**听到**被去除的噪声长什么样，判断降噪是否过度或不足。
 
-**三路输出缓冲所有权与跨线程同步**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配两个缓冲（`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体。**不分配 original_buf_**——原始 PCM 通过 input 指针直接暴露（同回调内有效，见下方零拷贝说明）。
+**三路输出缓冲所有权与跨线程同步**：`IDenoisePlugin::process()` 仅输出降噪 PCM 到一个 `float* out`。DenoiseProcessor 预分配三个缓冲（`original_buf_`/`denoised_buf_`/`noise_buf_`，构造时按最大帧长分配，运行时零堆分配），对外暴露 `DenoiseOutput` 结构体。每帧将 input 拷贝到 `original_buf_`（1.9 KB/帧 @480 样本），保证 `original` 指针在任意线程、任意时刻读取均有效——Phase 1 单线程和 Phase 3 per-sink 线程池通用，无需因线程模型变化修改缓冲策略。
 
-> **原始 PCM 零拷贝**：②NoiseDetector 和 ③NoiseAnalyzer 在同一 on_frame 回调内顺序执行，此时 Bridge 的 convert_buffer_ 尚未被下一个 sink 覆写，input 指针仍然有效。因此 DenoiseOutput.original 直接指向 input（零拷贝），②③通过该指针读取原始 PCM。这消除了每帧 480×4=1.9 KB 的 input→original_buf_ 拷贝，双缓冲也从 3 路降为 2 路（-3.8 KB/sensor）。
+> **原始 PCM 拷贝（非零拷贝）**：DenoiseOutput.original 指向 per-sensor 的 `original_buf_`，每帧从 input 拷贝。代价：每帧 480×4 = 1.9 KB 拷贝 + 每传感器 1.9 KB 内存。收益：①②③④ 无论在同一线程顺序执行（Phase 1）还是在 worker 线程异步执行（Phase 3），`original` 始终指向有效数据，不受 Bridge `convert_buffer_` 覆写影响。零拷贝方案（`original` 指向 input）在 Phase 1 安全但在 Phase 3 会悬垂（capture 线程处理下一个 sink 时覆写 convert_buffer_），需在 Phase 3 恢复 `original_buf_`——不如一开始就拷贝，全 Phase 统一。
 
-> **跨线程同步**：DenoiseProcessor 在 capture 线程写入 denoised/noise 缓冲，Streamer/SSE 在自身线程读取——两者访问同一缓冲区需同步。采用**双缓冲 + period 边界 swap** 方案：DenoiseProcessor 持 front/back 两套双路缓冲（denoised + noise）；capture 线程每 period 写 back 缓冲，period 结束时原子 swap front/back 指针（`std::atomic<DenoiseOutput*>`，release 序）；Streamer 在自身线程读 front 缓冲（acquire 序）。swap 发生在 `on_period_end()`，与 RCU epoch 推进同一静止点，保证 Streamer 读到完整 period 数据而非半写状态。front/back 缓冲构造时分配，运行时零堆分配。**原始 PCM 不参与双缓冲**——Streamer 原始 AAC 取 PcmCaptureService 原生帧（`CH_EXTRACT → STR_OUT` 路径），不经过 DenoiseProcessor。
+> **跨线程同步**：DenoiseProcessor 在 capture 线程写入 original/denoised/noise 缓冲，Streamer/SSE 在自身线程读取——两者访问同一缓冲区需同步。采用**双缓冲 + period 边界 swap** 方案：DenoiseProcessor 持 front/back 两套三路缓冲（original + denoised + noise）；capture 线程每 period 写 back 缓冲，period 结束时原子 swap front/back 指针（`std::atomic<DenoiseOutput*>`，release 序）；Streamer 在自身线程读 front 缓冲（acquire 序）。swap 发生在 `on_period_end()`，与 RCU epoch 推进同一静止点，保证 Streamer 读到完整 period 数据而非半写状态。front/back 缓冲构造时分配，运行时零堆分配。**Streamer 原始 AAC 也可从 DenoiseOutput.original 读取**（不再必须绕道 PcmCaptureService 原生帧），三路输出接口统一。
 
 ```cpp
 struct DenoiseOutput {
-  const float* original;   // 原始 PCM（指向 input，仅同线程回调内有效；跨线程消费者取 PcmCaptureService 原生帧）
+  const float* original;   // 原始 PCM（指向 original_buf_，per-sensor 拷贝，全 Phase 线程安全）
   const float* denoised;   // 降噪 PCM（插件输出，双缓冲覆盖）
   const float* noise;      // 噪声 PCM（原始 - 降噪，双缓冲覆盖）
   size_t frame_count;      // 有效帧数
@@ -1332,10 +1332,10 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 |--------|------|------|---------|
 | ❶ ALSA 内核→用户态 | `snd_pcm_readi()` | 480 × 2B = 960 B | ❌ RAVENNA LKM 不支持 mmap |
 | ❸ uint8_t→float + 通道解复用 | Bridge 格式转换 | 480 × 4B = 1,920 B | ❌ 格式边界不可消除 |
-| ❻ ~~input→original_buf_~~ | ~~DenoiseProcessor 输入副本~~ | ~~1,920 B~~ | ✅ **已消除**：同回调内 input 指针有效，②③零拷贝读 |
-| ❽ ~~2s 原始 PCM 窗口~~ | ~~NoiseAnalyzer 滑动缓冲~~ | ~~384,000 B~~ | ✅ **已消除**：改为逐帧特征缓冲 29.6 KB（§3.3.7） |
+| ❻ input→original_buf_ | DenoiseProcessor 原始 PCM 副本 | 480 × 4B = 1,920 B | ❌ Phase 1/3 线程安全统一，不可消除 |
+| ❽ ~~2s 原始 PCM 窗口~~ | ~~NoiseAnalyzer 滑动缓冲~~ | ~~384,000 B~~ | ✅ **已消除**：改为逐帧特征缓冲 30.5 KB（§3.3.7） |
 
-> ❷❹❺ 为零拷贝的指针传递，不产生数据复制。优化后全链路仅 ❶❸ 两次不可消除拷贝（格式边界），为理论最优。
+> ❷❹❺ 为零拷贝的指针传递，不产生数据复制。优化后全链路仅 ❶❸❻ 三次不可消除拷贝（格式边界 + 线程安全副本），为当前最优。
 
 内存预算（8 通道 ALSA、每 sink 2 通道、8 路传感器）：
 
@@ -1345,13 +1345,13 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 | PcmCaptureService | period 缓冲 | 6144 × 8ch × 2B = 96 KB |
 | Bridge | convert_buffer_ | 6144 × 2ch × 4B = 48 KB |
 | **每传感器** | | |
-| DenoiseProcessor | denoised + noise 双缓冲 (front+back) | 480 × 4 × 2 × 2 = 7.7 KB |
+| DenoiseProcessor | original + denoised + noise 双缓冲 (front+back) | 480 × 4 × 3 × 2 = 11.5 KB |
 | DenoiseProcessor | RNNoise DenoiseState | ~250 KB |
 | NoiseDetector | FFT + VAD 状态 | ~6 KB |
 | NoiseAnalyzer | 逐帧特征环形缓冲 (200 帧 × 156B) | ~31 KB |
 | NoiseAnalyzer | FFT 缓冲 | ~4 KB |
 | NoiseMetrics | 聚合结构 | ~1 KB |
-| **每传感器合计** | | **~300 KB** |
+| **每传感器合计** | | **~304 KB** |
 | **8 路传感器 + 全局** | | **~2.5 MB** |
 
 ### 6.3 线程模型
@@ -1865,7 +1865,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 步骤 3.6 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
 | 14 | JSON 持久化文件损坏 | daemon 崩溃/断电/磁盘满导致 `noise_status.json` 或 `templates.json` 半写 | **原子写入**：先写 `.tmp` 文件 → `fsync` → `rename` 覆盖原文件。POSIX `rename()` 是原子的，崩溃后要么是旧文件要么是新文件，不会出现半写状态。加载时若 JSON 解析失败，日志告警并以空配置启动（不阻塞 daemon 启动） |
 | 15 | 模板 WAV 文件与索引不一致 | 手动删除 WAV 文件或 `templates.json` 引用不存在的文件 | `NoiseTemplateDB::load()` 时逐条检查 WAV 文件是否存在，缺失条目日志告警但仍保留索引（特征向量可用，仅回听不可用）；`get_wav_path()` 返回空串表示无原始音频 |
-| 16 | DenoiseOutput.original 零拷贝指针在 Phase 3 per-sink 线程池下悬垂 | Phase 1 ①②③④ 在同一 capture 线程回调内顺序执行，input 指针有效。Phase 3 步骤 3.6 引入 per-sink 线程池后，①②③④ 在 worker 线程执行，capture 线程已处理下一个 sink 的帧并覆写 `convert_buffer_`，`original` 指针悬垂 | Phase 3 必须为 `original` 恢复 per-sensor 缓冲（即 Phase 1 消除的 `original_buf_`），或在 worker 线程启动前快照 `convert_buffer_` 到 per-sensor 缓冲。文档中"跨线程消费者取 PcmCaptureService 原生帧"仅覆盖 Streamer 等外部消费者，不覆盖同链路内的 ②③ |
+| 16 | ~~DenoiseOutput.original 零拷贝指针在 Phase 3 per-sink 线程池下悬垂~~ | ~~Phase 1 ①②③④ 在同一 capture 线程回调内顺序执行，input 指针有效。Phase 3 步骤 3.6 引入 per-sink 线程池后，①②③④ 在 worker 线程执行，capture 线程已处理下一个 sink 的帧并覆写 `convert_buffer_`，`original` 指针悬垂~~ | **已解决**：Phase 1 即采用 `original_buf_` per-sensor 拷贝（每帧 1.9 KB），`original` 指向自有缓冲，不受 `convert_buffer_` 覆写影响。Phase 1/3 线程模型统一，无需迁移 |
 | 17 | 双缓冲 swap 无背压：慢 Streamer 读取被 capture 线程覆写 | capture 线程 swap front/back 后立即开始写新 back（旧 front）。若 Streamer 尚未读完 front，capture 线程覆写其正在读的数据。release/acquire 序保证指针可见性，但不保证缓冲内容生命周期 | Phase 1 Streamer 在帧回调中仅做内存拷贝到自身环形缓冲（快速返回），AAC 编码 + HTTP 写入在 Streamer 自身线程完成（§11 风险 9 约束）。若 Streamer 拷贝速度 < 1 period 时需三缓冲；当前每 period ~128ms，拷贝 ~7.7 KB 极快，Phase 1 安全。Phase 3 需评估 |
 | 18 | `convert_buffer_` 裸指针无大小/边界文档 | `NoiseSessionManagerBridge` 的 `convert_buffer_` 声明为 `float*` 但未说明分配大小、分配时机、运行时重配置安全性 | 构造时按 `max_period_samples × max_channels` 分配（6144 × 8 = 49152 float = 192 KB）；若 ALSA period 或通道数运行时变化需重新分配（Phase 1 不支持运行时重配置，安全）。实现时须补全分配逻辑与断言 |
 | 19 | PTP 失锁时 capture 线程阻塞在 `snd_pcm_readi()` | `PcmCaptureService` 在 PTP unlock 时需 join capture 线程，但 `snd_pcm_readi()` 可能无限阻塞。控制线程必须中断阻塞读取才能 join | 控制线程在 PTP unlock 时调 `snd_pcm_drop()` + `snd_pcm_close()` 从外部中断阻塞读取（POSIX ALSA 标准做法），capture 线程在 `snd_pcm_readi()` 返回错误后检查 stop 标志并退出。此中断机制须在 §4.3 补充说明 |

@@ -253,3 +253,36 @@ BOOST_AUTO_TEST_CASE(noise_manager_ptp_unlock_skips_processing) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#include "noise_detector.hpp"
+#include "vad.hpp"
+#include "tests/synth_audio.hpp"
+
+BOOST_AUTO_TEST_SUITE(noise_detector_tests)
+
+// SimpleEnergyVad: 学完 15 帧静音 noise floor 后,静音判非语音、speech_like
+// 判语音。
+BOOST_AUTO_TEST_CASE(vad_detects_speech_vs_silence) {
+  noise::SimpleEnergyVad vad;
+  float buf[synth::kFrameSize];
+  synth::silence(buf, synth::kFrameSize);
+  for (int i = 0; i < 15; ++i)
+    vad.process(buf, synth::kFrameSize, 48000);              // 学 noise floor
+  BOOST_CHECK(!vad.process(buf, synth::kFrameSize, 48000));  // 静音=非语音
+  synth::speech_like(buf, synth::kFrameSize);
+  BOOST_CHECK(vad.process(buf, synth::kFrameSize, 48000));  // 语音=语音
+}
+
+// NoiseDetector SF: 白噪 SF>0.5(频谱平坦)、speech_like SF<0.3(谐波结构)。
+BOOST_AUTO_TEST_CASE(detector_spectral_flatness_white_vs_speech) {
+  noise::NoiseDetector det;
+  float buf[synth::kFrameSize];
+  synth::white_noise(buf, synth::kFrameSize, 42);
+  auto r1 = det.process_frame(buf, synth::kFrameSize);
+  BOOST_CHECK_GT(r1.spectral_flatness, 0.5f);  // 白噪 SF 高
+  synth::speech_like(buf, synth::kFrameSize);
+  auto r2 = det.process_frame(buf, synth::kFrameSize);
+  BOOST_CHECK_LT(r2.spectral_flatness, 0.3f);  // 语音 SF 低
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -7,6 +7,8 @@ set(NOISE_SOURCES
   audio_capture.cpp
   noise_manager.cpp
   stub_processor.cpp
+  vad.cpp
+  noise_detector.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

@@ -1,8 +1,6 @@
 // daemon/noise_session_manager_bridge.cpp
 #include "noise_session_manager_bridge.hpp"
 
-#include <cstring>
-
 #include "pcm_capture_service.hpp"
 #include "noise/audio_capture.hpp"
 

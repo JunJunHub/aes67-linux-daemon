@@ -7,7 +7,6 @@
 #include <alsa/asoundlib.h>
 #include <boost/log/trivial.hpp>
 #include <chrono>
-#include <cstring>
 #include <future>
 #include <thread>
 #include <vector>

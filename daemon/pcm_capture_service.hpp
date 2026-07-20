@@ -98,7 +98,6 @@ class PcmCaptureService
     ProviderToken token;
     FrameProvider provider;
   };
-  std::shared_ptr<const std::vector<ProviderEntry>> providers_snapshot_;
   noise::RcuPtr<std::vector<ProviderEntry>> providers_;
   std::atomic<ProviderToken> next_token_{1};
   noise::RetireQueue<std::vector<ProviderEntry>> providers_retire_;

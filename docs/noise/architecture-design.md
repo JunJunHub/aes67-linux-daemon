@@ -1516,7 +1516,7 @@ on_frame(sink_id=3, ...) → sensor 0 的 ①②③④  （下一帧）
 }
 ```
 
-**序列化/反序列化**：NoiseManager 自管，不经过 SessionManager。使用与 daemon 一致的 `boost::property_tree` 或 nlohmann/json（取决于项目最终选型）。
+**序列化/反序列化**：NoiseManager 自管，不经过 SessionManager。使用与 daemon 一致的 `boost::property_tree`（见 §11.1 D1 决定），照搬 `json.cpp` 既有的 ptree 数组遍历模式。
 
 ### 7.5 noise_templates/templates.json 格式
 
@@ -1880,9 +1880,9 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 
 | # | 事项 | 选项 | 建议 | 影响步骤 |
 |---|------|------|------|---------|
-| D1 | JSON 序列化库选型 | A: `nlohmann/json`（头文件，轻量） B: `boost::property_tree`（项目已有依赖） | **A**，nlohmann/json API 更简洁、JSON 规范符合性更好；boost::property_tree 的 JSON 支持有限（类型推断问题） | 1.10, 1.8 |
-| D2 | FFT 实现选型 | A: kiss_fft（复用 RNNoise 内嵌，零额外依赖） B: pffft（SSE/NEON 优化，性能更好） | **A**（Phase 1），Phase 3 可选切 pffxt | 1.5, 1.7 |
-| D3 | VAD 降级策略 | 降噪开启时 RNNoise VAD 与 WebRTC VAD 不一致如何处理 | RNNoise VAD 为主，WebRTC VAD 仅做交叉验证指标（不影响处理路径）；不一致时取 RNNoise 结果 | 1.5, 1.6 |
+| D1 | JSON 序列化库选型 | A: `nlohmann/json`（头文件，API 简洁） B: `boost::property_tree`（项目已有依赖） | **B**，daemon 现有 `config.cpp`/`json.cpp` 已全量使用 boost::property_tree（Boost 已 REQUIRED），噪声模块照搬既有数组遍历模式（见 `json.cpp` 的 `sources_to_json`/`sinks_to_json`）即可。引入 nlohmann 会让单一二进制并存两套 JSON 库，维护气味更差；32-float bark_spectrum 循环遍历是既有模式的重复，非新负担 | 1.10, 1.8 |
+| D2 | FFT 实现选型 | A: kiss_fft（复用 RNNoise 内嵌，零额外依赖） B: pffft（SSE/NEON 优化，性能更好） | **A**，kiss_fft 随 RNNoise 内嵌零额外依赖；512 点 FFT 在 x86 仅 ~0.01ms（附录 D.4），pffft 的 SIMD 优势（~2-4x）省下的 ~0.0075ms 在 10ms 帧预算可忽略，不值得引入新依赖 | 1.5, 1.7 |
+| D3 | VAD 降级策略 | 降噪开启时 RNNoise VAD 与 WebRTC VAD 不一致如何处理 | RNNoise VAD 为主（与降噪增益协同训练，含噪环境更稳定），WebRTC VAD 仅做交叉验证指标（不进控制路径，与 §3.2 NoiseDetector 不门控设计一致）；不一致时取 RNNoise 结果 | 1.5, 1.6 |
 
 ---
 

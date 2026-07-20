@@ -27,6 +27,10 @@
 
 #include "session_manager.hpp"
 
+#ifdef _USE_NOISE_
+#include "pcm_capture_service.hpp"
+#endif
+
 struct StreamerInfo {
   uint8_t status;
   uint16_t file_duration{0};
@@ -57,6 +61,14 @@ class Streamer {
   bool init();
   bool terminate();
 
+#ifdef _USE_NOISE_
+  // PcmCaptureService 注入点（main.cpp 装配留 Spec3 1.11）。不改
+  // Streamer::create 公开签名，避免上游 sync 冲突。
+  void set_pcm_capture(std::shared_ptr<PcmCaptureService> pcm_capture) {
+    pcm_capture_ = std::move(pcm_capture);
+  }
+#endif
+
   std::error_code get_info(const StreamSink& sink, StreamerInfo& info);
   std::error_code get_stream(const StreamSink& sink,
                              uint8_t file_id,
@@ -85,6 +97,14 @@ class Streamer {
   bool pcm_suspend();
   ssize_t pcm_read(uint8_t* data, size_t rcount);
 
+#ifdef _USE_NOISE_
+  // FrameProvider 回调入口：PcmCaptureService 分发的 PCM 帧喂入既有 AAC 编码
+  // 管线（替代 snd_pcm_readi 路径）。
+  void on_pcm_frame_from_capture(const uint8_t* pcm,
+                                 size_t frame_count,
+                                 uint8_t channels);
+#endif
+
   bool on_ptp_status_change(const std::string& status);
   bool on_sink_add(uint8_t id);
   bool on_sink_remove(uint8_t id);
@@ -94,6 +114,11 @@ class Streamer {
   void open_files(uint8_t files_id);
   void close_files(uint8_t files_id);
   void save_files(uint8_t files_id);
+
+#ifdef _USE_NOISE_
+  std::shared_ptr<PcmCaptureService> pcm_capture_;
+  PcmCaptureService::ProviderToken pcm_token_{0};
+#endif
 
   std::shared_ptr<SessionManager> session_manager_;
   std::shared_ptr<Config> config_;

@@ -16,6 +16,7 @@
 //  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <boost/algorithm/string.hpp>
+#include <cstring>
 
 #include "utils.hpp"
 #include "streamer.hpp"
@@ -35,6 +36,17 @@ std::shared_ptr<Streamer> Streamer::create(
 
 bool Streamer::init() {
   BOOST_LOG_TRIVIAL(info) << "Streamer: init";
+#ifdef _USE_NOISE_
+  // WITH_NOISE：PTP observer 由 PcmCaptureService 负责，Streamer 改注册
+  // FrameProvider 接收 PcmCaptureService 分发的 ALSA period 帧。
+  if (pcm_capture_) {
+    pcm_token_ = pcm_capture_->register_provider(
+        [this](const uint8_t* pcm, size_t frame_count, uint8_t channels,
+               uint32_t /*rate*/) {
+          this->on_pcm_frame_from_capture(pcm, frame_count, channels);
+        });
+  }
+#else
   session_manager_->add_ptp_status_observer(
       std::bind(&Streamer::on_ptp_status_change, this, std::placeholders::_1));
   session_manager_->add_sink_observer(
@@ -49,7 +61,7 @@ bool Streamer::init() {
   PTPStatus status;
   session_manager_->get_ptp_status(status);
   on_ptp_status_change(status.status);
-
+#endif
   return true;
 }
 
@@ -148,6 +160,34 @@ bool Streamer::pcm_suspend() {
   return true;
 }
 
+#ifdef _USE_NOISE_
+// FrameProvider 回调：收到一个 ALSA period 的全通道交错 PCM，
+// 喂入既有 AAC 编码管线（替代 snd_pcm_readi 路径）。
+// 复用 save_files / close_files / open_files / file 轮转逻辑。
+void Streamer::on_pcm_frame_from_capture(const uint8_t* pcm,
+                                         size_t frame_count,
+                                         uint8_t /*channels*/) {
+  if (!running_ || pcm == nullptr)
+    return;
+  // channels 与 setup_codec 时的 channels_ 一致（PcmCaptureService
+  // 全通道分发）。 chunk_samples_ == kPeriodSamples == 6144，与
+  // PcmCaptureService 对齐。
+  const size_t bytes = frame_count * bytes_per_frame_;
+  // 缓冲满：切文件（复用 start_capture 的轮转逻辑）
+  if (buffer_offset_ * bytes_per_frame_ + bytes >
+      buffer_samples_ * bytes_per_frame_) {
+    close_files(file_id_);
+    file_id_ = (file_id_ + 1) % files_num_;
+    file_counter_++;
+    buffer_offset_ = 0;
+    open_files(file_id_);
+  }
+  std::memcpy(buffer_.get() + buffer_offset_ * bytes_per_frame_, pcm, bytes);
+  save_files(file_id_);
+  buffer_offset_ += frame_count;
+}
+#endif
+
 ssize_t Streamer::pcm_read(uint8_t* data, size_t rcount) {
   ssize_t r;
   size_t count = rcount;
@@ -185,6 +225,28 @@ bool Streamer::start_capture() {
     return true;
 
   BOOST_LOG_TRIVIAL(info) << "Streamer: starting audio capture ... ";
+#ifdef _USE_NOISE_
+  // WITH_NOISE：ALSA capture 由 PcmCaptureService 独占，Streamer 不 open。
+  // 仅初始化 AAC 编码参数与 buffer（复用既有 setup，不启 async capture loop）。
+  rate_ = config_->get_sample_rate();
+  channels_ = config_->get_streamer_channels();
+  files_num_ = config_->get_streamer_files_num();
+  file_duration_ = config_->get_streamer_file_duration();
+  player_buffer_files_num_ = config_->get_streamer_player_buffer_files_num();
+  chunk_samples_ = 6144;
+  bytes_per_frame_ = snd_pcm_format_physical_width(format) * channels_ / 8;
+  buffer_samples_ = rate_ * file_duration_ / chunk_samples_ * chunk_samples_;
+  buffer_.reset(new uint8_t[buffer_samples_ * bytes_per_frame_]);
+  if (buffer_ == nullptr)
+    return false;
+  buffer_offset_ = 0;
+  total_sink_samples_.clear();
+  file_id_ = 0;
+  file_counter_ = 0;
+  running_ = true;
+  open_files(file_id_);
+  return true;
+#else
   int err;
   if ((err = snd_pcm_open(&capture_handle_, device_name, SND_PCM_STREAM_CAPTURE,
                           SND_PCM_NONBLOCK)) < 0) {
@@ -307,6 +369,7 @@ bool Streamer::start_capture() {
   });
 
   return true;
+#endif
 }
 
 void Streamer::open_files(uint8_t files_id) {
@@ -456,19 +519,34 @@ bool Streamer::stop_capture() {
 
   BOOST_LOG_TRIVIAL(info) << "streamer: stopping audio capture ... ";
   running_ = false;
+#ifndef _USE_NOISE_
   bool ret = res_.get();
+#else
+  // WITH_NOISE：无 async capture loop（帧由 PcmCaptureService 推送）
+  bool ret = true;
+#endif
   for (const auto& sink : session_manager_->get_sinks()) {
     if (faac_[sink.id]) {
       faacEncClose(faac_[sink.id]);
       faac_[sink.id] = 0;
     }
   }
+#ifndef _USE_NOISE_
   snd_pcm_close(capture_handle_);
+#endif
   return ret;
 }
 
 bool Streamer::terminate() {
   BOOST_LOG_TRIVIAL(info) << "streamer: terminating ... ";
+#ifdef _USE_NOISE_
+  // WITH_NOISE：注销 FrameProvider（init() 注册的），停止接收 PcmCaptureService
+  // 分发的帧。stop_capture() 关闭 faac 编码器。
+  if (pcm_capture_ && pcm_token_) {
+    pcm_capture_->unregister_provider(pcm_token_);
+    pcm_token_ = 0;
+  }
+#endif
   return stop_capture();
 }
 

@@ -1,0 +1,261 @@
+// daemon/pcm_capture_service.cpp
+// 架构依据：docs/noise/architecture-design.md §4.3 / §11 风险19/21。
+#ifdef _USE_NOISE_
+
+#include "pcm_capture_service.hpp"
+
+#include <alsa/asoundlib.h>
+#include <boost/log/trivial.hpp>
+#include <chrono>
+#include <cstring>
+#include <future>
+#include <thread>
+#include <vector>
+
+#include "config.hpp"
+#include "session_manager.hpp"
+
+constexpr uint32_t PcmCaptureService::kPeriodSamples;
+
+std::shared_ptr<PcmCaptureService> PcmCaptureService::create(
+    std::shared_ptr<SessionManager> session_manager,
+    std::shared_ptr<Config> config) {
+  return std::shared_ptr<PcmCaptureService>(
+      new PcmCaptureService(std::move(session_manager), std::move(config)));
+}
+
+std::shared_ptr<PcmCaptureService> PcmCaptureService::create_for_test() {
+  // 测试用：无 SessionManager/Config，直接驱动 fake_capture_loop。
+  // publish 初始空 provider 表，满足 RcuPtr::load() 永不为空契约
+  // （production 路径由 init() 完成，测试路径不走 init()）。
+  auto svc = std::shared_ptr<PcmCaptureService>(new PcmCaptureService());
+  svc->providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
+  return svc;
+}
+
+bool PcmCaptureService::init() {
+  if (!session_manager_ || !config_)
+    return false;
+  session_manager_->add_ptp_status_observer(std::bind(
+      &PcmCaptureService::on_ptp_status_change, this, std::placeholders::_1));
+  session_manager_->add_sink_observer(
+      SessionManager::SinkObserverType::add_sink,
+      std::bind(&PcmCaptureService::on_sink_add, this, std::placeholders::_1));
+  session_manager_->add_sink_observer(
+      SessionManager::SinkObserverType::remove_sink,
+      std::bind(&PcmCaptureService::on_sink_remove, this,
+                std::placeholders::_1));
+  // 初始化空 provider 表（永不为空契约）
+  providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
+  PTPStatus status;
+  session_manager_->get_ptp_status(status);
+  on_ptp_status_change(status.status);
+  return true;
+}
+
+bool PcmCaptureService::terminate() {
+  stop_capture();
+  return true;
+}
+
+PcmCaptureService::ProviderToken PcmCaptureService::register_provider(
+    FrameProvider provider) {
+  ProviderToken token = next_token_.fetch_add(1);
+  // COW：复制当前表 -> 追加 -> 原子换
+  auto current = providers_.load();
+  auto new_table = std::make_shared<std::vector<ProviderEntry>>(*current);
+  new_table->push_back({token, std::move(provider)});
+  auto old = providers_.publish(new_table);
+  providers_retire_.retire(std::move(old), providers_.epoch());
+  return token;
+}
+
+void PcmCaptureService::unregister_provider(ProviderToken token) {
+  auto current = providers_.load();
+  auto new_table = std::make_shared<std::vector<ProviderEntry>>();
+  new_table->reserve(current->size());
+  for (const auto& e : *current) {
+    if (e.token != token)
+      new_table->push_back(e);
+  }
+  auto old = providers_.publish(new_table);
+  providers_retire_.retire(std::move(old), providers_.epoch());
+}
+
+void PcmCaptureService::dispatch(const uint8_t* pcm,
+                                 size_t frame_count,
+                                 uint8_t channels,
+                                 uint32_t rate) {
+  // period 顶部 load 快照（整 period 复用，不每帧原子操作）
+  auto snapshot = providers_.load();
+  for (const auto& e : *snapshot) {
+    e.provider(pcm, frame_count, channels, rate);
+  }
+}
+
+bool PcmCaptureService::is_sink_receiving(uint8_t sink_id) const {
+  // SessionManager 无 is_sink_receiving，用 get_sink_status + SinkStreamStatus
+  // （session_manager.hpp:70 is_receiving_rtp_packet / :166 get_sink_status）
+  if (!session_manager_)
+    return false;
+  SinkStreamStatus status;
+  if (session_manager_->get_sink_status(sink_id, status))
+    return false;
+  return status.is_receiving_rtp_packet;
+}
+
+uint32_t PcmCaptureService::get_sample_rate() const {
+  return config_ ? config_->get_sample_rate() : test_rate_;
+}
+
+uint8_t PcmCaptureService::get_sink_channel_count(uint8_t sink_id) const {
+  // Spec1 最小实现：返回 streamer channels（Phase 1 限定全通道分发）
+  return config_ ? config_->get_streamer_channels() : test_channels_;
+}
+
+bool PcmCaptureService::is_capturing() const {
+  return running_.load();
+}
+
+bool PcmCaptureService::on_ptp_status_change(const std::string& status) {
+  BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: ptp status " << status;
+#ifdef _USE_FAKE_DRIVER_
+  // FAKE_DRIVER：PTP 永远 UNLOCKED，忽略 PTP 状态直接起 fake loop（§4.3）
+  if (!running_.load() && status == "unlocked") {
+    return start_capture();
+  }
+  return true;
+#else
+  if (status == "locked") {
+    return start_capture();
+  } else if (status == "unlocked") {
+    return stop_capture();
+  }
+  return true;
+#endif
+}
+
+bool PcmCaptureService::on_sink_add(uint8_t /*id*/) {
+  return true;
+}
+bool PcmCaptureService::on_sink_remove(uint8_t /*id*/) {
+  return true;
+}
+
+bool PcmCaptureService::start_capture() {
+  if (running_.load())
+    return true;
+  stop_flag_.store(false);
+  running_.store(true);
+#ifdef _USE_FAKE_DRIVER_
+  capture_future_ =
+      std::async(std::launch::async, [this] { fake_capture_loop(); });
+#else
+  capture_future_ = std::async(std::launch::async, [this] { capture_loop(); });
+#endif
+  return true;
+}
+
+bool PcmCaptureService::stop_capture() {
+  if (!running_.load())
+    return true;
+  stop_flag_.store(true);
+  // §11 风险19：控制线程调 snd_pcm_drop()+close() 中断阻塞 readi。
+  if (capture_handle_) {
+    snd_pcm_drop(capture_handle_);
+  }
+  if (capture_future_.valid())
+    capture_future_.wait();
+  if (capture_handle_) {
+    snd_pcm_close(capture_handle_);
+    capture_handle_ = nullptr;
+  }
+  running_.store(false);
+  return true;
+}
+
+// FAKE_DRIVER：模拟 ALSA period 节拍分发（§11 风险21 三规格）。
+void PcmCaptureService::fake_capture_loop() {
+  BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_capture_loop start";
+  // 静音帧缓冲（S16_LE 交错），按 test_rate_/test_channels_ 配置。
+  // Spec1：未指定 fake_pcm_source_ 时用内置静音帧（§4.3）。
+  const uint8_t channels = test_channels_;
+  const uint32_t rate = test_rate_;
+  const size_t bytes_per_sample = 2;  // S16_LE
+  const size_t period_bytes = kPeriodSamples * channels * bytes_per_sample;
+  std::vector<uint8_t> silent(period_bytes, 0);
+
+  // period 时长 = 6144 / 48000 ≈ 128ms
+  const auto period_duration =
+      std::chrono::microseconds(kPeriodSamples * 1000000ULL / rate);
+  auto next_period = std::chrono::steady_clock::now();
+  while (!stop_flag_.load()) {
+    dispatch(silent.data(), kPeriodSamples, channels, rate);
+    next_period += period_duration;
+    std::this_thread::sleep_until(next_period);
+  }
+  // period 结尾推进 epoch（RT 静止点），供 retire 回收判断
+  providers_.advance_epoch();
+  providers_retire_.reclaim_older_than(providers_.epoch());
+  BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_capture_loop end";
+}
+
+// 真实 ALSA capture（PTP locked 时运行）。hw_params 镜像 streamer.cpp
+// start_capture。
+void PcmCaptureService::capture_loop() {
+  BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: capture_loop start";
+  constexpr const char* device = "plughw:RAVENNA";
+  int err;
+  if ((err = snd_pcm_open(&capture_handle_, device, SND_PCM_STREAM_CAPTURE,
+                          SND_PCM_NONBLOCK)) < 0) {
+    BOOST_LOG_TRIVIAL(fatal) << "PcmCaptureService: cannot open " << device
+                             << ": " << snd_strerror(err);
+    running_.store(false);
+    return;
+  }
+  snd_pcm_hw_params_t* hw;
+  snd_pcm_hw_params_alloca(&hw);
+  snd_pcm_hw_params_any(capture_handle_, hw);
+  snd_pcm_hw_params_set_access(capture_handle_, hw,
+                               SND_PCM_ACCESS_RW_INTERLEAVED);
+  snd_pcm_hw_params_set_format(capture_handle_, hw, SND_PCM_FORMAT_S16_LE);
+  uint32_t rate = config_->get_sample_rate();
+  snd_pcm_hw_params_set_rate_near(capture_handle_, hw, &rate, 0);
+  uint8_t channels = config_->get_streamer_channels();
+  snd_pcm_hw_params_set_channels(capture_handle_, hw, channels);
+  snd_pcm_hw_params(capture_handle_, hw);
+  snd_pcm_prepare(capture_handle_);
+
+  const size_t bytes_per_frame = 2 * channels;  // S16_LE
+  std::vector<uint8_t> buf(kPeriodSamples * bytes_per_frame);
+  while (!stop_flag_.load()) {
+    snd_pcm_sframes_t n =
+        snd_pcm_readi(capture_handle_, buf.data(), kPeriodSamples);
+    if (n < 0) {
+      // stop_flag_ 触发或 xrun：readi 返回错误，检查 stop_flag_ 退出
+      if (stop_flag_.load())
+        break;
+      snd_pcm_recover(capture_handle_, n, 1);
+      continue;
+    }
+    dispatch(buf.data(), static_cast<size_t>(n), channels, rate);
+    providers_.advance_epoch();
+    providers_retire_.reclaim_older_than(providers_.epoch());
+  }
+  BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: capture_loop end";
+}
+
+// 测试专用入口
+void PcmCaptureService::start_fake_for_test(uint32_t sample_rate,
+                                            uint8_t channels) {
+  test_rate_ = sample_rate;
+  test_channels_ = channels;
+  // 不重置 providers_ 表：create_for_test() 已 publish 初始空表，
+  // register_provider() 在此前已追加 provider，重发空表会冲掉已注册 provider。
+  start_capture();
+}
+void PcmCaptureService::stop_for_test() {
+  stop_capture();
+}
+
+#endif  // _USE_NOISE_

@@ -81,6 +81,9 @@ BOOST_AUTO_TEST_CASE(const_t_supported) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
+#include "noise_session_manager_bridge.hpp"
+#include "noise/audio_capture.hpp"
+
 #include "pcm_capture_service.hpp"
 #include <chrono>
 #include <thread>
@@ -98,6 +101,37 @@ std::error_code SessionManager::get_sink_status(uint32_t,
                                                 SinkStreamStatus&) const {
   return {};
 }
+
+BOOST_AUTO_TEST_SUITE(bridge_tests)
+
+// uint8_t(S16_LE 交错)->float 转换 + 单通道解复用。
+// 构造已知交错 PCM：[ch0_s0, ch1_s0, ch0_s1, ch1_s1, ...]，提取 ch0。
+BOOST_AUTO_TEST_CASE(bridge_demux_and_float_conversion) {
+  auto pcm_svc = PcmCaptureService::create_for_test();
+  NoiseSessionManagerBridge bridge(pcm_svc);
+
+  // 2 通道，4 样本：ch0 = [0, 16384, -16384, 32767]，ch1 全 0
+  const int16_t interleaved[8] = {0, 0, 16384, 0, -16384, 0, 32767, 0};
+  static std::vector<float> received;
+  received.clear();
+  AudioCapture cap;
+  cap.register_callback([](const float* frames, size_t n, uint8_t ch) {
+    BOOST_CHECK_EQUAL(ch, 1);
+    for (size_t i = 0; i < n; ++i)
+      received.push_back(frames[i]);
+  });
+  // Bridge 把交错 S16 转 float 单通道后喂 AudioCapture 回调
+  bridge.test_demux_for_test(reinterpret_cast<const uint8_t*>(interleaved),
+                             4 /*samples*/, 2 /*channels*/, 0 /*ch_index*/,
+                             cap);
+  BOOST_CHECK_EQUAL(received.size(), 4u);
+  BOOST_CHECK_CLOSE(received[0], 0.0f / 32768.0f, 0.01);
+  BOOST_CHECK_CLOSE(received[1], 16384.0f / 32768.0f, 0.01);
+  BOOST_CHECK_CLOSE(received[2], -16384.0f / 32768.0f, 0.01);
+  BOOST_CHECK_CLOSE(received[3], 32767.0f / 32768.0f, 0.01);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(pcm_capture_service_tests)
 

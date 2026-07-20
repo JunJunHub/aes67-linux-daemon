@@ -55,7 +55,7 @@ endif()
 if(WITH_NOISE)
   MESSAGE(STATUS "WITH_NOISE")
   add_definitions(-D_USE_NOISE_)
-  list(APPEND SOURCES pcm_capture_service.cpp)
+  list(APPEND SOURCES pcm_capture_service.cpp noise_session_manager_bridge.cpp)
 endif()
 add_executable(aes67-daemon ${SOURCES})
 
@@ -94,7 +94,8 @@ endif()
 
 if(ENABLE_TESTS AND WITH_NOISE)
   find_package(Boost COMPONENTS unit_test_framework log REQUIRED)
-  add_executable(noise-test noise/tests/noise_test.cpp pcm_capture_service.cpp)
+  add_executable(noise-test noise/tests/noise_test.cpp
+                 pcm_capture_service.cpp noise_session_manager_bridge.cpp)
   target_include_directories(noise-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(noise-test PRIVATE noise ${Boost_LIBRARIES} ${ALSA_LIBRARY})
   target_compile_definitions(noise-test PRIVATE -D_USE_FAKE_DRIVER_ -D_USE_NOISE_)

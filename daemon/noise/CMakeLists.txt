@@ -4,8 +4,7 @@
 # 库合法），改用 STATIC + 普通链接（daemon/CMakeLists.txt 的 noise-test target
 # 用 target_link_libraries(... noise)）。
 set(NOISE_SOURCES
-  init.cpp
-  # Spec1: 暂无其他 .cpp（rcu_ptr.hpp 是 header-only，audio_capture.cpp 在 Task 4 追加）
+  audio_capture.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

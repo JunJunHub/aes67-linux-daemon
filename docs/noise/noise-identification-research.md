@@ -171,13 +171,13 @@ flowchart LR
 // 模板 = 归一化的 32 维 Bark 频带能量
 struct NoiseTemplate {
     std::string label;           // "空调噪声", "50Hz哼声", ...
-    std::array<float, 32> band_energy;  // 归一化 Bark 频带能量
+    std::array<float, 32> bark_spectrum;  // 归一化 Bark 频带能量（C4：与 §6.1 / 主文档统一命名）
     float reference_level;      // 录入时的参考噪声级 (dBFS)
 };
 
 // 匹配 = 余弦相似度
 float match(const NoiseTemplate& tmpl, const std::array<float, 32>& input) {
-    return cosine_similarity(tmpl.band_energy, input);
+    return cosine_similarity(tmpl.bark_spectrum, input);
 }
 ```
 

@@ -579,19 +579,49 @@ class DenoiseProcessor {
 
   // ── 音频线程：周期顶部 pin 一次，整周期复用，不每帧原子操作 ──
   void on_period_begin() { pinned_ = rcu_ptr_.load(); /* 永不为空 */ }
-  size_t process(const float* in, size_t n_in, float* out, size_t n_out_max,
-                 DenoiseResult* result) {
-    size_t n = pinned_->plugin->process(in, n_in, out, n_out_max, result);
-    // 静音过渡：对本 slot 的 mute 单调递减（仅 RT 写，min 上限保证永不为负）
+
+  // 三路输出处理（BL1 修复：与架构 §3.4 DenoiseOutput 三路 + front/back 双缓冲对齐）。
+  // 每帧写 back 缓冲，period 末 on_period_end() swap front/back（下游读 front）。
+  // 返回写入样本数 n（RNNoise frame=hop 无 overlap；流式插件 n 可能 < n_in，见 §2.2）。
+  size_t process(const float* in, size_t n_in, DenoiseResult* result) {
+    // ① 降噪：plugin 写 back_->denoised（IDenoisePlugin 单输出契约，§2.2）
+    size_t n = pinned_->plugin->process(in, n_in, back_->denoised, max_frame_, result);
+    // ② 原始副本：in -> back_->original（per-sensor 拷贝，全 Phase 线程安全，架构 §3.4）
+    std::memcpy(back_->original, in, n * sizeof(float));
+    // ③ 噪声分量：back_->noise = original - denoised（逐样本相减）
+    for (size_t i = 0; i < n; ++i)
+      back_->noise[i] = back_->original[i] - back_->denoised[i];
+    back_->frame_count = n;
+    // ④ 静音过渡：对本 slot 的 mute 单调递减（仅 RT 写，min 上限保证永不为负）
+    //    仅静音降噪路（denoised），original/noise 保留以供分析/SSE
     if (pinned_->mute_remaining > 0) {
       size_t mute = std::min(pinned_->mute_remaining, n);
-      std::memset(out, 0, mute * sizeof(float));
+      std::memset(back_->denoised, 0, mute * sizeof(float));
       pinned_->mute_remaining -= mute;
     }
     return n;
   }
+
+  // Streamer / SSE 读 front 缓冲（架构 §4.4 数据通路）。
+  // acquire 序，与 on_period_end() swap 的 release 配对。
+  // 返回的 DenoiseOutput 在下次 on_period_end() swap 前有效（架构 §11 风险23）。
+  const DenoiseOutput* get_output() const {
+    front_view_.original = front_->original;
+    front_view_.denoised = front_->denoised;
+    front_view_.noise = front_->noise;
+    front_view_.frame_count = front_->frame_count;
+    return &front_view_;
+  }
+
   void on_period_end() {
-    pinned_.reset();               // 释放本周期局部引用
+    // front/back swap（release 序）：本 period 写入的 back 变为 front 供下游读。
+    // 用 std::swap（非原子）即可：swap（on_period_end）与 front 读（get_output，经架构 §4.4
+    // 的 capture 线程 FrameProvider 回调内 memcpy）均由 capture 线程单线程驱动，无跨线程
+    // 竞争。HTTP 线程只读 Streamer 自有 ring（§4.4），不直接读 front_。架构 §3.4 的
+    // "std::atomic<DenoiseOutput*>" 表述为更早的宽松描述，以本节单线程 swap + §11 风险17
+    // 的"period 回调内 memcpy front"为准。
+    std::swap(front_, back_);
+    pinned_ = nullptr;             // 释放本周期裸指针（Taste 决策1，不再持 shared_ptr）
     rcu_ptr_.advance_epoch();      // 通知 housekeeper：一个静止点已过
   }
   // housekeeper（控制线程定期驱动）：释放穿越 ≥2 静止点的旧 slot。
@@ -607,6 +637,17 @@ class DenoiseProcessor {
   }
 
  private:
+  // 三路输出缓冲（front/back 双缓冲，构造时按 max_frame_ 分配，运行时零堆分配）
+  // 架构 §3.4 的 DenoiseOutput{const float* original/denoised/noise; size_t frame_count}
+  // 是其只读视图；DenoiseBuffer 持有 owning float[] 存储。
+  struct DenoiseBuffer {
+    std::unique_ptr<float[]> original;   // input 副本
+    std::unique_ptr<float[]> denoised;    // plugin 输出
+    std::unique_ptr<float[]> noise;      // original - denoised
+    size_t frame_count{0};
+    explicit DenoiseBuffer(size_t cap)
+        : original(new float[cap]), denoised(new float[cap]), noise(new float[cap]) {}
+  };
   // 随快照发布的槽：plugin + 该 slot 的静音计数（RT 单调递减）
   struct PluginSlot {
     std::shared_ptr<IDenoisePlugin> plugin;
@@ -615,10 +656,15 @@ class DenoiseProcessor {
         : plugin(std::move(p)), mute_remaining(mute) {}
   };
   RcuPtr<PluginSlot> rcu_ptr_;            // 原子插槽 + 静止点回收（C++17 自实现，见下）
-  std::shared_ptr<PluginSlot> pinned_;    // 本周期快照（RT 持有，整周期复用）
+  PluginSlot* pinned_{nullptr};           // 本周期裸指针快照（RT 持有，on_period_end 置空；Taste 决策1）
   RetireQueue<PluginSlot> retire_list_;   // 旧 slot 延迟释放队列
   PluginConfig current_config_;
   LatencyChangeCb latency_change_cb_;     // init-only
+  // 双缓冲（BL1）：front 供 Streamer/SSE 读，back 供 RT process 写，on_period_end swap。
+  std::unique_ptr<DenoiseBuffer> front_;
+  std::unique_ptr<DenoiseBuffer> back_;
+  mutable DenoiseOutput front_view_;      // get_output() 返回的只读视图（指向 front_ 缓冲）
+  size_t max_frame_;  // 构造时按插件 algorithmic_latency + 帧长确定（RNNoise = 480）
   static constexpr size_t kConvergenceMargin = 2400;  // 50ms @48k 收敛余量
 };
 ```

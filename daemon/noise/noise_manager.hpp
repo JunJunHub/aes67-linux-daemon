@@ -72,6 +72,14 @@ class NoiseManager {
   // 测试钩子（spec §D 接受此模式）
   size_t sensor_count_for_test() const;
   bool is_ptp_locked_for_test() const { return ptp_locked_.load(); }
+  // #2: ptp_locked_ 默认 false（arch §3.7 L855 安全默认），测试显式置位模拟
+  // PTP 锁定。生产环境由 bridge 回调管理（Spec3 wiring）。
+  void set_ptp_locked_for_test(bool locked) { ptp_locked_.store(locked); }
+  // #4: 观察 reset_pending_ 状态（on_ptp_unlocked 置位，housekeeper 200ms
+  // 后清）。
+  bool is_reset_pending_for_test() const { return reset_pending_.load(); }
+  // #3: 读取指定 sensor 的 stub process() 调用次数。Task 7 真实处理器无此钩子。
+  size_t stub_call_count_for_test(uint8_t sensor_id) const;
 
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
@@ -80,12 +88,12 @@ class NoiseManager {
   RetireQueue<const SensorTable> retire_queue_;
   // period 顶部 load 的快照（裸指针），整 period 内复用，on_period_end 置空。
   const SensorTable* pinned_table_{nullptr};
-  NoiseAudioBridge& bridge_;
+  NoiseAudioBridge& bridge_;  // #6: held for Task 2-3 FrameProvider
+                              // registration (Spec3 wiring)
   std::mutex
       ctrl_mutex_;  // 仅保护控制线程的建表/换表；帧回调走 RCU 读，绝不持此锁
-  // Task 1 简化：初始 true（正常工作态）。Task 7 接入 PTP
-  // 状态回调后由回调管理。
-  std::atomic<bool> ptp_locked_{true};
+  // arch §3.7 L855：安全默认 false（假设未锁，直到 PTP 回调确认锁定）。
+  std::atomic<bool> ptp_locked_{false};
   std::atomic<bool> reset_pending_{false};
   std::future<void> reset_future_;  // 持有 housekeeper async 任务
 };

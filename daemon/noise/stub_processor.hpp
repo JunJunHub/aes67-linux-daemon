@@ -15,7 +15,11 @@ class StubProcessor {
     (void)sink_id;
     (void)frames;
     (void)frame_size;
+    ++call_count;
   }
+
+  // 测试观察点（#3）：process() 被调用次数。Task 7 真实处理器无此字段。
+  size_t call_count{0};
 };
 
 #endif  // NOISE_STUB_PROCESSOR_HPP_

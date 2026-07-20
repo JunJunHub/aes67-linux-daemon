@@ -87,6 +87,8 @@ void NoiseManager::on_ptp_unlocked() {
   reset_pending_.store(true);
   // Task 1 简化：stub 无插件可 reset，仅延迟清标志。
   // Task 7 替换为 plugin->reset() + PcmCaptureService join（Spec3 path A）。
+  // #5: Task 1 最小实现：重复 on_ptp_unlocked() 会阻塞 ≤200ms（旧 future 析构
+  // 等待）。Task 7 改为独立 housekeeper 线程。
   reset_future_ = std::async(std::launch::async, [this]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     reset_pending_.store(false);
@@ -96,6 +98,16 @@ void NoiseManager::on_ptp_unlocked() {
 size_t NoiseManager::sensor_count_for_test() const {
   const SensorTable* tbl = sensor_table_.load();
   return tbl ? tbl->size() : 0;
+}
+
+size_t NoiseManager::stub_call_count_for_test(uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return 0;
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end() || it->second.stub == nullptr)
+    return 0;
+  return it->second.stub->call_count;
 }
 
 }  // namespace noise

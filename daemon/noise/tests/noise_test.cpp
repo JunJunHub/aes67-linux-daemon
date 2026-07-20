@@ -133,6 +133,37 @@ BOOST_AUTO_TEST_CASE(bridge_demux_and_float_conversion) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_AUTO_TEST_SUITE(pcm_capture_service_tests)
+
+// fake_capture_loop：注册 stub provider，断言帧回调触发、frame_count==6144。
+BOOST_AUTO_TEST_CASE(fake_capture_loop_dispatches_to_provider) {
+  // FAKE_DRIVER 模式：PcmCaptureService 忽略 PTP，直接跑 fake_capture_loop。
+  // SessionManager/Config 在测试中用最小 stub（见 Step 3 的测试辅助）。
+  auto svc = PcmCaptureService::create_for_test();
+  static std::atomic<int> callback_count{0};
+  static std::atomic<size_t> last_frame_count{0};
+  static std::atomic<uint8_t> last_channels{0};
+  static std::atomic<uint32_t> last_rate{0};
+  auto token =
+      svc->register_provider([](const uint8_t* /*pcm*/, size_t frame_count,
+                                uint8_t channels, uint32_t rate) {
+        callback_count.fetch_add(1);
+        last_frame_count.store(frame_count);
+        last_channels.store(channels);
+        last_rate.store(rate);
+      });
+  svc->start_fake_for_test(48000, 2);  // 48kHz, 2ch, 内置静音帧
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  svc->stop_for_test();
+  svc->unregister_provider(token);
+  BOOST_CHECK_GT(callback_count.load(), 0);
+  BOOST_CHECK_EQUAL(last_frame_count.load(), 6144u);
+  BOOST_CHECK_EQUAL(last_channels.load(), 2);
+  BOOST_CHECK_EQUAL(last_rate.load(), 48000u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 #include "noise_manager.hpp"
 #include <chrono>
 #include <thread>
@@ -163,6 +194,8 @@ BOOST_AUTO_TEST_SUITE(noise_manager_tests)
 BOOST_AUTO_TEST_CASE(noise_manager_routes_frames_to_sensors) {
   NoiseAudioBridgeStub bridge;  // 见上方测试辅助
   noise::NoiseManager mgr(bridge);
+  // #2: ptp_locked_ 默认 false，测试显式置 true 模拟 PTP 锁定。
+  mgr.set_ptp_locked_for_test(true);
   BOOST_CHECK(mgr.add_sensor(0, 0, noise::NoiseSensorConfig{}));
   BOOST_CHECK(mgr.add_sensor(1, 1, noise::NoiseSensorConfig{}));
 
@@ -172,15 +205,19 @@ BOOST_AUTO_TEST_CASE(noise_manager_routes_frames_to_sensors) {
   mgr.on_frame(0, silence, 480);
   mgr.on_frame(1, silence, 480);
   mgr.on_period_end();
-  // stub processor 不产出，仅验证不崩溃 + 帧路由执行
-  BOOST_CHECK_GT(mgr.sensor_count_for_test(), 0);
+  // #3: 验证 stub process() 被调用（路由生效）
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0);
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(1), 0);
 
   // 增删 sensor 不阻塞帧处理（COW 原子换）
+  size_t count_before = mgr.stub_call_count_for_test(0);
   mgr.on_period_begin();
   mgr.add_sensor(2, 2, noise::NoiseSensorConfig{});  // 控制线程换表
   mgr.on_frame(0, silence, 480);  // RT 用 pinned 快照，不受影响
   mgr.on_period_end();
   BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 3);
+  // #3: 第二个 period 再次路由到 sensor 0，call_count 递增
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), count_before);
 }
 
 // PTP unlock 置 ptp_locked_=false 后 process 跳过
@@ -188,15 +225,31 @@ BOOST_AUTO_TEST_CASE(noise_manager_ptp_unlock_skips_processing) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  // #2: ptp_locked_ 默认 false，置 true 模拟 PTP 锁定。
+  mgr.set_ptp_locked_for_test(true);
   float silence[480] = {0};
   mgr.on_period_begin();
-  mgr.on_frame(0, silence, 480);  // 处理
+  mgr.on_frame(0, silence, 480);  // ptp_locked_=true，处理
   mgr.on_period_end();
+  // #3: 确认 process() 被调用过
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0);
+
   mgr.on_ptp_unlocked();
+  BOOST_CHECK(!mgr.is_ptp_locked_for_test());
+  // #4: on_ptp_unlocked 立即置位 reset_pending_
+  BOOST_CHECK(mgr.is_reset_pending_for_test());
+
+  size_t count_before = mgr.stub_call_count_for_test(0);
   mgr.on_period_begin();
   mgr.on_frame(0, silence, 480);  // ptp_locked_=false，跳过
   mgr.on_period_end();
-  BOOST_CHECK(!mgr.is_ptp_locked_for_test());
+  // #3: process() 未被调用，call_count 未递增
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), count_before);
+
+  // #4: async housekeeper 200ms 后清 reset_pending_（250ms 等待留余量，
+  // 此时 future 已完成，析构时 wait() 立即返回，不阻塞）。
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_CHECK(!mgr.is_reset_pending_for_test());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -61,11 +61,13 @@ die()  { echo "${C_RED}[dev]${C_OFF} ERROR: $*" >&2; exit 1; }
 
 # ---- build -------------------------------------------------------------------
 cmd_build() {
-  local with_avahi=ON fake_driver=ON
+  local with_avahi=ON fake_driver=ON with_streamer=OFF with_noise=ON
   while [ $# -gt 0 ]; do
     case "$1" in
-      --no-avahi) with_avahi=OFF; shift ;;
-      --real)     fake_driver=OFF; shift ;;
+      --no-avahi)     with_avahi=OFF; shift ;;
+      --real)         fake_driver=OFF; shift ;;
+      --with-streamer) with_streamer=ON; shift ;;
+      --no-noise)     with_noise=OFF; shift ;;
       *) die "build: unknown option: $1" ;;
     esac
   done
@@ -100,7 +102,8 @@ cmd_build() {
       -DENABLE_TESTS=ON \
       -DWITH_AVAHI=$with_avahi \
       -DFAKE_DRIVER=$fake_driver \
-      -DWITH_STREAMER=OFF
+      -DWITH_STREAMER=$with_streamer \
+      -DWITH_NOISE=$with_noise
 
   log "building aes67-daemon ..."
   cmake --build "$BUILD_DIR" --target aes67-daemon

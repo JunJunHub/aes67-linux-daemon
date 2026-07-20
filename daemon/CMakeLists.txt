@@ -13,6 +13,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 option(WITH_SYSTEMD "Include systemd notify and watchdog support" OFF)
 option(WITH_STREAMER "Enable streamer support" ON)
+option(WITH_NOISE "Enable noise analysis and denoise module" OFF)
 
 # ravena lkm _should_ be provided by the CLI. Nonetheless, we should be able
 # to find it in system dirs too...
@@ -56,6 +57,13 @@ if(ENABLE_TESTS)
     add_subdirectory(tests)
 endif()
 
+if(WITH_NOISE)
+  MESSAGE(STATUS "WITH_NOISE")
+  add_definitions(-D_USE_NOISE_)
+  add_subdirectory(noise)
+  target_link_libraries(aes67-daemon noise)
+endif()
+
 target_link_libraries(aes67-daemon ${Boost_LIBRARIES})
 if(WITH_AVAHI)
   MESSAGE(STATUS "WITH_AVAHI")
@@ -74,4 +82,12 @@ if(WITH_STREAMER)
   find_library(ALSA_LIBRARY NAMES asound)
   find_library(AAC_LIBRARY NAMES faac)
   target_link_libraries(aes67-daemon ${ALSA_LIBRARY} ${AAC_LIBRARY})
+endif()
+
+if(ENABLE_TESTS AND WITH_NOISE)
+  find_package(Boost COMPONENTS unit_test_framework REQUIRED)
+  add_executable(noise-test noise/tests/noise_test.cpp)
+  target_link_libraries(noise-test PRIVATE noise ${Boost_LIBRARIES})
+  target_compile_definitions(noise-test PRIVATE -D_USE_FAKE_DRIVER_ -D_USE_NOISE_)
+  add_test(NAME noise-test COMMAND noise-test -p)
 endif()

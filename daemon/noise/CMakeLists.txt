@@ -5,6 +5,8 @@
 # 用 target_link_libraries(... noise)）。
 set(NOISE_SOURCES
   audio_capture.cpp
+  noise_manager.cpp
+  stub_processor.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

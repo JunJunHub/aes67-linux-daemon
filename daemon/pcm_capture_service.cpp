@@ -67,6 +67,11 @@ PcmCaptureService::ProviderToken PcmCaptureService::register_provider(
   new_table->push_back({token, std::move(provider)});
   auto old = providers_.publish(new_table);
   providers_retire_.retire(std::move(old), providers_.epoch());
+  // 控制线程驱动回收（§3.8 housekeeper，event-driven on publish，YAGNI 无需
+  // 独立 housekeeper 线程）。2-epoch 保证：retire 入队后若 RT 线程尚未穿越
+  // 2 静止点，reclaim 检查 epoch 差不足 2 -> no-op，更晚的 register/unregister
+  // 回收。
+  providers_retire_.reclaim_older_than(providers_.epoch());
   return token;
 }
 
@@ -80,6 +85,8 @@ void PcmCaptureService::unregister_provider(ProviderToken token) {
   }
   auto old = providers_.publish(new_table);
   providers_retire_.retire(std::move(old), providers_.epoch());
+  // 同 register_provider：控制线程驱动回收（§3.8 housekeeper）。
+  providers_retire_.reclaim_older_than(providers_.epoch());
 }
 
 void PcmCaptureService::dispatch(const uint8_t* pcm,
@@ -161,14 +168,16 @@ bool PcmCaptureService::stop_capture() {
     return true;
   stop_flag_.store(true);
   // §11 风险19：控制线程调 snd_pcm_drop()+close() 中断阻塞 readi。
-  if (capture_handle_) {
-    snd_pcm_drop(capture_handle_);
+  // acquire 与 capture_loop 的 store(release) 配对，确保看到 open 后的指针。
+  snd_pcm_t* h = capture_handle_.load(std::memory_order_acquire);
+  if (h) {
+    snd_pcm_drop(h);
   }
   if (capture_future_.valid())
     capture_future_.wait();
-  if (capture_handle_) {
-    snd_pcm_close(capture_handle_);
-    capture_handle_ = nullptr;
+  if (h) {
+    snd_pcm_close(h);
+    capture_handle_.store(nullptr, std::memory_order_release);
   }
   running_.store(false);
   return true;
@@ -194,9 +203,10 @@ void PcmCaptureService::fake_capture_loop() {
     next_period += period_duration;
     std::this_thread::sleep_until(next_period);
   }
-  // period 结尾推进 epoch（RT 静止点），供 retire 回收判断
+  // period 结尾推进 epoch（RT 静止点），供 retire 队列 2-epoch 判断。
+  // reclaim_older_than 由控制线程 register/unregister_provider 驱动
+  // （§3.8 housekeeper），RT 路径无锁。
   providers_.advance_epoch();
-  providers_retire_.reclaim_older_than(providers_.epoch());
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_capture_loop end";
 }
 
@@ -206,41 +216,51 @@ void PcmCaptureService::capture_loop() {
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: capture_loop start";
   constexpr const char* device = "plughw:RAVENNA";
   int err;
-  if ((err = snd_pcm_open(&capture_handle_, device, SND_PCM_STREAM_CAPTURE,
+  // 局部 handle 中转：snd_pcm_open 要 snd_pcm_t**，不能直接传 atomic 地址。
+  // open 成功后立即 store 到 capture_handle_，让 stop_capture 可见以便 drop。
+  snd_pcm_t* handle = nullptr;
+  if ((err = snd_pcm_open(&handle, device, SND_PCM_STREAM_CAPTURE,
                           SND_PCM_NONBLOCK)) < 0) {
     BOOST_LOG_TRIVIAL(fatal) << "PcmCaptureService: cannot open " << device
                              << ": " << snd_strerror(err);
     running_.store(false);
     return;
   }
+  capture_handle_.store(handle, std::memory_order_release);
   snd_pcm_hw_params_t* hw;
   snd_pcm_hw_params_alloca(&hw);
-  snd_pcm_hw_params_any(capture_handle_, hw);
-  snd_pcm_hw_params_set_access(capture_handle_, hw,
-                               SND_PCM_ACCESS_RW_INTERLEAVED);
-  snd_pcm_hw_params_set_format(capture_handle_, hw, SND_PCM_FORMAT_S16_LE);
+  snd_pcm_hw_params_any(handle, hw);
+  snd_pcm_hw_params_set_access(handle, hw, SND_PCM_ACCESS_RW_INTERLEAVED);
+  snd_pcm_hw_params_set_format(handle, hw, SND_PCM_FORMAT_S16_LE);
   uint32_t rate = config_->get_sample_rate();
-  snd_pcm_hw_params_set_rate_near(capture_handle_, hw, &rate, 0);
+  snd_pcm_hw_params_set_rate_near(handle, hw, &rate, 0);
   uint8_t channels = config_->get_streamer_channels();
-  snd_pcm_hw_params_set_channels(capture_handle_, hw, channels);
-  snd_pcm_hw_params(capture_handle_, hw);
-  snd_pcm_prepare(capture_handle_);
+  snd_pcm_hw_params_set_channels(handle, hw, channels);
+  snd_pcm_hw_params(handle, hw);
+  snd_pcm_prepare(handle);
 
   const size_t bytes_per_frame = 2 * channels;  // S16_LE
   std::vector<uint8_t> buf(kPeriodSamples * bytes_per_frame);
   while (!stop_flag_.load()) {
-    snd_pcm_sframes_t n =
-        snd_pcm_readi(capture_handle_, buf.data(), kPeriodSamples);
+    snd_pcm_sframes_t n = snd_pcm_readi(handle, buf.data(), kPeriodSamples);
     if (n < 0) {
       // stop_flag_ 触发或 xrun：readi 返回错误，检查 stop_flag_ 退出
       if (stop_flag_.load())
         break;
-      snd_pcm_recover(capture_handle_, n, 1);
+      // 镜像 streamer.cpp:151-180 pcm_read：NONBLOCK 设备无数据时返 -EAGAIN，
+      // snd_pcm_recover 不处理 -EAGAIN（只处理 -EINTR/-EPIPE/-ESTRPIPE），
+      // 直接 continue 会 100% CPU busy-spin。先 snd_pcm_wait 阻塞等数据。
+      if (n == -EAGAIN) {
+        snd_pcm_wait(handle, 1000);
+        continue;
+      }
+      snd_pcm_recover(handle, n, 1);
       continue;
     }
     dispatch(buf.data(), static_cast<size_t>(n), channels, rate);
+    // period 结尾推进 epoch（RT 静止点）。reclaim_older_than 由控制线程
+    // register/unregister_provider 驱动（§3.8 housekeeper），RT 路径无锁。
     providers_.advance_epoch();
-    providers_retire_.reclaim_older_than(providers_.epoch());
   }
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: capture_loop end";
 }

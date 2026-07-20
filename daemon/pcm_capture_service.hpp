@@ -81,7 +81,11 @@ class PcmCaptureService
 
   std::shared_ptr<SessionManager> session_manager_;
   std::shared_ptr<Config> config_;
-  snd_pcm_t* capture_handle_{nullptr};  // 仅 _USE_NOISE_ 用
+  // 仅 _USE_NOISE_ 用。原子指针：capture_loop（写，snd_pcm_open 后 store）
+  // 与 stop_capture（读/写，snd_pcm_drop/close/置 null）跨线程同步（§3.8
+  // 同步协议， 消除 brief 裸指针 data race）。stop_capture 的 drop+close
+  // 中断阻塞 readi 仍 保留（§11 风险19 设计意图）。
+  std::atomic<snd_pcm_t*> capture_handle_{nullptr};
   std::atomic_bool running_{false};
   std::atomic_bool stop_flag_{false};
   std::future<void> capture_future_;

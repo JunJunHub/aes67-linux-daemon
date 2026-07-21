@@ -19,16 +19,39 @@ NoiseManager::~NoiseManager() {
 
 bool NoiseManager::add_sensor(uint8_t sensor_id,
                               uint8_t sink_id,
-                              const NoiseSensorConfig& /*cfg*/) {
+                              const NoiseSensorConfig& cfg) {
   // 控制线程：COW 复制当前表 -> 加 sensor -> 原子 publish -> 旧表入 retire
   std::lock_guard<std::mutex> lock(ctrl_mutex_);
   const SensorTable* current = sensor_table_.load();
   auto new_table = std::make_shared<SensorTable>(*current);
-  (*new_table)[sensor_id] = SensorContext{
-      sink_id,
-      std::make_shared<StubProcessor>(),
-      std::make_shared<NoiseMetricsStub>(),
-  };
+
+  SensorContext ctx;
+  ctx.sink_id = sink_id;
+  ctx.denoise_enabled = cfg.denoise_enabled;
+  // ① DenoiseProcessor：构造即装 PassthroughPlugin（plugin_ 永不为空）。
+  ctx.denoise = std::make_shared<DenoiseProcessor>();
+  // 若 cfg 指定非 passthrough 插件，切换（如 "rnnoise"）。
+  if (!cfg.plugin_name.empty() && cfg.plugin_name != "passthrough") {
+    ctx.denoise->switch_plugin(cfg.plugin_name);
+    // 控制线程立即回收 retired slot（若 switch 成功，旧 slot 已入 retire）。
+    ctx.denoise->drain_retire();
+  }
+  // dry_wet 应用（控制线程 -> plugin->set_dry_wet）。
+  ctx.denoise->set_dry_wet(cfg.dry_wet);
+  // ② NoiseDetector（监测角色，SimpleEnergyVad）。
+  ctx.detector = std::make_shared<NoiseDetector>();
+  ctx.detector->set_sensitivity(cfg.sensitivity);
+  // ③ NoiseAnalyzer（L1 规则式 + L2 模板匹配）。
+  ctx.analyzer = std::make_shared<NoiseAnalyzer>();
+  // ④ NoiseMetrics stub（Spec3 1.9 实装真聚合）。
+  ctx.metrics = std::make_shared<NoiseMetricsStub>();
+  // 共享观测状态：shared_ptr 使 COW 表复制时旧表/新表共享同一计数器/结果，
+  // on_frame 在 pinned 旧表上递增会反映到新表（stub_call_count_for_test 读
+  // 新表）。与 detector/analyzer 等 shared_ptr 成员同语义。
+  ctx.last_analysis = std::make_shared<NoiseAnalysisResult>();
+  ctx.frame_count = std::make_shared<std::atomic<size_t>>(0);
+
+  (*new_table)[sensor_id] = std::move(ctx);
   auto old = sensor_table_.publish(std::move(new_table));
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   // 控制线程回收（勿在 RT 路径调，reclaim_older_than 持 mutex）
@@ -36,13 +59,28 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   return true;
 }
 
+bool NoiseManager::switch_plugin(uint8_t sensor_id, const std::string& name) {
+  // 控制线程：lookup sensor -> denoise->switch_plugin(name) + drain_retire。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
+  const SensorTable* current = sensor_table_.load();
+  auto it = current->find(sensor_id);
+  if (it == current->end() || !it->second.denoise)
+    return false;
+  bool ok = it->second.denoise->switch_plugin(name);
+  // drain_retire 控制线程专用：回收穿越 >=2 静止点的 retired PluginSlot。
+  // switch_plugin 后立即调用，确保旧插件析构（ONNX session teardown /
+  // rnnoise_destroy，毫秒级）在控制线程完成，不堆积在 retire_list_。
+  it->second.denoise->drain_retire();
+  return ok;
+}
+
 void NoiseManager::on_period_begin() {
   // period 顶部 load 快照，整 period 内 on_frame 复用
   pinned_table_ = sensor_table_.load();
   for (auto& [id, ctx] : *pinned_table_) {
     (void)id;
-    if (ctx.stub)
-      ctx.stub->on_period_begin();
+    if (ctx.denoise)
+      ctx.denoise->on_period_begin();
     if (ctx.metrics)
       ctx.metrics->on_period_begin();
   }
@@ -56,13 +94,64 @@ void NoiseManager::on_frame(uint8_t sink_id,
     return;
   if (pinned_table_ == nullptr)
     return;
-  // 按 sink_id 路由到对应 sensor（1.4b stub 调 process）
+  // 按 sink_id 路由到对应 sensor
   for (auto& [id, ctx] : *pinned_table_) {
     (void)id;
-    if (ctx.sink_id == sink_id && ctx.stub) {
-      ctx.stub->process(sink_id, frames, frame_size);
-      break;
+    if (ctx.sink_id != sink_id)
+      continue;
+    if (!ctx.denoise || !ctx.detector || !ctx.analyzer || !ctx.metrics)
+      return;
+    // 计数 on_frame 调用（#3 兼容：stub_call_count_for_test 用此字段）。
+    // shared_ptr<atomic<size_t>>: 跨表共享（COW 复制后旧/新表同一计数器）。
+    if (ctx.frame_count)
+      ctx.frame_count->fetch_add(1, std::memory_order_relaxed);
+
+    // ① DenoiseProcessor.process：写 back_（original/denoised/noise）。
+    //    返回 n = 实际输出样本数（plugin 可能因首帧延迟返回 < n_in）。
+    DenoiseResult denoise_result;
+    size_t n = ctx.denoise->process(frames, frame_size, &denoise_result);
+    // 当前 period 的数据视图（back_，刚写入）。get_current_output 与
+    // get_output 的区别见 denoise_processor.hpp 注释。
+    const DenoiseOutput* out = ctx.denoise->get_current_output();
+
+    // ② NoiseDetectionResult 构建（分析源选择 §3.3.1）：
+    //   denoise_enabled=true  -> RNNoise VAD 为主，Detector VAD 辅助（SF/SNR
+    //                            交叉验证），VAD 取 RNNoise。
+    //   denoise_enabled=false -> Detector VAD 为唯一源。
+    NoiseDetectionResult detection{};
+    if (ctx.denoise_enabled) {
+      // RNNoise VAD 为主（denoise_result.has_vad 时取其概率）。
+      detection.is_speech =
+          denoise_result.has_vad && (denoise_result.vad_probability > 0.5f);
+      // 同时调 Detector 做监测（SF/SNR 用于交叉验证），但 VAD 不覆盖。
+      NoiseDetectionResult det_monitoring =
+          ctx.detector->process_frame(frames, frame_size);
+      detection.spectral_flatness = det_monitoring.spectral_flatness;
+      detection.estimated_snr_db = det_monitoring.estimated_snr_db;
+      detection.confidence = det_monitoring.confidence;
+      detection.is_noisy = det_monitoring.is_noisy;
+    } else {
+      detection = ctx.detector->process_frame(frames, frame_size);
     }
+
+    // ③ 分析源选择（arch §3.3.1）：
+    //   denoise_enabled=true  -> NoisePCM (out->noise = original - denoised)
+    //                            纯噪声分量，分类最准
+    //   denoise_enabled=false -> OriginalPCM (frames)
+    const float* analysis_pcm = frames;
+    size_t analysis_n = frame_size;
+    if (ctx.denoise_enabled && out != nullptr && out->noise != nullptr) {
+      analysis_pcm = out->noise;
+      analysis_n = n;
+    }
+    NoiseAnalysisResult ar =
+        ctx.analyzer->analyze(analysis_pcm, analysis_n, detection);
+    *ctx.last_analysis =
+        ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
+
+    // ④ NoiseMetrics stub（Spec3 1.9 替换真聚合）。
+    ctx.metrics->collect(ar, detection, denoise_result);
+    break;
   }
 }
 
@@ -70,8 +159,8 @@ void NoiseManager::on_period_end() {
   if (pinned_table_ != nullptr) {
     for (auto& [id, ctx] : *pinned_table_) {
       (void)id;
-      if (ctx.stub)
-        ctx.stub->on_period_end();
+      if (ctx.denoise)
+        ctx.denoise->on_period_end();
       if (ctx.metrics)
         ctx.metrics->on_period_end();
     }
@@ -85,10 +174,9 @@ void NoiseManager::on_ptp_unlocked() {
   // 置位后由 housekeeper 延迟 reset（arch §3.7 L862）。
   ptp_locked_.store(false);
   reset_pending_.store(true);
-  // Task 1 简化：stub 无插件可 reset，仅延迟清标志。
-  // Task 7 替换为 plugin->reset() + PcmCaptureService join（Spec3 path A）。
-  // #5: Task 1 最小实现：重复 on_ptp_unlocked() 会阻塞 ≤200ms（旧 future 析构
-  // 等待）。Task 7 改为独立 housekeeper 线程。
+  // Task 7 简化：仍用延迟清标志（真实 plugin->reset() + PcmCaptureService
+  // join 在 Spec3 path A 实装）。#5: 重复 on_ptp_unlocked() 会阻塞 <=200ms
+  // （旧 future 析构等待）。Task 7 改为独立 housekeeper 线程（Spec3）。
   reset_future_ = std::async(std::launch::async, [this]() {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     reset_pending_.store(false);
@@ -105,9 +193,26 @@ size_t NoiseManager::stub_call_count_for_test(uint8_t sensor_id) const {
   if (tbl == nullptr)
     return 0;
   auto it = tbl->find(sensor_id);
-  if (it == tbl->end() || it->second.stub == nullptr)
+  if (it == tbl->end())
     return 0;
-  return it->second.stub->call_count;
+  // Task 7: 返回 on_frame 调用次数（shared_ptr<atomic<size_t>>，跨表共享）。
+  // 保留 Task 1 方法名以兼容既有测试。
+  const auto& fc = it->second.frame_count;
+  return fc ? fc->load(std::memory_order_relaxed) : 0;
+}
+
+NoiseAnalysisResult NoiseManager::get_analysis_result_for_test(
+    uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return NoiseAnalysisResult{};
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end())
+    return NoiseAnalysisResult{};
+  // shared_ptr<NoiseAnalysisResult>：on_frame 写 -> test 读（同表或 COW
+  // 副本）。
+  const auto& la = it->second.last_analysis;
+  return la ? *la : NoiseAnalysisResult{};
 }
 
 }  // namespace noise

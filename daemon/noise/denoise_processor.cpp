@@ -102,6 +102,18 @@ const DenoiseOutput* DenoiseProcessor::get_output() const {
   return &front_view_;
 }
 
+const DenoiseOutput* DenoiseProcessor::get_current_output() const {
+  // 当前 period 数据视图（back_，process() 刚写入）。
+  // 用于 ①②③ 链路在 on_frame 内的 in-period 读取：NoiseManager ① process 后
+  // 立即 ③ analyze 需读 current period 的 noise/denoised 分量。
+  // 与 get_output()（previous period, Streamer/SSE cross-thread）互斥分工。
+  back_view_.original = back_->original.get();
+  back_view_.denoised = back_->denoised.get();
+  back_view_.noise = back_->noise.get();
+  back_view_.frame_count = back_->frame_count;
+  return &back_view_;
+}
+
 void DenoiseProcessor::on_period_end() {
   // front/back swap（release 序）：本 period 写入的 back 变为 front 供下游读。
   // 用 std::swap（非原子）即可：swap（on_period_end）与 front 读（get_output，
@@ -118,10 +130,21 @@ void DenoiseProcessor::on_period_end() {
 void DenoiseProcessor::drain_retire() {
   // housekeeper（控制线程定期驱动）：释放穿越 ≥2 静止点的旧 slot。
   // 旧插件析构（ONNX session teardown / rnnoise_destroy，毫秒级）在此线程完成。
-  // reclaim_older_than 回收条件：retire_epoch + 1 < current_epoch
-  // 传 epoch()-1 意味着回收条件为 retire_epoch + 1 < epoch - 1，
-  // 即 retire_epoch < epoch - 2，给 3-epoch grace（保守，正确）。
-  retire_list_.reclaim_older_than(rcu_ptr_.epoch() - 1);
+  //
+  // RetireQueue::reclaim_older_than(current_epoch) 回收条件：
+  //   retire_epoch + 1 < current_epoch  <=>  current_epoch >= retire_epoch + 2
+  // 即 retire at epoch E 的 slot 在 epoch >= E+2 时回收（2-epoch grace）。
+  //
+  // Task 7 carry-forward 修复（Task 3 Important bug）：
+  // 原实现传 epoch() - 1，当 epoch()==0 时下溢为 UINT64_MAX，导致所有条目
+  // （含刚入队、retire_epoch==0 的）被立即回收。若 switch_plugin 后立即调
+  // drain_retire（如 Task 7 add_sensor/switch_plugin 所为），RT 线程可能仍
+  // 持有旧 pinned_ 裸指针 -> use-after-free。
+  // 修复：传 epoch()，给 2-epoch grace（与 Task 1 NoiseManager
+  // reclaim_older_than(epoch()) 一致）。slot retired at E 被 RT pin 直到
+  // on_period_end at E+1（advance_epoch 推进到 E+1 -> E+2），在 epoch >= E+2
+  // 回收安全（RT 已穿越 2 个静止点，旧裸指针不再被持有）。
+  retire_list_.reclaim_older_than(rcu_ptr_.epoch());
 }
 
 std::vector<std::string> DenoiseProcessor::list_plugins() const {

@@ -506,3 +506,48 @@ BOOST_AUTO_TEST_CASE(list_templates) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Spec2 Task 7: ①②③ 链路集成 - NoiseManager 接入真实
+// DenoiseProcessor/NoiseDetector/NoiseAnalyzer。Phase 1 单线程串行执行
+// (arch §6.2):on_frame 内 ①denoise->process -> ②detector->process_frame
+// (RNNoise VAD 主,denoise_enabled=true 时) -> ③analyzer->analyze(NoisePCM,
+// 纯噪声分量分类) -> ④metrics_stub->collect(no-op)。
+// 分析源选择(arch §3.3.1):denoise_enabled=true -> NoisePCM(original-denoised,
+// 纯噪声,分类最准); false -> OriginalPCM + Detector VAD 过滤语音段。
+BOOST_AUTO_TEST_SUITE(noise_pipeline_integration_tests)
+
+// ①②③ 链路:合成白噪 -> 降噪(RNNoise) -> 噪声 PCM 分量 -> 分类=White。
+// 断言:经过 20 帧收敛后,NoiseAnalyzer 主类型 = White(频谱平坦,SF>0.7)。
+// 这是 Spec2 端到端集成门控:Task 1-6 各组件通过此测试验证协同正确。
+BOOST_AUTO_TEST_CASE(pipeline_white_noise_classification) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  // #2: ptp_locked_ 默认 false(arch §3.7 安全默认),测试显式置 true
+  // 模拟 PTP 锁定。未置位时 on_frame 跳过所有 ①②③ 处理。
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+  // 切到 rnnoise 插件(默认构造装 PassthroughPlugin,需显式切换)。
+  BOOST_CHECK(mgr.switch_plugin(0, "rnnoise"));
+
+  // 合成强白噪(seed=9,与 rnnoise_adapter_tests 不同的 seed 以避免重复序列)
+  float noisy[synth::kFrameSize];
+  synth::white_noise(noisy, synth::kFrameSize, 9);
+
+  // 喂 20 帧让 RNNoise 收敛 + NoiseAnalyzer 窗口积累。
+  // 单 period 内 20 帧(Phase 1 单线程,arch §6.2)。
+  mgr.on_period_begin();
+  for (int f = 0; f < 20; ++f)
+    mgr.on_frame(0, noisy, synth::kFrameSize);
+  mgr.on_period_end();
+
+  // 测试钩子:获取 sensor 0 最近一次 ③ 分析结果。
+  auto result = mgr.get_analysis_result_for_test(0);
+  // 白噪 SF 趋近 1.0 -> classify_rule_based 触发 White 候选。
+  // denoise_enabled=true -> 用 NoisePCM(original-denoised)做分析,纯噪声分量,
+  // RNNoise 不会将白噪误判为语音(VAD 概率低 -> is_speech=false)。
+  BOOST_CHECK(result.primary_type == noise::NoiseType::White);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

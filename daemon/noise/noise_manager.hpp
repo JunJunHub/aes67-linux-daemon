@@ -1,7 +1,8 @@
 // daemon/noise/noise_manager.hpp
 // 架构依据：docs/noise/architecture-design.md §3.7。
 // Spec2 1.4b：NoiseManager 骨架 - RcuPtr sensor_table + 帧路由 + PTP-unlock
-// 联动。 Task 7 替换 stub 为真实 DenoiseProcessor/NoiseDetector/NoiseAnalyzer。
+// 联动。 Task 7 替换 stub 为真实 DenoiseProcessor/NoiseDetector/NoiseAnalyzer
+// （①②③④ 链路接入，arch §3.7 L817 on_frame + §3.3.1 分析源选择）。
 #ifndef NOISE_NOISE_MANAGER_HPP_
 #define NOISE_NOISE_MANAGER_HPP_
 
@@ -12,10 +13,12 @@
 #include <mutex>
 #include <string>
 
+#include "denoise_processor.hpp"
+#include "noise_analyzer.hpp"
 #include "noise_audio_bridge.hpp"
+#include "noise_detector.hpp"
 #include "noise_metrics_stub.hpp"
 #include "rcu_ptr.hpp"
-#include "stub_processor.hpp"
 
 namespace noise {
 
@@ -28,12 +31,32 @@ struct NoiseSensorConfig {
   float sensitivity{1.0f};
 };
 
-// per-sensor 处理上下文（1.4b stub 版本）。
-// Task 7 替换为完整版（detector/analyzer/denoise/metrics）。
+// per-sensor 处理上下文（arch §3.7 L842-848）。
+// Task 7 完整版：聚合真实 detector/analyzer/denoise/metrics。
+// ④NoiseMetrics 仍为 stub（Spec3 1.9 实装真聚合）。
 struct SensorContext {
   uint8_t sink_id{0};
-  std::shared_ptr<StubProcessor> stub;
-  std::shared_ptr<NoiseMetricsStub> metrics;
+  std::shared_ptr<NoiseDetector> detector;
+  std::shared_ptr<NoiseAnalyzer> analyzer;
+  std::shared_ptr<DenoiseProcessor> denoise;
+  std::shared_ptr<NoiseMetricsStub> metrics;  // ④ stays stub (Spec3 replaces)
+  // last_analysis / frame_count 用 shared_ptr 包裹：
+  // SensorTable 经 RcuPtr<const SensorTable> publish，add_sensor 时 COW 复制
+  // 旧表 -> 加新 sensor -> publish。若 last_analysis/frame_count 是 direct
+  // 成员，COW 浅拷贝后旧表/新表各持独立副本，on_frame 在 pinned 旧表上递增
+  // 不会反映到新表（stub_call_count_for_test 读新表 -> 看不到增量）。
+  // shared_ptr 使旧表/新表共享同一计数器/结果对象，与 detector/analyzer 等
+  // shared_ptr 成员语义一致（arch §3.7 L842-848 论证）。
+  // mutable: const SensorContext& 上可改（RcuPtr<const SensorTable> 约束）。
+  mutable std::shared_ptr<NoiseAnalysisResult>
+      last_analysis;  // for get_analysis_result_for_test
+  // 分析源选择由 cfg.denoise_enabled 决定（arch §3.3.1）。
+  bool denoise_enabled{false};
+  // #3 兼容：用于 stub_call_count_for_test（保留 Task 1 测试钩子名称，
+  // Task 7 真实处理器无 StubProcessor.call_count，改用 on_frame 调用计数）。
+  // atomic<size_t>: on_frame 写 (capture 线程) + stub_call_count_for_test 读
+  // (控制线程) 跨线程，atomic 保证可见性且无数据竞争。
+  mutable std::shared_ptr<std::atomic<size_t>> frame_count;
 };
 
 // 不可变 sensor 表：控制线程建新表原子换，RT 线程周期顶部 load 快照。
@@ -49,23 +72,37 @@ class NoiseManager {
                   uint8_t sink_id,
                   const NoiseSensorConfig& cfg);
 
+  // 降噪配置路由到对应 sensor 的 processor（控制线程调用，arch §3.7 L810）。
+  // Task 7 实现：lookup sensor -> denoise->switch_plugin(name) + drain_retire
+  // （回收 retired PluginSlot，避免泄漏；drain_retire 控制线程专用）。
+  bool switch_plugin(uint8_t sensor_id, const std::string& name);
+
   // 帧回调入口（Bridge 的 capture 线程调用，按 sink_id 路由到对应 sensor）
   // frames 为单通道连续帧（Bridge 已按 channel_map 解复用，channels 恒为 1）。
+  // Task 7 ①②③④ 链路（Phase 1 单线程，arch §6.2）：
+  //   ① denoise->process(frames, ..., &result) -> 写
+  //   back_（original/denoised/noise） ② detector->process_frame(...) ->
+  //   监测角色（denoise_enabled 时 VAD 主源
+  //      为 RNNoise；否则 Detector VAD 为唯一源）
+  //   ③ analyzer->analyze(NoisePCM 或 OriginalPCM, detection) -> 分类
+  //      分析源选择（arch §3.3.1）：
+  //        denoise_enabled=true  -> out->noise (NoisePCM = original-denoised)
+  //        denoise_enabled=false -> frames (OriginalPCM)
+  //   ④ metrics->collect(ar, detection, denoise_result)  (stub no-op)
   void on_frame(uint8_t sink_id, const float* frames, size_t frame_size);
 
   // ── period 生命周期钩子（capture 线程在 ALSA period 边界调用，BL2）──
   // on_period_begin: period 顶部 load sensor_table_ RcuPtr 快照 ->
-  // pinned_table_，
-  //   并对所有 sensor 的 stub/metrics 调 on_period_begin()。
+  // pinned_table_， 并对所有 sensor 的 denoise/metrics 调 on_period_begin()。
   //   整 period 内 on_frame 复用 pinned_table_，不每帧原子操作。
   void on_period_begin();
-  // on_period_end: period 结尾，对每个 sensor 的 stub/metrics 调
-  // on_period_end()，
+  // on_period_end: period 结尾，对每个 sensor 的 denoise/metrics 调
+  // on_period_end()（denoise swap front/back + advance_epoch），
   //   再 pinned_table_ = nullptr + sensor_table_.advance_epoch()。
   void on_period_end();
 
   // PTP 失锁联动：置 ptp_locked_=false + reset_pending_=true，
-  // housekeeper 延迟 200ms 后清 reset_pending_（stub 无插件可 reset）。
+  // housekeeper 延迟 200ms 后清 reset_pending_。
   // Task 7 替换为真实 plugin->reset() + PcmCaptureService join（Spec3）。
   void on_ptp_unlocked();
 
@@ -78,8 +115,13 @@ class NoiseManager {
   // #4: 观察 reset_pending_ 状态（on_ptp_unlocked 置位，housekeeper 200ms
   // 后清）。
   bool is_reset_pending_for_test() const { return reset_pending_.load(); }
-  // #3: 读取指定 sensor 的 stub process() 调用次数。Task 7 真实处理器无此钩子。
+  // #3: 读取指定 sensor 的 on_frame 调用次数。
+  // Task 7 真实处理器无 StubProcessor.call_count，改用
+  // SensorContext.frame_count （on_frame 内递增）。保留 Task 1
+  // 测试钩子名称以兼容既有测试。
   size_t stub_call_count_for_test(uint8_t sensor_id) const;
+  // Task 7 测试钩子：返回 sensor 最近一次 ③ 分析结果。未找到返回默认。
+  NoiseAnalysisResult get_analysis_result_for_test(uint8_t sensor_id) const;
 
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1

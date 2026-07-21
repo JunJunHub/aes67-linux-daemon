@@ -65,7 +65,17 @@ class DenoiseProcessor {
 
   // Streamer / SSE 读 front 缓冲（架构 §4.4 数据通路）。
   // 返回的 DenoiseOutput 在下次 on_period_end() swap 前有效。
+  // 注意：返回的是 PREVIOUS period 的数据（on_period_end 已 swap），
+  // 供 Streamer/SSE 等 cross-thread 读者读取完整 period。
   const DenoiseOutput* get_output() const;
+
+  // 当前 period 的数据视图（back_，刚被 process() 写入）。
+  // 用于 ①②③ 链路在 on_frame 内的 in-period 读取（NoiseManager 在同一
+  // on_frame 调用中 ① process 后立即 ③ analyze 需读 current period 数据）。
+  // 与 get_output() 区别：
+  //   get_output()         = previous period（Streamer/SSE cross-thread）
+  //   get_current_output() = current period（capture thread, in-period ①②③）
+  const DenoiseOutput* get_current_output() const;
 
   // period 结尾：swap front/back + pinned_=nullptr + advance_epoch。
   void on_period_end();
@@ -116,6 +126,8 @@ class DenoiseProcessor {
   std::unique_ptr<DenoiseBuffer> back_;
   mutable DenoiseOutput
       front_view_;  // get_output() 返回的只读视图（指向 front_ 缓冲）
+  mutable DenoiseOutput
+      back_view_;  // get_current_output() 视图（指向 back_，当前 period）
   // Task 3 简化：max_frame_ = 480（= synth::kFrameSize）。
   // PassthroughPlugin latency=0，out 容量 >= n_in = 480 足够。
   // Task 4 RNNoise（latency=480）可能需要重评估 max_frame_（非 Task 3 范围）。

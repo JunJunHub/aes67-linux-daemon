@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 
 namespace noise {
 
@@ -43,6 +44,9 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
                            const NoiseAnalysisResult& analysis,
                            float input_rms,
                            float denoised_rms) {
+  // denoise（① DenoiseResult）保留供未来 VAD-probability 指标使用
+  // （review Minor #3：参数签名按 brief 要求，此处标记 reserved）。
+  (void)denoise;
   // ② 检测结果
   latest_.is_noisy = detection.is_noisy;
   latest_.noise_confidence = detection.confidence;
@@ -89,8 +93,10 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   latest_.timestamp_ms = frame_counter_;
 
   // 60s history ring：每 kHistorySampleIntervalFrames 帧采样一次。
+  // review Minor #5：guard modulo-by-zero（测试 hook 可能传 0）。
   ++frame_counter_;
-  if (frame_counter_ % history_sample_interval_ == 0) {
+  if (history_sample_interval_ > 0 &&
+      frame_counter_ % history_sample_interval_ == 0) {
     history_.push_back(latest_);
     if (history_.size() > kMaxHistorySize)
       history_.pop_front();

@@ -576,15 +576,16 @@ BOOST_AUTO_TEST_SUITE(noise_metrics_tests)
 // ④ 聚合 ①②③ 结果：denoise/detection/analysis 聚合到 snapshot。
 // 断言：noise_type/noise_type_confidence 来自 ③，is_noisy/estimated_snr_db
 // 来自 ②，noise_reduction_db = 20log10(input_rms/denoised_rms)。
+// 所有 struct 用 {} 值初始化，避免读取未初始化字段 UB（review Important #1）。
 BOOST_AUTO_TEST_CASE(metrics_aggregates_123_results) {
   noise::NoiseMetrics m;
-  noise::DenoiseResult dr;
+  noise::DenoiseResult dr{};
   dr.has_vad = true;
   dr.vad_probability = 0.3f;
-  noise::NoiseDetectionResult det;
+  noise::NoiseDetectionResult det{};
   det.is_noisy = true;
   det.estimated_snr_db = 15.0f;
-  noise::NoiseAnalysisResult ar;
+  noise::NoiseAnalysisResult ar{};
   ar.primary_type = noise::NoiseType::White;
   ar.primary_confidence = 0.8f;
   ar.noise_level_dbfs = -35.0f;
@@ -602,19 +603,21 @@ BOOST_AUTO_TEST_CASE(metrics_aggregates_123_results) {
 }
 
 // 告警：noise_level_dbfs=-20dBFS > -30dBFS 阈值 -> is_alerting=true。
+// ar{} 值初始化：hum_strength_db=0（默认），不会触发 hum-alert 路径，
+// 确保 is_alerting 经由 noise_level_dbfs 路径触发（review Important #1）。
 BOOST_AUTO_TEST_CASE(metrics_alerts_when_loud) {
   noise::NoiseMetrics m;
-  noise::DenoiseResult dr;
-  noise::NoiseDetectionResult det;
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
   det.is_noisy = true;
-  noise::NoiseAnalysisResult ar;
+  noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -20.0f;  // loud
   m.collect(dr, det, ar, 0.5f, 0.5f);
   BOOST_CHECK(m.snapshot_for_test().is_alerting);  // -20 > -30 threshold
 }
 
 // NoiseManager 4 控制方法：remove_sensor / enable_sensor / set_dry_wet /
-// set_param。
+// set_param（review Minor #2：补 set_param 覆盖）。
 BOOST_AUTO_TEST_CASE(noise_manager_remove_enable_set_methods) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
@@ -624,21 +627,51 @@ BOOST_AUTO_TEST_CASE(noise_manager_remove_enable_set_methods) {
   mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
   BOOST_CHECK(mgr.enable_sensor(0, false));
   BOOST_CHECK(mgr.set_dry_wet(0, 0.5f));
+  // set_param 路由覆盖（review Minor #2）：PassthroughPlugin 无参数支持，
+  // set_param 恒返回 false。断言 ! 验证路由到 plugin（sensor 存在 ->
+  // lookup 成功 -> plugin->set_param 返回 false）。
+  BOOST_CHECK(!mgr.set_param(0, "key", "value"));
 }
 
 // 60s history ring：每 N 帧采样一次，capped at 60 entries。
 BOOST_AUTO_TEST_CASE(metrics_history_populates_and_caps) {
   noise::NoiseMetrics m;
   m.set_history_sample_interval_for_test(1);  // 每 call 采样一次（测试加速）
-  noise::DenoiseResult dr;
-  noise::NoiseDetectionResult det;
-  noise::NoiseAnalysisResult ar;
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -40.0f;
   for (int i = 0; i < 70; ++i) {  // 70 calls -> 70 entries, capped at 60
     m.collect(dr, det, ar, 0.1f, 0.05f);
   }
   auto hist = m.get_history_for_test();
   BOOST_CHECK_EQUAL(hist.size(), 60u);
+}
+
+// Hum-alert 路径独立测试（review Minor #6）：
+// noise_level_dbfs 低于阈值但 hum_strength_db 高于阈值 -> 经 hum 路径告警。
+BOOST_AUTO_TEST_CASE(metrics_alerts_via_hum_path) {
+  noise::NoiseMetrics m;
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS 阈值（不经 noise_level 路径）
+  ar.hum_strength_db = -20.0f;  // 高于 -40dB hum 阈值 -> 经 hum 路径告警
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+}
+
+// Hum-alert 阴性对照（review Minor #6）：
+// noise_level_dbfs + hum_strength_db 均低于阈值 -> 不告警。
+BOOST_AUTO_TEST_CASE(metrics_no_alert_when_both_below_threshold) {
+  noise::NoiseMetrics m;
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS
+  ar.hum_strength_db = -70.0f;   // 低于 -40dB hum 阈值
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

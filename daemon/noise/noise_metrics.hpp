@@ -21,7 +21,6 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <deque>
 
 #include "denoise_plugin.hpp"  // DenoiseResult

@@ -97,50 +97,10 @@ std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
 
 // ── Spec3 Task 4 持久化实现（arch §7.5）─────────────────────────────────
 // JSON 输出 = 手工拼接（与 daemon/json.cpp + noise_http.cpp 同一模式）：
-// 数字/bool 不加引号，字符串加引号 + escape_json。
+// 数字/bool 不加引号，字符串加引号 + escape_json（共享自 noise_status.hpp，
+// review Minor #5 去重）。
 // 不用 boost::property_tree::write_json（会将所有值引号化，违反约定）。
 // 输入用 boost::property_tree::ptree + read_json（daemon 既有模式）。
-namespace {
-
-// JSON 字符串转义（daemon/json.cpp L42-78 复制，避免跨模块依赖）。
-std::string escape_json(const std::string& s) {
-  std::ostringstream ss;
-  for (auto c = s.cbegin(); c != s.cend(); c++) {
-    switch (*c) {
-      case '"':
-        ss << "\\\"";
-        break;
-      case '\\':
-        ss << "\\\\";
-        break;
-      case '\b':
-        ss << "\\b";
-        break;
-      case '\f':
-        ss << "\\f";
-        break;
-      case '\n':
-        ss << "\\n";
-        break;
-      case '\r':
-        ss << "\\r";
-        break;
-      case '\t':
-        ss << "\\t";
-        break;
-      default:
-        if ('\x00' <= *c && *c <= '\x1f') {
-          ss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-             << static_cast<int>(*c);
-        } else {
-          ss << *c;
-        }
-    }
-  }
-  return ss.str();
-}
-
-}  // namespace
 
 bool NoiseTemplateDB::save(const std::string& dir) const {
   if (dir.empty())

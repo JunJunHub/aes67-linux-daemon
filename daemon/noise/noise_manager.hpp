@@ -181,19 +181,32 @@ class NoiseManager {
       uint8_t sensor_id) const;
 
   // ── Spec3 Task 4 持久化（arch §7.6）──
-  // load_status(file, template_dir)：启动时加载传感器配置 + 模板库。
-  //   file 空字符串 -> 仅尝试 template_dir 加载。
-  //   template_dir 空字符串 -> 跳过模板加载。
-  //   返回 true 表示至少一项加载成功或文件不存在（非错误，首次启动）。
-  bool load_status(const std::string& noise_status_file,
-                   const std::string& template_dir);
+  // load_status(file)：启动时加载传感器配置。
+  //   file 空字符串 -> no-op 返回 false。
+  //   文件不存在 -> 返回 false（非错误，首次启动）。
+  //   JSON 解析失败 -> 返回 false 并 stderr 告警（不抛异常）。
+  //   成功 -> 逐条 add_sensor 重建 sensors 表，末尾一次性 save_status。
+  //   返回 true 表示传感器加载成功。
+  //
+  //   模板持久化是调用方的职责（review Important #1）：
+  //   NoiseManager 不持有 NoiseTemplateDB（T5 设计：db 作为独立参数传入
+  //   register_noise_template_routes）。T6 wiring 负责：
+  //     template_db->load(config.get_noise_template_dir());
+  //     noise_manager->load_status(config.get_noise_status_file());
+  bool load_status(const std::string& noise_status_file);
   // save_status()：序列化 sensors 表为 noise_status.json via write_atomic
   //   （arch §7.1 + §7.4）。status_file_ 空时 no-op 返回 false。
+  //   load_in_progress_ 置位时 no-op（review Minor #7：load 期间跳过
+  //   add_sensor 触发的中间态写入，末尾一次性持久化）。
   //   const: 仅读 sensor_table_ RCU 快照 + status_file_ 成员，不改状态。
   //   RT 安全：不持 ctrl_mutex_（RcuPtr::load 原子），不阻塞音频线程。
   bool save_status() const;
-  // save_status_on_exit()：daemon shutdown 序列调用，同 save_status。
-  bool save_status_on_exit() const;
+  // save_status_on_exit()：daemon shutdown 序列调用。
+  //   review Minor #2：持 ctrl_mutex_ 防止与并发 HTTP 控制操作竞态
+  //   （set_dry_wet 等可能改 ctx.cfg）。shutdown 无嵌套控制调用，无死锁。
+  //   非 const：需持 ctrl_mutex_（mutex 非 mutable，const 方法无法加锁）。
+  //   shutdown 序列在非 const 上下文调用，无需 const。
+  bool save_status_on_exit();
   // 测试钩子（spec §D）：设置持久化文件路径。生产环境由 Config 注入。
   void set_status_file_for_test(const std::string& file) {
     status_file_ = file;
@@ -222,6 +235,14 @@ class NoiseManager {
   // 控制线程写（set_status_file_for_test）与 save_status() 读之间无竞态
   // （前者仅在 init/test 调用，后者在控制线程调用）。
   mutable std::string status_file_;
+  // Spec3 Task4 review Minor #7：load 进行中标志。
+  // load_status 进入时置 true，退出时置 false。save_status() 检查此标志
+  // 并早返回（跳过 add_sensor 触发的 N 次中间态写入），load 结束后
+  // 一次性 save_status 持久化最终状态。避免 N×I/O + partial-state 写入。
+  // mutable: load_status() 非只读（改此标志），save_status() const 读此标志。
+  // atomic: load_status (控制线程写) 与 save_status (控制线程读，由
+  // add_sensor 内部调用) 跨函数但同线程，atomic 保证可见性。
+  mutable std::atomic<bool> load_in_progress_{false};
 };
 
 }  // namespace noise

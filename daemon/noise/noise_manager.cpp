@@ -414,56 +414,22 @@ std::vector<NoiseMetricsSnapshot> NoiseManager::get_history_snapshot(
 
 // ── Spec3 Task 4 持久化实现（arch §7.6）────────────────────────────────
 // JSON 输出 = 手工拼接（与 daemon/json.cpp + noise_http.cpp 同一模式）：
-// 数字/bool 不加引号，字符串加引号 + escape_json。
+// 数字/bool 不加引号，字符串加引号 + escape_json（共享自 noise_status.hpp，
+// review Minor #5 去重）。
 // 不用 boost::property_tree::write_json（会将所有值引号化，违反约定）。
 // 输入用 boost::property_tree::ptree + read_json（daemon 既有模式）。
-namespace {
-
-// JSON 字符串转义（daemon/json.cpp L42-78 复制，避免跨模块依赖）。
-std::string escape_json(const std::string& s) {
-  std::ostringstream ss;
-  for (auto c = s.cbegin(); c != s.cend(); c++) {
-    switch (*c) {
-      case '"':
-        ss << "\\\"";
-        break;
-      case '\\':
-        ss << "\\\\";
-        break;
-      case '\b':
-        ss << "\\b";
-        break;
-      case '\f':
-        ss << "\\f";
-        break;
-      case '\n':
-        ss << "\\n";
-        break;
-      case '\r':
-        ss << "\\r";
-        break;
-      case '\t':
-        ss << "\\t";
-        break;
-      default:
-        if ('\x00' <= *c && *c <= '\x1f') {
-          ss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-             << static_cast<int>(*c);
-        } else {
-          ss << *c;
-        }
-    }
-  }
-  return ss.str();
-}
-
-}  // namespace
 
 bool NoiseManager::save_status() const {
-  // Gate: status_file_ 空时 no-op（arch §7.3 注：空字符串禁用持久化）。
+  // Gate 1: status_file_ 空时 no-op（arch §7.3 注：空字符串禁用持久化）。
   // 既有 T2/T3 测试调用 add_sensor 等不设 status_file_，gate 使 save-on-change
   // 不可见，不污染 worktree 也不写文件。
   if (status_file_.empty())
+    return false;
+  // Gate 2: load_in_progress_ 置位时跳过（review Minor #7）。
+  // load_status 内每次 add_sensor 会触发 save_status，若不跳过会写 N 次
+  // 中间态（progressively-larger partial state）。load 结束后由
+  // load_status 末尾显式调一次 save_status 持久化最终状态。
+  if (load_in_progress_.load(std::memory_order_relaxed))
     return false;
   const SensorTable* tbl = sensor_table_.load();
   if (tbl == nullptr)
@@ -490,69 +456,71 @@ bool NoiseManager::save_status() const {
   return write_atomic(status_file_, ss.str());
 }
 
-bool NoiseManager::save_status_on_exit() const {
+bool NoiseManager::save_status_on_exit() {
+  // review Minor #2：持 ctrl_mutex_ 防止与并发 HTTP 控制操作（set_dry_wet 等）
+  // 竞态改 ctx.cfg。shutdown 序列无嵌套控制调用，无死锁。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
   return save_status();
 }
 
-bool NoiseManager::load_status(const std::string& noise_status_file,
-                               const std::string& template_dir) {
+bool NoiseManager::load_status(const std::string& noise_status_file) {
+  // review Important #1：模板持久化是调用方职责（T6 wiring
+  //   template_db->load(config.get_noise_template_dir())），本方法仅加载
+  //   sensors。
   // 设置 status_file_ 供后续 save-on-change 使用。
   if (!noise_status_file.empty())
     status_file_ = noise_status_file;
+  if (noise_status_file.empty())
+    return false;
+  // 文件不存在视为首次启动，非错误（返回 false 表示未加载任何传感器）。
+  if (!std::filesystem::exists(noise_status_file))
+    return false;
+  // review Minor #7：置位 load_in_progress_，跳过 add_sensor 内部 save_status
+  // 的 N 次中间态写入。load 结束后一次性 save_status 持久化最终状态。
+  load_in_progress_.store(true, std::memory_order_relaxed);
   bool sensors_ok = true;
-  if (!noise_status_file.empty()) {
-    // 读 noise_status.json -> 重建 sensors（arch §7.4 + §7.6）。
-    // 文件不存在视为首次启动，非错误。
-    if (std::filesystem::exists(noise_status_file)) {
-      try {
-        boost::property_tree::ptree pt;
-        std::ifstream in(noise_status_file, std::ios::binary);
-        if (!in.is_open()) {
-          std::cerr << "NoiseManager::load_status: cannot open "
-                    << noise_status_file << std::endl;
-          sensors_ok = false;
-        } else {
-          boost::property_tree::read_json(in, pt);
-          BOOST_FOREACH (const boost::property_tree::ptree::value_type& v,
-                         pt.get_child("sensors")) {
-            uint8_t sensor_id =
-                static_cast<uint8_t>(v.second.get<unsigned>("id"));
-            NoiseSensorConfig cfg;
-            cfg.denoise_enabled = v.second.get<bool>("denoise_enabled", false);
-            cfg.plugin_name =
-                v.second.get<std::string>("denoise_plugin", "passthrough");
-            cfg.dry_wet = v.second.get<float>("denoise_dry_wet", 1.0f);
-            cfg.sensitivity = v.second.get<float>("sensitivity", 1.0f);
-            uint8_t sink_id =
-                static_cast<uint8_t>(v.second.get<unsigned>("sink_id"));
-            add_sensor(sensor_id, sink_id, cfg);
-            // add_sensor 内已调 save_status（status_file_ 已设），但首次 load
-            // 时每次 add 都写盘略浪费。Phase 1 低频控制操作，可接受。
-            // 若 enabled=false，add_sensor 默认 enabled=true，需 enable_sensor
-            // 修正。此处用 add_sensor 后 enable_sensor 不触发额外 save
-            // （add_sensor 已 save 了默认 enabled=true 的状态）。
-            bool enabled = v.second.get<bool>("enabled", true);
-            if (!enabled)
-              enable_sensor(sensor_id, false);
-          }
-        }
-      } catch (const boost::property_tree::json_parser::json_parser_error& je) {
-        std::cerr << "NoiseManager::load_status: JSON parse error at line "
-                  << je.line() << ": " << je.message() << std::endl;
-        sensors_ok = false;
-      } catch (const std::exception& e) {
-        std::cerr << "NoiseManager::load_status: error: " << e.what()
-                  << std::endl;
-        sensors_ok = false;
+  try {
+    boost::property_tree::ptree pt;
+    std::ifstream in(noise_status_file, std::ios::binary);
+    if (!in.is_open()) {
+      std::cerr << "NoiseManager::load_status: cannot open "
+                << noise_status_file << std::endl;
+      sensors_ok = false;
+    } else {
+      boost::property_tree::read_json(in, pt);
+      BOOST_FOREACH (const boost::property_tree::ptree::value_type& v,
+                     pt.get_child("sensors")) {
+        uint8_t sensor_id = static_cast<uint8_t>(v.second.get<unsigned>("id"));
+        NoiseSensorConfig cfg;
+        cfg.denoise_enabled = v.second.get<bool>("denoise_enabled", false);
+        cfg.plugin_name =
+            v.second.get<std::string>("denoise_plugin", "passthrough");
+        cfg.dry_wet = v.second.get<float>("denoise_dry_wet", 1.0f);
+        cfg.sensitivity = v.second.get<float>("sensitivity", 1.0f);
+        uint8_t sink_id =
+            static_cast<uint8_t>(v.second.get<unsigned>("sink_id"));
+        add_sensor(sensor_id, sink_id, cfg);
+        // review Minor #6：add_sensor 默认 enabled=true，若 JSON 中
+        // enabled=false 需 enable_sensor 修正。enable_sensor 会触发
+        // save_status（但 load_in_progress_ 置位 -> 跳过），与 add_sensor
+        // 的 save_status 一样被 gate 拦截。load 结束后一次性持久化。
+        bool enabled = v.second.get<bool>("enabled", true);
+        if (!enabled)
+          enable_sensor(sensor_id, false);
       }
     }
+  } catch (const boost::property_tree::json_parser::json_parser_error& je) {
+    std::cerr << "NoiseManager::load_status: JSON parse error at line "
+              << je.line() << ": " << je.message() << std::endl;
+    sensors_ok = false;
+  } catch (const std::exception& e) {
+    std::cerr << "NoiseManager::load_status: error: " << e.what() << std::endl;
+    sensors_ok = false;
   }
-  // 委托模板加载（arch §7.6）。
-  if (!template_dir.empty()) {
-    // Phase 1: NoiseManager 不直接持有 NoiseTemplateDB（T5 会接 HTTP API）。
-    // load_status 仅验证目录可读，实际模板加载由 T5 wiring。
-    // 此处返回 true 表示非错误（sensors_ok 或模板加载 deferred）。
-  }
+  // 清除 load_in_progress_，然后一次性持久化最终状态（review Minor #7）。
+  load_in_progress_.store(false, std::memory_order_relaxed);
+  if (sensors_ok)
+    save_status();
   return sensors_ok;
 }
 

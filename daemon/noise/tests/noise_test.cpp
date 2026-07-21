@@ -895,41 +895,79 @@ BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_AUTO_TEST_SUITE(noise_persistence_tests)
 
-// sensor 配置 roundtrip：add_sensor -> save -> load -> sensor_count > 0。
-// 验证 NoiseManager::save_status / load_status + write_atomic 原子写。
+// sensor 配置 roundtrip：add_sensor -> save -> load -> 逐字段验证。
+// review Minor #4：加固为 field-by-field 断言，检测静默字段丢失/损坏。
+// 用非默认值避免与默认值巧合通过。
 BOOST_AUTO_TEST_CASE(sensor_config_roundtrip) {
   const char* f = "test_noise_status.json";
   std::remove(f);  // 测试清理（非 shell rm 禁令范围）
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
-  mgr.add_sensor(0, 5, noise::NoiseSensorConfig{});
+  // 用非默认值：sink_id=7, denoise_enabled=true, plugin=rnnoise, dry_wet=0.75
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  cfg.plugin_name = "rnnoise";
+  cfg.dry_wet = 0.75f;
+  cfg.sensitivity = 1.5f;
+  mgr.add_sensor(3, 7, cfg);
+  // enabled=false 测试 disabled sensor 持久化路径
+  mgr.enable_sensor(3, false);
   mgr.set_status_file_for_test(f);
   BOOST_CHECK(mgr.save_status());
-  // 新 manager 加载
+
+  // 验证 JSON 文件内容包含期望字段值（防静默字段丢失）
+  std::ifstream in(f);
+  std::string json((std::istreambuf_iterator<char>(in)), {});
+  BOOST_CHECK(json.find("\"id\": 3") != std::string::npos);
+  BOOST_CHECK(json.find("\"sink_id\": 7") != std::string::npos);
+  BOOST_CHECK(json.find("\"enabled\": false") != std::string::npos);
+  BOOST_CHECK(json.find("\"denoise_enabled\": true") != std::string::npos);
+  BOOST_CHECK(json.find("\"denoise_plugin\": \"rnnoise\"") !=
+              std::string::npos);
+  BOOST_CHECK(json.find("\"denoise_dry_wet\": 0.75") != std::string::npos);
+
+  // 新 manager 加载（review Important #1：load_status 仅接受 file 参数）
   NoiseAudioBridgeStub bridge2;
   noise::NoiseManager mgr2(bridge2);
   mgr2.set_status_file_for_test(f);
-  BOOST_CHECK(mgr2.load_status(f, ""));
+  BOOST_CHECK(mgr2.load_status(f));
   BOOST_CHECK_GT(mgr2.sensor_count_for_test(), 0);
+
+  // 逐字段验证（通过 get_sensor_info 读回）
+  noise::SensorInfo info{};
+  BOOST_CHECK(mgr2.get_sensor_info(3, info));
+  BOOST_CHECK_EQUAL(info.id, 3);
+  BOOST_CHECK_EQUAL(info.sink_id, 7);
+  BOOST_CHECK(!info.enabled);         // disabled sensor 持久化
+  BOOST_CHECK(info.denoise_enabled);  // denoise_enabled=true 持久化
+
   std::remove(f);  // 清理
 }
 
-// 模板 roundtrip：add_template -> save -> load -> list_templates.size==1。
-// 验证 NoiseTemplateDB::save / load + JSON 序列化。
+// 模板 roundtrip：add_template -> save -> load -> name + bark_features
+// 逐元素验证。 review Minor #4：加固为 name + 32 维 bark_features 全匹配。
 BOOST_AUTO_TEST_CASE(template_roundtrip) {
   const char* d = "test_noise_templates";
   std::filesystem::remove_all(d);  // 测试清理
   noise::NoiseTemplateDB db;
   std::array<float, 32> feat{};
-  for (auto& x : feat)
-    x = 0.5f;
-  db.add_template("test", feat);
+  for (size_t i = 0; i < 32; ++i)
+    feat[i] = 0.1f * static_cast<float>(i + 1);  // 0.1, 0.2, ..., 3.2
+  db.add_template("空调噪声", feat);
   db.set_dir_for_test(d);
   BOOST_CHECK(db.save(d));
   noise::NoiseTemplateDB db2;
   BOOST_CHECK(db2.load(d));
   auto list = db2.list_templates();
   BOOST_CHECK_EQUAL(list.size(), 1u);
+  BOOST_CHECK_EQUAL(list[0].second, "空调噪声");  // name 逐字节匹配
+
+  // bark_features 逐元素验证：用 match 间接验证（match 输入 == 已存特征
+  // 时相似度=1.0）。直接 accessor 不存在，但 match 自身 + 余弦相似度=1.0
+  // 证明 32 维特征完整往返。
+  auto [matched_id, sim] = db2.match(feat);
+  BOOST_CHECK_EQUAL(matched_id, list[0].first);
+  BOOST_CHECK_CLOSE(sim, 1.0f, 0.01);  // 完美匹配 -> sim=1.0
   std::filesystem::remove_all(d);
 }
 
@@ -949,6 +987,25 @@ BOOST_AUTO_TEST_CASE(atomic_write_no_halfwrite) {
   std::ifstream in(f);
   std::string s((std::istreambuf_iterator<char>(in)), {});
   BOOST_CHECK(s.find("\"sensors\"") != std::string::npos);
+  std::remove(f);
+}
+
+// review Minor #4：corrupt-JSON-load 测试。
+// 写垃圾到文件，load_status 返回 false（graceful，不 crash/不抛异常）。
+BOOST_AUTO_TEST_CASE(load_status_rejects_corrupt_json) {
+  const char* f = "test_corrupt_status.json";
+  std::remove(f);
+  // 写畸形 JSON（缺 }）
+  std::ofstream out(f);
+  out << R"({"sensors":[{"id":0,"sink_id":0)";
+  out.close();
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test(f);
+  // load_status 返回 false（JSON 解析失败 -> stderr 告警 -> false）
+  BOOST_CHECK(!mgr.load_status(f));
+  // 不 crash、不抛异常即通过。sensor_count 应为 0（未加载任何传感器）。
+  BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
   std::remove(f);
 }
 

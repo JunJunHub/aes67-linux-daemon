@@ -566,3 +566,79 @@ BOOST_AUTO_TEST_CASE(pipeline_white_noise_classification) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Spec3 Task 2: ④NoiseMetrics 真聚合 - 聚合 ①②③ 链路结果到 per-sensor
+// NoiseMetricsSnapshot + 60s history ring + NoiseManager 4 控制方法。
+#include "noise_metrics.hpp"
+
+BOOST_AUTO_TEST_SUITE(noise_metrics_tests)
+
+// ④ 聚合 ①②③ 结果：denoise/detection/analysis 聚合到 snapshot。
+// 断言：noise_type/noise_type_confidence 来自 ③，is_noisy/estimated_snr_db
+// 来自 ②，noise_reduction_db = 20log10(input_rms/denoised_rms)。
+BOOST_AUTO_TEST_CASE(metrics_aggregates_123_results) {
+  noise::NoiseMetrics m;
+  noise::DenoiseResult dr;
+  dr.has_vad = true;
+  dr.vad_probability = 0.3f;
+  noise::NoiseDetectionResult det;
+  det.is_noisy = true;
+  det.estimated_snr_db = 15.0f;
+  noise::NoiseAnalysisResult ar;
+  ar.primary_type = noise::NoiseType::White;
+  ar.primary_confidence = 0.8f;
+  ar.noise_level_dbfs = -35.0f;
+  ar.hum_strength_db = -70.0f;
+  ar.spectral_flatness = 0.85f;
+  ar.spectral_centroid_hz = 4000.0f;
+  m.collect(dr, det, ar, /*input_rms=*/0.1f, /*denoised_rms=*/0.01f);
+  auto snap = m.snapshot_for_test();
+  BOOST_CHECK(snap.noise_type == noise::NoiseType::White);
+  BOOST_CHECK_CLOSE(snap.noise_type_confidence, 0.8f, 0.01);
+  BOOST_CHECK(snap.is_noisy);
+  BOOST_CHECK_CLOSE(snap.estimated_snr_db, 15.0f, 0.01);
+  BOOST_CHECK_GT(snap.noise_reduction_db, 10.0f);  // 20log10(0.1/0.01)=20dB
+  BOOST_CHECK(!snap.is_alerting);  // -35dBFS < -30 threshold -> not alerting
+}
+
+// 告警：noise_level_dbfs=-20dBFS > -30dBFS 阈值 -> is_alerting=true。
+BOOST_AUTO_TEST_CASE(metrics_alerts_when_loud) {
+  noise::NoiseMetrics m;
+  noise::DenoiseResult dr;
+  noise::NoiseDetectionResult det;
+  det.is_noisy = true;
+  noise::NoiseAnalysisResult ar;
+  ar.noise_level_dbfs = -20.0f;  // loud
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);  // -20 > -30 threshold
+}
+
+// NoiseManager 4 控制方法：remove_sensor / enable_sensor / set_dry_wet /
+// set_param。
+BOOST_AUTO_TEST_CASE(noise_manager_remove_enable_set_methods) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  BOOST_CHECK(mgr.add_sensor(0, 0, noise::NoiseSensorConfig{}));
+  BOOST_CHECK(mgr.remove_sensor(0));
+  BOOST_CHECK(!mgr.remove_sensor(0));  // 已删
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  BOOST_CHECK(mgr.enable_sensor(0, false));
+  BOOST_CHECK(mgr.set_dry_wet(0, 0.5f));
+}
+
+// 60s history ring：每 N 帧采样一次，capped at 60 entries。
+BOOST_AUTO_TEST_CASE(metrics_history_populates_and_caps) {
+  noise::NoiseMetrics m;
+  m.set_history_sample_interval_for_test(1);  // 每 call 采样一次（测试加速）
+  noise::DenoiseResult dr;
+  noise::NoiseDetectionResult det;
+  noise::NoiseAnalysisResult ar;
+  ar.noise_level_dbfs = -40.0f;
+  for (int i = 0; i < 70; ++i) {  // 70 calls -> 70 entries, capped at 60
+    m.collect(dr, det, ar, 0.1f, 0.05f);
+  }
+  auto hist = m.get_history_for_test();
+  BOOST_CHECK_EQUAL(hist.size(), 60u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

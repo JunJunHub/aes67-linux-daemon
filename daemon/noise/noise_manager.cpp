@@ -3,6 +3,7 @@
 #include "noise_manager.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <thread>
 #include <utility>
 
@@ -43,8 +44,10 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.detector->set_sensitivity(cfg.sensitivity);
   // ③ NoiseAnalyzer（L1 规则式 + L2 模板匹配）。
   ctx.analyzer = std::make_shared<NoiseAnalyzer>();
-  // ④ NoiseMetrics stub（Spec3 1.9 实装真聚合）。
-  ctx.metrics = std::make_shared<NoiseMetricsStub>();
+  // ④ NoiseMetrics（Spec3 Task 2 真聚合，替 Spec2 stub）。
+  // set_denoise_state 用 atomic 写，collect() RT 路径 atomic 读 -> 无竞争。
+  ctx.metrics = std::make_shared<NoiseMetrics>();
+  ctx.metrics->set_denoise_state(cfg.denoise_enabled, cfg.dry_wet);
   // 共享观测状态：shared_ptr 使 COW 表复制时旧表/新表共享同一计数器/结果，
   // on_frame 在 pinned 旧表上递增会反映到新表（stub_call_count_for_test 读
   // 新表）。与 detector/analyzer 等 shared_ptr 成员同语义。
@@ -72,6 +75,64 @@ bool NoiseManager::switch_plugin(uint8_t sensor_id, const std::string& name) {
   // rnnoise_destroy，毫秒级）在控制线程完成，不堆积在 retire_list_。
   it->second.denoise->drain_retire();
   return ok;
+}
+
+bool NoiseManager::remove_sensor(uint8_t sensor_id) {
+  // 控制线程：COW 复制当前表 -> erase sensor -> publish -> retire 旧表。
+  // 同 add_sensor 的 COW 模式（arch §3.7 L860 读路径无锁约束）。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
+  const SensorTable* current = sensor_table_.load();
+  if (current->find(sensor_id) == current->end())
+    return false;  // 不存在
+  auto new_table = std::make_shared<SensorTable>(*current);
+  new_table->erase(sensor_id);
+  auto old = sensor_table_.publish(std::move(new_table));
+  retire_queue_.retire(std::move(old), sensor_table_.epoch());
+  retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  return true;
+}
+
+bool NoiseManager::enable_sensor(uint8_t sensor_id, bool enabled) {
+  // 控制线程：COW 复制 -> set enabled -> publish -> retire 旧表。
+  // 同 add_sensor/remove_sensor 的 COW 模式（不直接改 pinned 表）。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
+  const SensorTable* current = sensor_table_.load();
+  auto it = current->find(sensor_id);
+  if (it == current->end())
+    return false;
+  auto new_table = std::make_shared<SensorTable>(*current);
+  (*new_table)[sensor_id].enabled = enabled;
+  auto old = sensor_table_.publish(std::move(new_table));
+  retire_queue_.retire(std::move(old), sensor_table_.epoch());
+  retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  return true;
+}
+
+bool NoiseManager::set_dry_wet(uint8_t sensor_id, float dry_wet) {
+  // 控制线程：lookup sensor -> denoise->set_dry_wet（plugin 原子 setter，
+  // 不 COW，同 switch_plugin 参数变更先例）+ metrics->set_denoise_state
+  // 更新快照 dry_wet（供 HTTP /sensor 响应）。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
+  const SensorTable* current = sensor_table_.load();
+  auto it = current->find(sensor_id);
+  if (it == current->end() || !it->second.denoise)
+    return false;
+  it->second.denoise->set_dry_wet(dry_wet);
+  if (it->second.metrics)
+    it->second.metrics->set_denoise_state(it->second.denoise_enabled, dry_wet);
+  return true;
+}
+
+bool NoiseManager::set_param(uint8_t sensor_id,
+                             const std::string& key,
+                             const std::string& value) {
+  // 控制线程：lookup sensor -> denoise->set_param（plugin 原子 setter）。
+  std::lock_guard<std::mutex> lock(ctrl_mutex_);
+  const SensorTable* current = sensor_table_.load();
+  auto it = current->find(sensor_id);
+  if (it == current->end() || !it->second.denoise)
+    return false;
+  return it->second.denoise->set_param(key, value);
 }
 
 void NoiseManager::on_period_begin() {
@@ -149,8 +210,22 @@ void NoiseManager::on_frame(uint8_t sink_id,
     *ctx.last_analysis =
         ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
 
-    // ④ NoiseMetrics stub（Spec3 1.9 替换真聚合）。
-    ctx.metrics->collect(ar, detection, denoise_result);
+    // ④ NoiseMetrics 真聚合（Spec3 Task 2，替 Spec2 stub no-op）。
+    // input_rms = RMS(frames)（原始 PCM），denoised_rms = RMS(out->denoised)
+    // （降噪 PCM）。out 可能为 nullptr（首帧或异常），此时 denoised_rms=0，
+    // collect() 内部 guard divide-by-zero（noise_reduction_db=0）。
+    float input_rms = 0.0f;
+    for (size_t i = 0; i < frame_size; ++i)
+      input_rms += frames[i] * frames[i];
+    input_rms = std::sqrt(input_rms / static_cast<float>(frame_size));
+    float denoised_rms = 0.0f;
+    if (out != nullptr && out->denoised != nullptr && n > 0) {
+      for (size_t i = 0; i < n; ++i)
+        denoised_rms += out->denoised[i] * out->denoised[i];
+      denoised_rms = std::sqrt(denoised_rms / static_cast<float>(n));
+    }
+    ctx.metrics->collect(denoise_result, detection, ar, input_rms,
+                         denoised_rms);
     break;
   }
 }
@@ -213,6 +288,28 @@ NoiseAnalysisResult NoiseManager::get_analysis_result_for_test(
   // 副本）。
   const auto& la = it->second.last_analysis;
   return la ? *la : NoiseAnalysisResult{};
+}
+
+NoiseMetricsSnapshot NoiseManager::get_metrics_for_test(
+    uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return NoiseMetricsSnapshot{};
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end() || !it->second.metrics)
+    return NoiseMetricsSnapshot{};
+  return it->second.metrics->snapshot_for_test();
+}
+
+std::deque<NoiseMetricsSnapshot> NoiseManager::get_history_for_test(
+    uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return {};
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end() || !it->second.metrics)
+    return {};
+  return it->second.metrics->get_history_for_test();
 }
 
 }  // namespace noise

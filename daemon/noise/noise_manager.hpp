@@ -17,7 +17,7 @@
 #include "noise_analyzer.hpp"
 #include "noise_audio_bridge.hpp"
 #include "noise_detector.hpp"
-#include "noise_metrics_stub.hpp"
+#include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
 
 namespace noise {
@@ -33,13 +33,13 @@ struct NoiseSensorConfig {
 
 // per-sensor 处理上下文（arch §3.7 L842-848）。
 // Task 7 完整版：聚合真实 detector/analyzer/denoise/metrics。
-// ④NoiseMetrics 仍为 stub（Spec3 1.9 实装真聚合）。
+// Spec3 Task 2：④NoiseMetrics 替换 Spec2 stub，真聚合 ①②③ 链路结果。
 struct SensorContext {
   uint8_t sink_id{0};
   std::shared_ptr<NoiseDetector> detector;
   std::shared_ptr<NoiseAnalyzer> analyzer;
   std::shared_ptr<DenoiseProcessor> denoise;
-  std::shared_ptr<NoiseMetricsStub> metrics;  // ④ stays stub (Spec3 replaces)
+  std::shared_ptr<NoiseMetrics> metrics;  // ④ Spec3 Task 2 真聚合
   // last_analysis / frame_count 用 shared_ptr 包裹：
   // SensorTable 经 RcuPtr<const SensorTable> publish，add_sensor 时 COW 复制
   // 旧表 -> 加新 sensor -> publish。若 last_analysis/frame_count 是 direct
@@ -52,6 +52,8 @@ struct SensorContext {
       last_analysis;  // for get_analysis_result_for_test
   // 分析源选择由 cfg.denoise_enabled 决定（arch §3.3.1）。
   bool denoise_enabled{false};
+  // Spec3 Task 2：sensor 启用/禁用（enable_sensor 切换，§5.4 "enabled" 字段）。
+  bool enabled{true};
   // #3 兼容：用于 stub_call_count_for_test（保留 Task 1 测试钩子名称，
   // Task 7 真实处理器无 StubProcessor.call_count，改用 on_frame 调用计数）。
   // atomic<size_t>: on_frame 写 (capture 线程) + stub_call_count_for_test 读
@@ -71,11 +73,23 @@ class NoiseManager {
   bool add_sensor(uint8_t sensor_id,
                   uint8_t sink_id,
                   const NoiseSensorConfig& cfg);
+  // Spec3 Task 2：传感器删除/启用（arch §3.7 L805-808）。
+  // COW 复制表 -> mutate -> publish -> retire 旧表（同 add_sensor 模式）。
+  bool remove_sensor(uint8_t sensor_id);
+  bool enable_sensor(uint8_t sensor_id, bool enabled);
 
-  // 降噪配置路由到对应 sensor 的 processor（控制线程调用，arch §3.7 L810）。
-  // Task 7 实现：lookup sensor -> denoise->switch_plugin(name) + drain_retire
-  // （回收 retired PluginSlot，避免泄漏；drain_retire 控制线程专用）。
+  // 降噪配置路由到对应 sensor 的 processor（控制线程调用，arch §3.7
+  // L810-812）。 Task 7 实现：lookup sensor -> denoise->switch_plugin(name) +
+  // drain_retire （回收 retired PluginSlot，避免泄漏；drain_retire
+  // 控制线程专用）。
   bool switch_plugin(uint8_t sensor_id, const std::string& name);
+  // Spec3 Task 2：dry_wet/param 路由到 plugin 原子 setter（不 COW，同
+  // switch_plugin 的参数变更先例 -- plugin 内部用 atomic 成员）。
+  // 同时更新 metrics 的 denoise 状态快照（set_denoise_state）。
+  bool set_dry_wet(uint8_t sensor_id, float dry_wet);
+  bool set_param(uint8_t sensor_id,
+                 const std::string& key,
+                 const std::string& value);
 
   // 帧回调入口（Bridge 的 capture 线程调用，按 sink_id 路由到对应 sensor）
   // frames 为单通道连续帧（Bridge 已按 channel_map 解复用，channels 恒为 1）。
@@ -88,7 +102,9 @@ class NoiseManager {
   //      分析源选择（arch §3.3.1）：
   //        denoise_enabled=true  -> out->noise (NoisePCM = original-denoised)
   //        denoise_enabled=false -> frames (OriginalPCM)
-  //   ④ metrics->collect(ar, detection, denoise_result)  (stub no-op)
+  //   ④ metrics->collect(denoise_result, detection, ar, input_rms,
+  //      denoised_rms) -- Spec3 Task 2 真聚合（替 Spec2 stub no-op）。
+  //      input_rms = RMS(frames)，denoised_rms = RMS(out->denoised)。
   void on_frame(uint8_t sink_id, const float* frames, size_t frame_size);
 
   // ── period 生命周期钩子（capture 线程在 ALSA period 边界调用，BL2）──
@@ -122,6 +138,11 @@ class NoiseManager {
   size_t stub_call_count_for_test(uint8_t sensor_id) const;
   // Task 7 测试钩子：返回 sensor 最近一次 ③ 分析结果。未找到返回默认。
   NoiseAnalysisResult get_analysis_result_for_test(uint8_t sensor_id) const;
+  // Spec3 Task 2 测试钩子：返回 sensor ④ metrics 最新快照/历史。
+  // 未找到 sensor 返回默认 snapshot / 空 history。
+  NoiseMetricsSnapshot get_metrics_for_test(uint8_t sensor_id) const;
+  std::deque<NoiseMetricsSnapshot> get_history_for_test(
+      uint8_t sensor_id) const;
 
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1

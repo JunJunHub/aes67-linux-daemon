@@ -73,10 +73,13 @@ cmd_build() {
   done
 
   # 确保子模块就绪(若被 cleanup.sh 误删,这里自动恢复,不报错)
+  # rnnoise 仅 WITH_NOISE=ON 时由 CMake 引用,但本脚本默认 with_noise=ON,
+  # 故与 cpp-httplib / ravenna-alsa-lkm 一起 init。
   if [ ! -f "$TOPDIR/3rdparty/cpp-httplib/httplib.h" ] || \
-     [ ! -f "$TOPDIR/3rdparty/ravenna-alsa-lkm/common/MergingRAVENNACommon.h" ]; then
+     [ ! -f "$TOPDIR/3rdparty/ravenna-alsa-lkm/common/MergingRAVENNACommon.h" ] || \
+     [ ! -f "$TOPDIR/3rdparty/rnnoise/src/denoise.c" ]; then
     log "submodules missing, initializing ..."
-    git -C "$TOPDIR" submodule update --init 3rdparty/cpp-httplib 3rdparty/ravenna-alsa-lkm
+    git -C "$TOPDIR" submodule update --init 3rdparty/cpp-httplib 3rdparty/ravenna-alsa-lkm 3rdparty/rnnoise
     git -C "$TOPDIR/3rdparty/ravenna-alsa-lkm" checkout aes67-daemon >/dev/null 2>&1 || true
   fi
 

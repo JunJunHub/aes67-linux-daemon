@@ -5,3 +5,6 @@
 	path = 3rdparty/ravenna-alsa-lkm
 	url = https://github.com/bondagit/ravenna-alsa-lkm.git
 	branch = aes67-daemon
+[submodule "3rdparty/rnnoise"]
+	path = 3rdparty/rnnoise
+	url = https://gitlab.xiph.org/xiph/rnnoise.git

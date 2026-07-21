@@ -21,45 +21,40 @@ target_include_directories(noise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # RNNoise 降噪插件（Spec2 1.6b）。
 # 整个 daemon/noise/CMakeLists.txt 由 daemon/CMakeLists.txt 的
 # add_subdirectory(noise) 在 if(WITH_NOISE) 内引入,故 WITH_NOISE=OFF
-# 时本文件不执行,FetchContent 不会被触发（--no-noise 零回归保证）。
+# 时本文件不执行,submodule 不会被触发（--no-noise 零回归保证）。
 #
 # RNNoise build-system 偏差（详见 task-4-report.md）：
 # - task brief 指定 pinned commit 70f1d25。该 commit 的 rnnoise_data.{c,h}
 #   不在 git 仓库--需从 media.xiph.org 下载 58MB model tarball。
-# - RNNoise 无 CMakeLists.txt（纯 autotools）,故 FetchContent_MakeAvailable
-#   会静默跳过 add_subdirectory,导致 target_link_libraries(noise PRIVATE rnnoise)
-#   误解析为系统 -lrnnoise。改为 FetchContent_Populate 仅下载源码,
-#   手动 add_library(rnnoise STATIC ...) 编译 .c 源码。
+# - RNNoise 无 CMakeLists.txt（纯 autotools）,故手动 add_library(rnnoise
+#   STATIC ...) 编译 .c 源码（绕过 autotools）。
 # - 首次配置时自动下载 model tarball（有 SHA256 校验）,缓存在 build 目录下
 #   避免重复下载。后续配置检测到 src/rnnoise_data.c 存在则跳过下载。
-include(FetchContent)
+# - Spec3 T1：源码来源由 FetchContent_Populate 改为 vendored submodule
+#   3rdparty/rnnoise（pinned 70f1d25）。CMake 3.30+ 已弃用
+#   FetchContent_Populate；submodule 方式更简单且可重复。
 option(NOISE_PLUGIN_RNNOISE "Build RNNoise denoise plugin" ON)
 if(NOISE_PLUGIN_RNNOISE)
   # RNNoise 是纯 C 库,而 daemon/CMakeLists.txt 的 project() 仅启用 CXX。
   # 在本子目录内 enable_language(C) 启用 C 编译器（不修改 daemon/CMakeLists.txt）。
   enable_language(C)
 
-  # GIT_TAG 用 pinned commit 而非 master：master 会漂移,可能破坏构建。
-  # 网络已预验证：gitlab.xiph.org HEAD = 70f1d256... (2026-07)。
-  # 若 gitlab 不可达,改用 github 镜像：https://github.com/xiph/rnnoise.git。
-  FetchContent_Declare(rnnoise
-    GIT_REPOSITORY https://gitlab.xiph.org/xiph/rnnoise.git
-    GIT_TAG 70f1d256acd4b34a572f999a05c87bf00b67730d)
-  FetchContent_GetProperties(rnnoise)
-  if(NOT rnnoise_POPULATED)
-    FetchContent_Populate(rnnoise)
-  endif()
+  # 源码目录：vendored submodule（3rdparty/rnnoise，pinned 70f1d25）。
+  # build.sh/buildfake.sh 的 `git submodule update --init --recursive` 负责 init。
+  # 若 gitlab.xiph.org 不可达,改用 github 镜像重新 add：
+  #   git submodule add https://github.com/xiph/rnnoise.git 3rdparty/rnnoise
+  set(RNNOISE_SRC_DIR ${CMAKE_SOURCE_DIR}/../3rdparty/rnnoise)
 
   # rnnoise_data.{c,h} 不在 git 仓库--由 download_model.sh 从
   # media.xiph.org 下载 model tarball 解压。CMake 首次配置时自动下载
   # （~58MB,有 SHA256 校验）。缓存在 build 目录避免重复下载。
   # 后续配置检测到文件存在则跳过。
-  file(STRINGS "${rnnoise_SOURCE_DIR}/model_version" RNNOISE_MODEL_HASH)
+  file(STRINGS "${RNNOISE_SRC_DIR}/model_version" RNNOISE_MODEL_HASH)
   set(RNNOISE_MODEL_URL
       "https://media.xiph.org/rnnoise/models/rnnoise_data-${RNNOISE_MODEL_HASH}.tar.gz")
   set(RNNOISE_MODEL_FILE
       "${CMAKE_BINARY_DIR}/rnnoise-model-cache/rnnoise_data-${RNNOISE_MODEL_HASH}.tar.gz")
-  if(NOT EXISTS "${rnnoise_SOURCE_DIR}/src/rnnoise_data.c")
+  if(NOT EXISTS "${RNNOISE_SRC_DIR}/src/rnnoise_data.c")
     if(EXISTS ${RNNOISE_MODEL_FILE})
       message(STATUS "Using cached RNNoise model tarball")
     else()
@@ -71,7 +66,7 @@ if(NOISE_PLUGIN_RNNOISE)
     endif()
     execute_process(
       COMMAND ${CMAKE_COMMAND} -E tar xf ${RNNOISE_MODEL_FILE}
-      WORKING_DIRECTORY ${rnnoise_SOURCE_DIR}
+      WORKING_DIRECTORY ${RNNOISE_SRC_DIR}
       RESULT_VARIABLE tar_result)
     if(NOT tar_result EQUAL 0)
       message(FATAL_ERROR "Failed to extract RNNoise model tarball")
@@ -82,22 +77,22 @@ if(NOISE_PLUGIN_RNNOISE)
   # 源码清单来自 RNNoise Makefile.am 的 RNNOISE_SOURCES（不含 x86 RTCD,
   # 默认 portable C 实现;若需 SIMD 优化可后续扩展）。
   set(RNNOISE_C_SOURCES
-    ${rnnoise_SOURCE_DIR}/src/denoise.c
-    ${rnnoise_SOURCE_DIR}/src/rnn.c
-    ${rnnoise_SOURCE_DIR}/src/pitch.c
-    ${rnnoise_SOURCE_DIR}/src/kiss_fft.c
-    ${rnnoise_SOURCE_DIR}/src/celt_lpc.c
-    ${rnnoise_SOURCE_DIR}/src/nnet.c
-    ${rnnoise_SOURCE_DIR}/src/nnet_default.c
-    ${rnnoise_SOURCE_DIR}/src/parse_lpcnet_weights.c
-    ${rnnoise_SOURCE_DIR}/src/rnnoise_data.c
-    ${rnnoise_SOURCE_DIR}/src/rnnoise_tables.c
+    ${RNNOISE_SRC_DIR}/src/denoise.c
+    ${RNNOISE_SRC_DIR}/src/rnn.c
+    ${RNNOISE_SRC_DIR}/src/pitch.c
+    ${RNNOISE_SRC_DIR}/src/kiss_fft.c
+    ${RNNOISE_SRC_DIR}/src/celt_lpc.c
+    ${RNNOISE_SRC_DIR}/src/nnet.c
+    ${RNNOISE_SRC_DIR}/src/nnet_default.c
+    ${RNNOISE_SRC_DIR}/src/parse_lpcnet_weights.c
+    ${RNNOISE_SRC_DIR}/src/rnnoise_data.c
+    ${RNNOISE_SRC_DIR}/src/rnnoise_tables.c
   )
   add_library(rnnoise STATIC ${RNNOISE_C_SOURCES})
   # include/ 暴露 rnnoise.h（PUBLIC,使用方 #include "rnnoise.h" 可见）;
   # src/ 是内部头文件（arch.h/common.h 等,PRIVATE）。
-  target_include_directories(rnnoise PUBLIC ${rnnoise_SOURCE_DIR}/include)
-  target_include_directories(rnnoise PRIVATE ${rnnoise_SOURCE_DIR}/src)
+  target_include_directories(rnnoise PUBLIC ${RNNOISE_SRC_DIR}/include)
+  target_include_directories(rnnoise PRIVATE ${RNNOISE_SRC_DIR}/src)
   set_target_properties(rnnoise PROPERTIES
                         POSITION_INDEPENDENT_CODE ON
                         C_STANDARD 99)

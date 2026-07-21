@@ -82,16 +82,23 @@ pt::ptree snapshot_to_ptree(const NoiseMetricsSnapshot& s) {
 
 // SensorInfo -> ptree：sensor 元信息（id/sink_id/enabled/denoise_enabled）
 // + metrics 快照字段（合并到同一层级，照搬 arch §5.4 GET /sensor/:id 响应）。
+// Spec3 Task3 review Important #1：sensor-config 的 denoise_enabled 是权威值
+// （用户 PUT 设置，立即反映在 SensorContext.denoise_enabled）；metrics 快照
+// 的 denoise_enabled 是 stale 值（NoiseMetrics::set_denoise_state 只更新
+// atomic，latest_.denoise_enabled 在 collect() 时才刷新）。若直接 put_child
+// 覆盖，PUT 后未跑音频循环时 GET 会返回 false（stale 覆盖了 true）。
+// 修复：merge 时跳过已存在的 key，让 sensor-config 的权威值胜出。
 pt::ptree sensor_info_to_ptree(const SensorInfo& info) {
   pt::ptree node;
   node.put("id", static_cast<unsigned>(info.id));
   node.put("sink_id", static_cast<unsigned>(info.sink_id));
   node.put("enabled", info.enabled);
   node.put("denoise_enabled", info.denoise_enabled);
-  // 合并 metrics 字段到同一层级。
+  // 合并 metrics 字段到同一层级，跳过已存在的 key（denoise_enabled 等）。
   auto metrics_pt = snapshot_to_ptree(info.metrics);
   for (auto& [k, v] : metrics_pt) {
-    node.put_child(k, v);
+    if (!node.get_optional<std::string>(k))
+      node.put_child(k, v);
   }
   return node;
 }
@@ -175,18 +182,20 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
   });
 
   // GET /api/noise/sensor/([0-9]+)/metrics - 最新 metrics 快照。
+  // Spec3 Task3 review Minor #4：用 get_metrics_snapshot 而非 get_sensor_info，
+  // 聚焦 accessor - 不读 sensor 配置字段（sink_id/enabled 等），仅 metrics。
   svr.Get("/api/noise/sensor/([0-9]+)/metrics",
           [&mgr](const Request& req, Response& res) {
             uint8_t id;
             if (!parse_sensor_id(req, res, id))
               return;
-            SensorInfo info;
-            if (!mgr.get_sensor_info(id, info)) {
+            NoiseMetricsSnapshot snapshot;
+            if (!mgr.get_metrics_snapshot(id, snapshot)) {
               res.status = 404;
               res.set_content("sensor not found", "text/plain");
               return;
             }
-            res.set_content(metrics_to_json(info.metrics), "application/json");
+            res.set_content(metrics_to_json(snapshot), "application/json");
           });
 
   // GET /api/noise/sensor/([0-9]+)/history - 60s history ring。
@@ -229,6 +238,8 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
   // SensorContext），
   //   故 PUT 即创建即更新。enabled 字段单独走 enable_sensor 路由（PUT
   //   后调一次）。
+  // Spec3 Task3 review Minor #5：add_sensor 恒返回 true（COW + make_shared
+  // 成功或抛异常被外层 catch 捕获为 400），故移除 dead 500 路径。
   svr.Put("/api/noise/sensor/([0-9]+)", [&mgr](const Request& req,
                                                Response& res) {
     uint8_t id;
@@ -249,11 +260,7 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
       cfg.plugin_name = pt.get<std::string>("denoise_plugin", "passthrough");
       cfg.dry_wet = pt.get<float>("denoise_dry_wet", 1.0f);
       cfg.sensitivity = pt.get<float>("sensitivity", 1.0f);
-      if (!mgr.add_sensor(id, sink_id, cfg)) {
-        res.status = 500;
-        res.set_content("failed to add sensor", "text/plain");
-        return;
-      }
+      mgr.add_sensor(id, sink_id, cfg);
       // enabled 可选字段：PUT 时若提供则应用 enable_sensor。
       auto en_opt = pt.get_optional<bool>("enabled");
       if (en_opt)

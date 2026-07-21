@@ -354,15 +354,16 @@ std::vector<std::pair<uint8_t, SensorInfo>> NoiseManager::list_sensor_infos()
   return result;
 }
 
-NoiseMetricsSnapshot NoiseManager::get_metrics_snapshot(
-    uint8_t sensor_id) const {
+bool NoiseManager::get_metrics_snapshot(uint8_t sensor_id,
+                                        NoiseMetricsSnapshot& out) const {
   const SensorTable* tbl = sensor_table_.load();
   if (tbl == nullptr)
-    return NoiseMetricsSnapshot{};
+    return false;
   auto it = tbl->find(sensor_id);
   if (it == tbl->end() || !it->second.metrics)
-    return NoiseMetricsSnapshot{};
-  return it->second.metrics->get_snapshot();  // 持 metrics_mutex_
+    return false;
+  out = it->second.metrics->get_snapshot();  // 持 metrics_mutex_
+  return true;
 }
 
 std::vector<NoiseMetricsSnapshot> NoiseManager::get_history_snapshot(

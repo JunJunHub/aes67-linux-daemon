@@ -165,12 +165,13 @@ class NoiseManager {
   // get_sensor_info: 返回单个 sensor 的 SensorInfo（配置 + metrics 快照）。
   //   未找到 sensor 返回 false。
   // list_sensor_infos: 返回所有 sensor 的 SensorInfo 列表（GET
-  // /api/noise/sensors）。 get_metrics_snapshot: 仅返回 metrics 快照（GET
-  // /api/noise/sensor/:id/metrics）。 get_history_snapshot: 返回 history
-  // 拷贝（GET /api/noise/sensor/:id/history）。
+  // /api/noise/sensors）。 get_metrics_snapshot: 聚焦 accessor - 仅返回 metrics
+  // 快照，不读 sensor 配置（GET /api/noise/sensor/:id/metrics，Spec3 Task3
+  // review Minor #4）。未找到 sensor 返回 false。 get_history_snapshot:
+  // 返回 history 拷贝（GET /api/noise/sensor/:id/history）。
   bool get_sensor_info(uint8_t sensor_id, SensorInfo& out) const;
   std::vector<std::pair<uint8_t, SensorInfo>> list_sensor_infos() const;
-  NoiseMetricsSnapshot get_metrics_snapshot(uint8_t sensor_id) const;
+  bool get_metrics_snapshot(uint8_t sensor_id, NoiseMetricsSnapshot& out) const;
   std::vector<NoiseMetricsSnapshot> get_history_snapshot(
       uint8_t sensor_id) const;
 

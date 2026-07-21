@@ -687,6 +687,9 @@ BOOST_AUTO_TEST_SUITE_END()
 BOOST_AUTO_TEST_SUITE(noise_http_sensor_tests)
 
 // CRUD: PUT 创建 -> GET 读取 -> GET 列表 -> DELETE -> GET 返回 404。
+// Spec3 Task3 review Minor #3：每个 r->status / r->body 访问前 BOOST_REQUIRE(r)
+// 防止 startup race（bind 与 listen 之间 client 连接被 RST -> 返回 nullptr）
+// 导致 UB crash，转为 clean test failure。
 BOOST_AUTO_TEST_CASE(sensor_crud_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
@@ -703,22 +706,27 @@ BOOST_AUTO_TEST_CASE(sensor_crud_via_http) {
       "/api/noise/sensor/0",
       R"({"sink_id":0,"denoise_enabled":true,"denoise_plugin":"rnnoise"})",
       "application/json");
+  BOOST_REQUIRE(r1);
   BOOST_CHECK_EQUAL(r1->status, 200);
 
   // GET sensor 0
   auto r2 = cli.Get("/api/noise/sensor/0");
+  BOOST_REQUIRE(r2);
   BOOST_CHECK_EQUAL(r2->status, 200);
   BOOST_CHECK(r2->body.find("\"noise_type\"") != std::string::npos);
 
   // GET sensors 列表
   auto r3 = cli.Get("/api/noise/sensors");
+  BOOST_REQUIRE(r3);
   BOOST_CHECK_EQUAL(r3->status, 200);
   BOOST_CHECK(r3->body.find("\"sensors\"") != std::string::npos);
 
   // DELETE
   auto r4 = cli.Delete("/api/noise/sensor/0");
+  BOOST_REQUIRE(r4);
   BOOST_CHECK_EQUAL(r4->status, 200);
   auto r5 = cli.Get("/api/noise/sensor/0");
+  BOOST_REQUIRE(r5);
   BOOST_CHECK_EQUAL(r5->status, 404);
 
   svr.stop();
@@ -738,12 +746,89 @@ BOOST_AUTO_TEST_CASE(sensor_metrics_history_via_http) {
   httplib::Client cli("127.0.0.1", port);
 
   auto m = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_REQUIRE(m);
   BOOST_CHECK_EQUAL(m->status, 200);
   BOOST_CHECK(m->body.find("noise_level_dbfs") != std::string::npos);
 
   auto h = cli.Get("/api/noise/sensor/0/history");
+  BOOST_REQUIRE(h);
   BOOST_CHECK_EQUAL(h->status, 200);
   BOOST_CHECK(h->body.find("\"history\"") != std::string::npos);
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// Spec3 Task3 review Important #1：PUT denoise_enabled=true 后 GET 必须返回
+// denoise_enabled=true。修复前：sensor_info_to_ptree 合并 metrics_pt 时
+// snapshot.denoise_enabled（stale，未跑 collect 更新）覆盖了权威的
+// SensorContext.denoise_enabled。本 case 不跑音频循环，故
+// latest_.denoise_enabled 保持默认 false；若 merge 不跳过已存在 key，
+// GET 会错误返回 false。
+BOOST_AUTO_TEST_CASE(put_denoise_enabled_reflected_in_get) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // PUT denoise_enabled=true（不跑音频循环，metrics.latest_.denoise_enabled
+  // 仍为默认 false）
+  auto r1 =
+      cli.Put("/api/noise/sensor/0", R"({"sink_id":0,"denoise_enabled":true})",
+              "application/json");
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 200);
+
+  // GET 必须返回 denoise_enabled=true（权威值来自 SensorContext）。
+  // 注：boost::property_tree::write_json 将所有值序列化为字符串（bool -> "true"
+  // /"false"，number -> "42"/"3.14"）。这是 ptree JSON writer 的已知行为，
+  // 不影响 JSON 合法性（值仍是字符串，可解析），但与 arch §5.4 示例的裸
+  // true/false 类型有差异。spec compliance 已由 Task3 review 确认 ✅，此处
+  // 按 ptree 实际输出断言。
+  auto r2 = cli.Get("/api/noise/sensor/0");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  // 关键断言：denoise_enabled 是 "true"（权威值），不是 "false"（stale
+  // metrics 值）。若 sensor_info_to_ptree 的 merge 未跳过已存在 key，
+  // 此处会失败（stale 覆盖权威）。
+  BOOST_CHECK(r2->body.find("\"denoise_enabled\":\"true\"") !=
+              std::string::npos);
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// Spec3 Task3 review Minor #2：400 错误路径覆盖。
+// (a) PUT 畸形 JSON -> 400； (b) GET id 超范围 -> 400。
+BOOST_AUTO_TEST_CASE(error_paths_return_400) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // (a) PUT 畸形 JSON body（缺 }）
+  auto r1 =
+      cli.Put("/api/noise/sensor/0", R"({"sink_id":0)", "application/json");
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 400);
+
+  // (b) GET id=256（超 uint8_t 范围，parse_sensor_id 0-255 检查）
+  auto r2 = cli.Get("/api/noise/sensor/256");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 400);
+
+  // 对照：id=255 合法（未创建 sensor -> 404，不是 400）
+  auto r3 = cli.Get("/api/noise/sensor/255");
+  BOOST_REQUIRE(r3);
+  BOOST_CHECK_EQUAL(r3->status, 404);
 
   svr.stop();
   svr_thread.join();
@@ -774,11 +859,13 @@ BOOST_AUTO_TEST_CASE(concurrent_metrics_read_while_collect) {
     }
   });
 
-  // HTTP 线程：并发读 metrics + history
+  // HTTP 线程：并发读 metrics + history（Minor #3：nullptr 检查）
   for (int i = 0; i < 20; ++i) {
     auto m = cli.Get("/api/noise/sensor/0/metrics");
+    BOOST_REQUIRE(m);
     BOOST_CHECK_EQUAL(m->status, 200);
     auto h = cli.Get("/api/noise/sensor/0/history");
+    BOOST_REQUIRE(h);
     BOOST_CHECK_EQUAL(h->status, 200);
   }
 

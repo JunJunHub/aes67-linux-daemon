@@ -734,6 +734,8 @@ BOOST_AUTO_TEST_CASE(sensor_crud_via_http) {
 }
 
 // metrics + history：sensor 已存在时返回 JSON 含 noise_level_dbfs 字段。
+// Spec3 Task3 JSON fix：验证手写 JSON 输出类型 - 数字/bool 不加引号
+// （对齐 daemon/json.cpp + arch §5.4）。
 BOOST_AUTO_TEST_CASE(sensor_metrics_history_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
@@ -749,6 +751,14 @@ BOOST_AUTO_TEST_CASE(sensor_metrics_history_via_http) {
   BOOST_REQUIRE(m);
   BOOST_CHECK_EQUAL(m->status, 200);
   BOOST_CHECK(m->body.find("noise_level_dbfs") != std::string::npos);
+  // JSON 类型断言（对齐 arch §5.4 + daemon/json.cpp 手写模式）：
+  // 数字不加引号（不是 "noise_level_dbfs": "-100"）
+  BOOST_CHECK(m->body.find("\"noise_level_dbfs\": \"") == std::string::npos);
+  // bool 不加引号（"is_alerting": true 或 false，不是 "true"/"false"）
+  BOOST_CHECK(m->body.find("\"is_alerting\": ") != std::string::npos);
+  BOOST_CHECK(m->body.find("\"is_alerting\": \"") == std::string::npos);
+  // noise_type 是字符串（加引号）
+  BOOST_CHECK(m->body.find("\"noise_type\": \"") != std::string::npos);
 
   auto h = cli.Get("/api/noise/sensor/0/history");
   BOOST_REQUIRE(h);
@@ -783,20 +793,15 @@ BOOST_AUTO_TEST_CASE(put_denoise_enabled_reflected_in_get) {
   BOOST_REQUIRE(r1);
   BOOST_CHECK_EQUAL(r1->status, 200);
 
-  // GET 必须返回 denoise_enabled=true（权威值来自 SensorContext）。
-  // 注：boost::property_tree::write_json 将所有值序列化为字符串（bool -> "true"
-  // /"false"，number -> "42"/"3.14"）。这是 ptree JSON writer 的已知行为，
-  // 不影响 JSON 合法性（值仍是字符串，可解析），但与 arch §5.4 示例的裸
-  // true/false 类型有差异。spec compliance 已由 Task3 review 确认 ✅，此处
-  // 按 ptree 实际输出断言。
+  // GET 必须返回 denoise_enabled: true（权威值来自 SensorContext，裸 bool
+  // 不加引号 - 照搬 daemon/json.cpp 手写模式）。
   auto r2 = cli.Get("/api/noise/sensor/0");
   BOOST_REQUIRE(r2);
   BOOST_CHECK_EQUAL(r2->status, 200);
-  // 关键断言：denoise_enabled 是 "true"（权威值），不是 "false"（stale
-  // metrics 值）。若 sensor_info_to_ptree 的 merge 未跳过已存在 key，
-  // 此处会失败（stale 覆盖权威）。
-  BOOST_CHECK(r2->body.find("\"denoise_enabled\":\"true\"") !=
-              std::string::npos);
+  // 关键断言：denoise_enabled 是 true（权威值，unquoted），不是 false
+  // （stale metrics 值）。若 sensor_to_json 未跳过 metrics 的 stale
+  // denoise_enabled，此处会失败。
+  BOOST_CHECK(r2->body.find("\"denoise_enabled\": true") != std::string::npos);
 
   svr.stop();
   svr_thread.join();

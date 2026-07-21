@@ -2,11 +2,21 @@
 // Spec3 Task 3：HTTP sensor API
 // 实现。架构依据：docs/noise/architecture-design.md §5.1（端点）+
 // §5.4（响应字段）。
+//
+// JSON 序列化模式（照搬 daemon/json.cpp）：
+// - 输出：std::stringstream 手工拼接 + escape_json() 转义。数字/bool 不加
+//   引号（arch §5.4 示例 `"noise_level_dbfs": -35.0`、`"is_alerting": true`）。
+// - 输入（PUT body 解析）：boost::property_tree::ptree + read_json（同
+//   daemon/json.cpp 的 json_to_config_ / json_to_source / json_to_sink）。
+// - 不用 boost::property_tree::write_json 做输出（该函数将所有值序列化为
+//   字符串 `"true"`/`"42"`，违反 arch §5.4 的裸类型约定 + 与 daemon API
+//   不一致）。
 #include "noise_http.hpp"
 
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <cstdint>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -39,75 +49,105 @@ std::string noise_type_to_string(NoiseType type) {
   }
 }
 
-// ── ptree 构造 helper ───────────────────────────────────────────────────
-// boost::property_tree 风格（与 daemon/json.cpp config_to_json 同一做法）。
-// 不直接手拼字符串，避免 escape/格式问题。write_json(ss, pt, false)
-// pretty=false 输出紧凑 JSON（默认 true 会带换行+缩进）。
+// ── JSON 输出 helper（照搬 daemon/json.cpp L44-78 escape_json）────────────
+// 手工拼接 JSON：数字/bool 不加引号，字符串加引号 + 转义。与 daemon 的
+// config_to_json / source_to_json 同一模式。
 namespace {
-namespace pt = boost::property_tree;
 
-// 单个 NoiseMetricsSnapshot -> ptree（不含外层 wrapper）。
-// 字段名严格按 arch §5.4 响应示例：noise_level_dbfs / noise_type /
-// noise_type_confidence / is_mixed / estimated_snr_db / denoise_enabled /
-// denoise_dry_wet / noise_reduction_db / alert_threshold_dbfs / is_alerting
-// / spectral_centroid_hz / spectral_flatness / hum_strength_db。
-pt::ptree snapshot_to_ptree(const NoiseMetricsSnapshot& s) {
-  pt::ptree node;
-  node.put("noise_level_dbfs", s.noise_level_dbfs);
-  node.put("noise_type", noise_type_to_string(s.noise_type));
-  node.put("noise_type_confidence", s.noise_type_confidence);
-  node.put("is_mixed", s.is_mixed);
-  node.put("estimated_snr_db", s.estimated_snr_db);
-  node.put("denoise_enabled", s.denoise_enabled);
-  node.put("denoise_dry_wet", s.denoise_dry_wet);
-  node.put("noise_reduction_db", s.noise_reduction_db);
-  node.put("alert_threshold_dbfs", s.alert_threshold_dbfs);
-  node.put("is_alerting", s.is_alerting);
-  node.put("spectral_centroid_hz", s.spectral_centroid_hz);
-  node.put("spectral_flatness", s.spectral_flatness);
-  node.put("hum_strength_db", s.hum_strength_db);
-  // noise_candidates 数组（arch §5.4 混合噪声示例）。
-  // NoiseMetricsSnapshot.noise_candidates 是定长 array + count（避免 RT 路径
-  // 堆分配）。序列化时按 count 截断。
-  pt::ptree cand_arr;
-  for (size_t i = 0; i < s.noise_candidates_count; ++i) {
-    pt::ptree elem;
-    elem.put("type", noise_type_to_string(s.noise_candidates[i].type));
-    elem.put("confidence", s.noise_candidates[i].confidence);
-    cand_arr.push_back(std::make_pair("", elem));
+// JSON 字符串转义（daemon/json.cpp L44-78 复制，避免跨模块依赖）。
+// 处理 " \\ \b \f \n \r \t + 控制字符 \u00XX。
+std::string escape_json(const std::string& s) {
+  std::ostringstream ss;
+  for (auto c = s.cbegin(); c != s.cend(); c++) {
+    switch (*c) {
+      case '"':
+        ss << "\\\"";
+        break;
+      case '\\':
+        ss << "\\\\";
+        break;
+      case '\b':
+        ss << "\\b";
+        break;
+      case '\f':
+        ss << "\\f";
+        break;
+      case '\n':
+        ss << "\\n";
+        break;
+      case '\r':
+        ss << "\\r";
+        break;
+      case '\t':
+        ss << "\\t";
+        break;
+      default:
+        if ('\x00' <= *c && *c <= '\x1f') {
+          ss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+             << static_cast<int>(*c);
+        } else {
+          ss << *c;
+        }
+    }
   }
-  node.put_child("noise_candidates", cand_arr);
-  return node;
-}
-
-// SensorInfo -> ptree：sensor 元信息（id/sink_id/enabled/denoise_enabled）
-// + metrics 快照字段（合并到同一层级，照搬 arch §5.4 GET /sensor/:id 响应）。
-// Spec3 Task3 review Important #1：sensor-config 的 denoise_enabled 是权威值
-// （用户 PUT 设置，立即反映在 SensorContext.denoise_enabled）；metrics 快照
-// 的 denoise_enabled 是 stale 值（NoiseMetrics::set_denoise_state 只更新
-// atomic，latest_.denoise_enabled 在 collect() 时才刷新）。若直接 put_child
-// 覆盖，PUT 后未跑音频循环时 GET 会返回 false（stale 覆盖了 true）。
-// 修复：merge 时跳过已存在的 key，让 sensor-config 的权威值胜出。
-pt::ptree sensor_info_to_ptree(const SensorInfo& info) {
-  pt::ptree node;
-  node.put("id", static_cast<unsigned>(info.id));
-  node.put("sink_id", static_cast<unsigned>(info.sink_id));
-  node.put("enabled", info.enabled);
-  node.put("denoise_enabled", info.denoise_enabled);
-  // 合并 metrics 字段到同一层级，跳过已存在的 key（denoise_enabled 等）。
-  auto metrics_pt = snapshot_to_ptree(info.metrics);
-  for (auto& [k, v] : metrics_pt) {
-    if (!node.get_optional<std::string>(k))
-      node.put_child(k, v);
-  }
-  return node;
-}
-
-// ptree -> 紧凑 JSON 字符串。
-std::string ptree_to_json(const pt::ptree& root) {
-  std::stringstream ss;
-  pt::write_json(ss, root, false);
   return ss.str();
+}
+
+// bool -> JSON 字面量（不加引号）。不用 std::boolalpha 避免影响 stream
+// 状态（后续浮点输出会变）。
+inline const char* bool_str(bool b) {
+  return b ? "true" : "false";
+}
+
+// 单个 NoiseMetricsSnapshot 字段追加到 stream（不含外层 {}）。
+// indent 是每行前缀（如 "  " 或 "    "），用于嵌套场景的对齐。
+// include_denoise_enabled：是否输出 denoise_enabled 字段。
+//   true: metrics 独立视图（GET /metrics），输出 denoise_enabled（stale
+//   值，仅 collect() 时刷新 - 但这是 /metrics 的语义：返回最新 metrics 快照）。
+//   false: sensor 合并视图（GET /sensor/:id），denoise_enabled 由 sensor
+//   元信息提供（权威值，Spec3 Task3 review Important #1），不重复输出。
+// 字段名严格按 arch §5.4 响应示例。
+void append_snapshot_fields(std::stringstream& ss,
+                            const NoiseMetricsSnapshot& s,
+                            const char* indent,
+                            bool include_denoise_enabled) {
+  ss << indent << "\"noise_level_dbfs\": " << s.noise_level_dbfs << ",\n"
+     << indent << "\"noise_type\": \""
+     << escape_json(noise_type_to_string(s.noise_type)) << "\",\n"
+     << indent << "\"noise_type_confidence\": " << s.noise_type_confidence
+     << ",\n"
+     << indent << "\"is_mixed\": " << bool_str(s.is_mixed) << ",\n"
+     << indent << "\"estimated_snr_db\": " << s.estimated_snr_db;
+  if (include_denoise_enabled) {
+    ss << ",\n"
+       << indent << "\"denoise_enabled\": " << bool_str(s.denoise_enabled);
+  }
+  ss << ",\n"
+     << indent << "\"denoise_dry_wet\": " << s.denoise_dry_wet << ",\n"
+     << indent << "\"noise_reduction_db\": " << s.noise_reduction_db << ",\n"
+     << indent << "\"alert_threshold_dbfs\": " << s.alert_threshold_dbfs
+     << ",\n"
+     << indent << "\"is_alerting\": " << bool_str(s.is_alerting) << ",\n"
+     << indent << "\"spectral_centroid_hz\": " << s.spectral_centroid_hz
+     << ",\n"
+     << indent << "\"spectral_flatness\": " << s.spectral_flatness << ",\n"
+     << indent << "\"hum_strength_db\": " << s.hum_strength_db;
+}
+
+// noise_candidates 数组追加（arch §5.4 混合噪声示例）。
+// 定长 array + count 截断（避免 RT 路径堆分配，见 noise_metrics.hpp）。
+void append_candidates_array(std::stringstream& ss,
+                             const NoiseMetricsSnapshot& s,
+                             const char* indent) {
+  ss << indent << "\"noise_candidates\": [";
+  for (size_t i = 0; i < s.noise_candidates_count; ++i) {
+    if (i > 0)
+      ss << ", ";
+    ss << "{\"type\": \""
+       << escape_json(noise_type_to_string(s.noise_candidates[i].type))
+       << "\", \"confidence\": " << s.noise_candidates[i].confidence << "}";
+  }
+  ss << "]";
 }
 
 // 解析 URL path 中的 :id 为 uint8_t。超范围（>255 或负）返回 false 并设置
@@ -133,33 +173,63 @@ bool parse_sensor_id(const httplib::Request& req,
 }
 }  // namespace
 
+// ── JSON 输出函数（手工拼接，对齐 daemon/json.cpp 模式）──────────────────
+
 std::string metrics_to_json(const NoiseMetricsSnapshot& snapshot) {
-  return ptree_to_json(snapshot_to_ptree(snapshot));
+  // /metrics 独立视图：输出全部 metrics 字段（含 denoise_enabled，返回最新
+  // metrics 快照，值由 collect() 时刷新）。
+  std::stringstream ss;
+  ss << "{\n";
+  append_snapshot_fields(ss, snapshot, "  ", /*include_denoise_enabled=*/true);
+  ss << ",\n";
+  append_candidates_array(ss, snapshot, "  ");
+  ss << "\n}\n";
+  return ss.str();
 }
 
 std::string sensor_to_json(const SensorInfo& info) {
-  return ptree_to_json(sensor_info_to_ptree(info));
+  // /sensor/:id 合并视图：sensor 元信息（id/sink_id/enabled/denoise_enabled
+  // - 权威值来自 SensorContext）+ metrics 字段（不含 denoise_enabled，避免
+  // 与 sensor 元信息的权威值冲突 - Spec3 Task3 review Important #1）。
+  std::stringstream ss;
+  ss << "{\n  \"id\": " << static_cast<unsigned>(info.id)
+     << ",\n  \"sink_id\": " << static_cast<unsigned>(info.sink_id)
+     << ",\n  \"enabled\": " << bool_str(info.enabled)
+     << ",\n  \"denoise_enabled\": " << bool_str(info.denoise_enabled) << ",\n";
+  append_snapshot_fields(ss, info.metrics, "  ",
+                         /*include_denoise_enabled=*/false);
+  ss << ",\n";
+  append_candidates_array(ss, info.metrics, "  ");
+  ss << "\n}\n";
+  return ss.str();
 }
 
 std::string sensors_to_json(
     const std::vector<std::pair<uint8_t, SensorInfo>>& sensors) {
-  pt::ptree root;
-  pt::ptree arr;
+  std::stringstream ss;
+  ss << "{\n  \"sensors\": [";
+  size_t i = 0;
   for (const auto& [id, info] : sensors) {
-    arr.push_back(std::make_pair("", sensor_info_to_ptree(info)));
+    if (i++ > 0)
+      ss << ", ";
+    // 复用 sensor_to_json 输出单个 sensor 对象。
+    ss << sensor_to_json(info);
   }
-  root.put_child("sensors", arr);
-  return ptree_to_json(root);
+  ss << "  ]\n}\n";
+  return ss.str();
 }
 
 std::string history_to_json(const std::vector<NoiseMetricsSnapshot>& history) {
-  pt::ptree root;
-  pt::ptree arr;
+  std::stringstream ss;
+  ss << "{\n  \"history\": [";
+  size_t i = 0;
   for (const auto& snap : history) {
-    arr.push_back(std::make_pair("", snapshot_to_ptree(snap)));
+    if (i++ > 0)
+      ss << ", ";
+    ss << metrics_to_json(snap);
   }
-  root.put_child("history", arr);
-  return ptree_to_json(root);
+  ss << "  ]\n}\n";
+  return ss.str();
 }
 
 // ── 路由注册 ────────────────────────────────────────────────────────────
@@ -240,15 +310,17 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
   //   后调一次）。
   // Spec3 Task3 review Minor #5：add_sensor 恒返回 true（COW + make_shared
   // 成功或抛异常被外层 catch 捕获为 400），故移除 dead 500 路径。
+  // 输入解析用 boost::property_tree（照搬 daemon/json.cpp json_to_source
+  // 模式）。
   svr.Put("/api/noise/sensor/([0-9]+)", [&mgr](const Request& req,
                                                Response& res) {
     uint8_t id;
     if (!parse_sensor_id(req, res, id))
       return;
     try {
-      pt::ptree pt;
+      boost::property_tree::ptree pt;
       std::stringstream ss(req.body);
-      pt::read_json(ss, pt);
+      boost::property_tree::read_json(ss, pt);
       NoiseSensorConfig cfg;
       uint8_t sink_id = id;
       // sink_id 可缺省（默认与 sensor_id 相同，简化单 sensor 场景）。

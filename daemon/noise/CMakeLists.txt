@@ -7,6 +7,7 @@ set(NOISE_SOURCES
   audio_capture.cpp
   noise_manager.cpp
   noise_metrics.cpp
+  noise_http.cpp
   vad.cpp
   noise_detector.cpp
   denoise_plugin_factory.cpp

@@ -94,10 +94,14 @@ endif()
 
 if(ENABLE_TESTS AND WITH_NOISE)
   find_package(Boost COMPONENTS unit_test_framework log REQUIRED)
+  # Spec3 Task 3：noise-test 通过 noise_http.cpp 引入 cpp-httplib（header-only），
+  # cpp-httplib 直接 #include <pthread.h>，需显式链接 Threads。
+  set(THREADS_PREFER_PTHREAD_FLAG true)
+  find_package(Threads REQUIRED)
   add_executable(noise-test noise/tests/noise_test.cpp
                  pcm_capture_service.cpp noise_session_manager_bridge.cpp)
   target_include_directories(noise-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(noise-test PRIVATE noise ${Boost_LIBRARIES} ${ALSA_LIBRARY})
+  target_link_libraries(noise-test PRIVATE noise ${Boost_LIBRARIES} ${ALSA_LIBRARY} Threads::Threads)
   target_compile_definitions(noise-test PRIVATE -D_USE_FAKE_DRIVER_ -D_USE_NOISE_)
   add_test(NAME noise-test COMMAND noise-test -p)
 endif()

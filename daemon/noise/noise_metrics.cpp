@@ -44,6 +44,12 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
                            const NoiseAnalysisResult& analysis,
                            float input_rms,
                            float denoised_rms) {
+  // Spec3 Task 3：持锁写 latest_ + history_，与 HTTP 读路径互斥。
+  // Phase 1 simple mutex - HTTP 读罕见，非 contends。Phase 3.6 改 seqlock
+  // 做 lock-free RT（arch §11 待决项）。RT 路径持锁开销：单次非竞争
+  // std::mutex lock/unlock ~25ns @ modern x86，48000Hz/480sample 帧预算
+  // ~10ms，占比 < 0.001%。
+  std::lock_guard<std::mutex> lock(metrics_mutex_);
   // denoise（① DenoiseResult）保留供未来 VAD-probability 指标使用
   // （review Minor #3：参数签名按 brief 要求，此处标记 reserved）。
   (void)denoise;

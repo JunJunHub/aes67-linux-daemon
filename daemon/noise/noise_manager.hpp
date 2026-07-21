@@ -12,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "denoise_processor.hpp"
 #include "noise_analyzer.hpp"
@@ -29,6 +31,18 @@ struct NoiseSensorConfig {
   std::string plugin_name{"passthrough"};
   float dry_wet{1.0f};
   float sensitivity{1.0f};
+};
+
+// Spec3 Task 3：HTTP 控制线程读取的 sensor 信息快照。
+// 由 get_sensor_info() / list_sensor_infos() 填充，组合 sensor 配置（sink_id/
+// enabled/denoise_enabled，从 SensorContext 读）+ 最新 metrics 快照（从
+// NoiseMetrics::get_snapshot() 持锁读）。POD，拷贝安全。
+struct SensorInfo {
+  uint8_t id{0};
+  uint8_t sink_id{0};
+  bool enabled{true};
+  bool denoise_enabled{false};
+  NoiseMetricsSnapshot metrics{};
 };
 
 // per-sensor 处理上下文（arch §3.7 L842-848）。
@@ -142,6 +156,22 @@ class NoiseManager {
   // 未找到 sensor 返回默认 snapshot / 空 history。
   NoiseMetricsSnapshot get_metrics_for_test(uint8_t sensor_id) const;
   std::deque<NoiseMetricsSnapshot> get_history_for_test(
+      uint8_t sensor_id) const;
+
+  // ── Spec3 Task 3 同步读路径（HTTP 控制线程调用）──
+  // 与 collect() (RT 写) 互斥：metrics->get_snapshot() 持 metrics_mutex_。
+  // sensor_table_.load() 是 RCU 读，安全。控制线程写 (add_sensor 等) 走 COW
+  // 不改旧表，读路径看到的 SensorContext 字段（sink_id/enabled 等）稳定。
+  // get_sensor_info: 返回单个 sensor 的 SensorInfo（配置 + metrics 快照）。
+  //   未找到 sensor 返回 false。
+  // list_sensor_infos: 返回所有 sensor 的 SensorInfo 列表（GET
+  // /api/noise/sensors）。 get_metrics_snapshot: 仅返回 metrics 快照（GET
+  // /api/noise/sensor/:id/metrics）。 get_history_snapshot: 返回 history
+  // 拷贝（GET /api/noise/sensor/:id/history）。
+  bool get_sensor_info(uint8_t sensor_id, SensorInfo& out) const;
+  std::vector<std::pair<uint8_t, SensorInfo>> list_sensor_infos() const;
+  NoiseMetricsSnapshot get_metrics_snapshot(uint8_t sensor_id) const;
+  std::vector<NoiseMetricsSnapshot> get_history_snapshot(
       uint8_t sensor_id) const;
 
  private:

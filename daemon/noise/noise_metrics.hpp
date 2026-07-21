@@ -6,14 +6,19 @@
 //
 // 线程模型（arch §3.7 L860 帧回调线程安全）：
 //   - collect() 在 RT 路径（on_frame capture 线程）调用，更新 latest_ 快照。
-//     无锁写：latest_ 为 per-sensor 实例，单写者（capture 线程）。
+//     Spec3 Task 3：collect() 持 metrics_mutex_ 写 latest_ + history_，与 HTTP
+//     读路径互斥。Phase 1 simple mutex - HTTP 读罕见（UI 手动轮询），非
+//     contends。 Phase 3.6 改 seqlock 做 lock-free RT（arch §11 待决项）。
 //     history_ 每 kHistorySampleIntervalFrames 帧 push 一次（~1s），deque
 //     push 的少量分配可接受（非每帧）。
 //   - set_denoise_state() 在控制线程调用（add_sensor / set_dry_wet），
 //     用 atomic 写 denoise_enabled_ / denoise_dry_wet_bits_，collect() 用
 //     atomic 读 -> 无数据竞争。
-//   - snapshot_for_test() / get_history_for_test()：测试钩子。单线程测试中
-//     collect 后读，无竞态。Task 3 HTTP 控制线程读需加同步（本 task 不涉及）。
+//   - get_snapshot() / get_history()：Spec3 Task 3 新增的同步读路径，HTTP 控制
+//     线程调用。持 metrics_mutex_ 读 latest_/history_ 副本。
+//   - snapshot_for_test() / get_history_for_test()：Spec2
+//   单线程测试钩子，无锁。
+//     保留以兼容 T2 既有单线程 unit tests。
 #ifndef NOISE_NOISE_METRICS_HPP_
 #define NOISE_NOISE_METRICS_HPP_
 
@@ -22,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <mutex>
 
 #include "denoise_plugin.hpp"  // DenoiseResult
 #include "noise_analyzer.hpp"  // NoiseAnalysisResult, NoiseType
@@ -110,9 +116,22 @@ class NoiseMetrics {
   // add_sensor / set_dry_wet 调用。atomic 写，collect() atomic 读 -> 无竞争。
   void set_denoise_state(bool enabled, float dry_wet);
 
+  // Spec3 Task 3 同步读路径（HTTP 控制线程调用）。
+  // 持 metrics_mutex_ 读 latest_ / history_ 副本，与 collect() 写互斥。
+  // 返回值是拷贝，调用方在锁外使用。Phase 1 simple mutex（arch §11 待决项
+  // 提到 Phase 3.6 改 seqlock）。
+  NoiseMetricsSnapshot get_snapshot() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    return latest_;
+  }
+  std::deque<NoiseMetricsSnapshot> get_history() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    return history_;
+  }
+
   // 测试钩子（spec §D 接受此模式）。
-  // 返回 latest_ 副本。测试为单线程（collect 后读，无竞态）。
-  // Task 3 HTTP 控制线程读需加同步（本 task 不涉及）。
+  // 返回 latest_ 副本。Spec2 单线程测试，collect 后读无竞态。无锁。
+  // Spec3 Task 3 HTTP 控制线程读改用 get_snapshot()（持锁）。
   NoiseMetricsSnapshot snapshot_for_test() const { return latest_; }
   std::deque<NoiseMetricsSnapshot> get_history_for_test() const {
     return history_;
@@ -133,6 +152,9 @@ class NoiseMetrics {
   // IEEE 754 float 位模式存 atomic<uint32_t>（与 IDenoisePlugin 同一做法，
   // std::atomic<float> 不保证 lock-free，arch §3.4 denoise_plugin.hpp 注释）。
   std::atomic<uint32_t> denoise_dry_wet_bits_;
+  // Spec3 Task 3：guards latest_ + history_。RT 写 (collect) vs HTTP 读
+  // (get_snapshot/get_history) 互斥。mutable: const 方法 (get_snapshot) 可锁。
+  mutable std::mutex metrics_mutex_;
 };
 
 }  // namespace noise

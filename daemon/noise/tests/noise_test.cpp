@@ -675,3 +675,117 @@ BOOST_AUTO_TEST_CASE(metrics_no_alert_when_both_below_threshold) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Spec3 Task 3: HTTP sensor API - CRUD + metrics + history。
+// Brief 原代码有 bug：`svr.listen()` 返回 bool，不是端口；`svr.port()` 方法在
+// cpp-httplib 0.11.2 不存在。正确写法：bind_to_any_port() 返回 OS 分配端口，
+// 然后在独立线程跑 listen_after_bind()，主线程用返回的端口构造 Client。
+#include "noise_http.hpp"
+#include <httplib.h>
+#include <thread>
+
+BOOST_AUTO_TEST_SUITE(noise_http_sensor_tests)
+
+// CRUD: PUT 创建 -> GET 读取 -> GET 列表 -> DELETE -> GET 返回 404。
+BOOST_AUTO_TEST_CASE(sensor_crud_via_http) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // PUT 创建 sensor 0（denoise_plugin 字段映射到
+  // NoiseSensorConfig::plugin_name）
+  auto r1 = cli.Put(
+      "/api/noise/sensor/0",
+      R"({"sink_id":0,"denoise_enabled":true,"denoise_plugin":"rnnoise"})",
+      "application/json");
+  BOOST_CHECK_EQUAL(r1->status, 200);
+
+  // GET sensor 0
+  auto r2 = cli.Get("/api/noise/sensor/0");
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK(r2->body.find("\"noise_type\"") != std::string::npos);
+
+  // GET sensors 列表
+  auto r3 = cli.Get("/api/noise/sensors");
+  BOOST_CHECK_EQUAL(r3->status, 200);
+  BOOST_CHECK(r3->body.find("\"sensors\"") != std::string::npos);
+
+  // DELETE
+  auto r4 = cli.Delete("/api/noise/sensor/0");
+  BOOST_CHECK_EQUAL(r4->status, 200);
+  auto r5 = cli.Get("/api/noise/sensor/0");
+  BOOST_CHECK_EQUAL(r5->status, 404);
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// metrics + history：sensor 已存在时返回 JSON 含 noise_level_dbfs 字段。
+BOOST_AUTO_TEST_CASE(sensor_metrics_history_via_http) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  auto m = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_CHECK_EQUAL(m->status, 200);
+  BOOST_CHECK(m->body.find("noise_level_dbfs") != std::string::npos);
+
+  auto h = cli.Get("/api/noise/sensor/0/history");
+  BOOST_CHECK_EQUAL(h->status, 200);
+  BOOST_CHECK(h->body.find("\"history\"") != std::string::npos);
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// 线程安全：HTTP 读 metrics 与 RT 写 collect 并发不数据竞争（D-S3.x）。
+// Phase 1 simple mutex - 非 contends 场景。此 case 仅验证不 crash 不死锁。
+BOOST_AUTO_TEST_CASE(concurrent_metrics_read_while_collect) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // RT 线程模拟：连续 collect 帧数据
+  std::atomic<bool> stop{false};
+  float buf[480] = {0};
+  std::thread rt_thread([&]() {
+    while (!stop.load()) {
+      mgr.on_period_begin();
+      mgr.on_frame(0, buf, 480);
+      mgr.on_period_end();
+    }
+  });
+
+  // HTTP 线程：并发读 metrics + history
+  for (int i = 0; i < 20; ++i) {
+    auto m = cli.Get("/api/noise/sensor/0/metrics");
+    BOOST_CHECK_EQUAL(m->status, 200);
+    auto h = cli.Get("/api/noise/sensor/0/history");
+    BOOST_CHECK_EQUAL(h->status, 200);
+  }
+
+  stop.store(true);
+  rt_thread.join();
+  svr.stop();
+  svr_thread.join();
+}
+
+BOOST_AUTO_TEST_SUITE_END()

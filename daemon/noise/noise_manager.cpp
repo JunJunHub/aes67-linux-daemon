@@ -312,4 +312,69 @@ std::deque<NoiseMetricsSnapshot> NoiseManager::get_history_for_test(
   return it->second.metrics->get_history_for_test();
 }
 
+// ── Spec3 Task 3 同步读路径实现 ─────────────────────────────────────────
+// 见 noise_manager.hpp 注释：HTTP 控制线程调用，metrics->get_snapshot() 持锁
+// 与 collect() (RT 写) 互斥。SensorContext
+// 字段（sink_id/enabled/denoise_enabled） 经 RCU 表发布后稳定，不需额外锁。
+bool NoiseManager::get_sensor_info(uint8_t sensor_id, SensorInfo& out) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return false;
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end())
+    return false;
+  const auto& ctx = it->second;
+  out.id = sensor_id;
+  out.sink_id = ctx.sink_id;
+  out.enabled = ctx.enabled;
+  out.denoise_enabled = ctx.denoise_enabled;
+  if (ctx.metrics)
+    out.metrics = ctx.metrics->get_snapshot();  // 持 metrics_mutex_
+  else
+    out.metrics = NoiseMetricsSnapshot{};
+  return true;
+}
+
+std::vector<std::pair<uint8_t, SensorInfo>> NoiseManager::list_sensor_infos()
+    const {
+  std::vector<std::pair<uint8_t, SensorInfo>> result;
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return result;
+  for (const auto& [id, ctx] : *tbl) {
+    SensorInfo info;
+    info.id = id;
+    info.sink_id = ctx.sink_id;
+    info.enabled = ctx.enabled;
+    info.denoise_enabled = ctx.denoise_enabled;
+    if (ctx.metrics)
+      info.metrics = ctx.metrics->get_snapshot();  // 持 metrics_mutex_
+    result.emplace_back(id, std::move(info));
+  }
+  return result;
+}
+
+NoiseMetricsSnapshot NoiseManager::get_metrics_snapshot(
+    uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return NoiseMetricsSnapshot{};
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end() || !it->second.metrics)
+    return NoiseMetricsSnapshot{};
+  return it->second.metrics->get_snapshot();  // 持 metrics_mutex_
+}
+
+std::vector<NoiseMetricsSnapshot> NoiseManager::get_history_snapshot(
+    uint8_t sensor_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return {};
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end() || !it->second.metrics)
+    return {};
+  auto hist = it->second.metrics->get_history();  // 持 metrics_mutex_
+  return std::vector<NoiseMetricsSnapshot>(hist.begin(), hist.end());
+}
+
 }  // namespace noise

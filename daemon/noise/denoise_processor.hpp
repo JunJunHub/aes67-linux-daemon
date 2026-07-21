@@ -83,6 +83,11 @@ class DenoiseProcessor {
   // 控制线程 housekeeper 定期驱动：释放穿越 ≥2 静止点的旧 slot。
   // 旧插件析构（ONNX session teardown / rnnoise_destroy，毫秒级）在此线程完成。
   void drain_retire();
+  // Spec3 Task 7 path A：控制线程在 capture 线程 join 后调用，转发到当前
+  // 活动 plugin slot 的 reset()。arch §3.7 L862：capture 线程已静止 -> 无
+  // in-flight process() -> 安全清空 plugin 有状态成员（RNNoise DenoiseState
+  // / DTLN LSTM / DF STFT 缓冲）。load rcu_ptr_（publish 的 release 已同步）。
+  void reset_plugin();
 
   std::vector<std::string> list_plugins() const;
 

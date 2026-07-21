@@ -236,7 +236,8 @@ BOOST_AUTO_TEST_CASE(noise_manager_ptp_unlock_skips_processing) {
 
   mgr.on_ptp_unlocked();
   BOOST_CHECK(!mgr.is_ptp_locked_for_test());
-  // #4: on_ptp_unlocked 立即置位 reset_pending_
+  // #4: on_ptp_unlocked 立即置位 reset_pending_（path A：不再用 std::async
+  // 延迟清标志，改由 on_capture_thread_joined 在 capture 线程静止后清）。
   BOOST_CHECK(mgr.is_reset_pending_for_test());
 
   size_t count_before = mgr.stub_call_count_for_test(0);
@@ -246,13 +247,75 @@ BOOST_AUTO_TEST_CASE(noise_manager_ptp_unlock_skips_processing) {
   // #3: process() 未被调用，call_count 未递增
   BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), count_before);
 
-  // #4: async housekeeper 200ms 后清 reset_pending_（250ms 等待留余量，
-  // 此时 future 已完成，析构时 wait() 立即返回，不阻塞）。
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  // path A：reset_pending_ 在 capture 线程 join 前保持置位（无 async 清除）。
+  BOOST_CHECK(mgr.is_reset_pending_for_test());
+  // 模拟 PcmCaptureService join capture 线程后回调 -> 清 reset_pending_。
+  mgr.on_capture_thread_joined_for_test();
   BOOST_CHECK(!mgr.is_reset_pending_for_test());
 }
 
-BOOST_AUTO_TEST_SUITE_END()
+// ── Spec3 Task 7：on_ptp_unlocked path A ─────────────────────────────────
+// arch §3.7 L862：PTP unlock -> PcmCaptureService join capture 线程 ->
+// 控制线程 plugin->reset() per sensor + 清 reset_pending_。单 path A，无 path
+// B。
+BOOST_AUTO_TEST_SUITE(noise_ptp_path_a_tests)
+
+// path A：PTP unlock 后，模拟 capture 线程 join -> plugin->reset() 被调用 +
+// reset_pending_ 清除。
+BOOST_AUTO_TEST_CASE(ptp_unlock_triggers_plugin_reset_after_join) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  mgr.add_sensor(0, 0, cfg);
+  mgr.switch_plugin(0, "passthrough");
+  // PTP unlock
+  mgr.on_ptp_unlocked();
+  BOOST_CHECK(!mgr.is_ptp_locked_for_test());
+  // path A: 模拟 capture 线程静止（join）-> plugin reset 被调
+  mgr.on_capture_thread_joined_for_test();
+  BOOST_CHECK_GT(mgr.plugin_reset_count_for_test(0), 0u);
+  // reset 后 reset_pending_ 清
+  BOOST_CHECK(!mgr.is_reset_pending_for_test());
+}
+
+// path A：PTP unlock 后 on_frame 跳过 process（ptp_locked_=false），
+// reset 未执行前 reset_pending_ 保持置位（无 path B 轮询清除）。
+BOOST_AUTO_TEST_CASE(ptp_unlock_no_concurrent_process) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.on_ptp_unlocked();
+  float in[480] = {
+      0};  // 静音帧（与 noise_manager_ptp_unlock_skips_processing 同模式）
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);  // 跳过 process
+  mgr.on_period_end();
+  // reset 未执行（capture 未 join）-> reset_pending_ 保持置位
+  BOOST_CHECK(mgr.is_reset_pending_for_test());
+}
+
+// path A：reset 恰好一次 per sensor（不重复、不遗漏）。
+BOOST_AUTO_TEST_CASE(ptp_unlock_reset_exactly_once_per_sensor) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  mgr.add_sensor(0, 0, cfg);
+  mgr.add_sensor(1, 1, cfg);
+  mgr.on_ptp_unlocked();
+  mgr.on_capture_thread_joined_for_test();
+  BOOST_CHECK_EQUAL(mgr.plugin_reset_count_for_test(0), 1u);
+  BOOST_CHECK_EQUAL(mgr.plugin_reset_count_for_test(1), 1u);
+  // 重复调用 on_capture_thread_joined 不重复 reset（reset_pending_ 已清，
+  // 第二次 no-op）。
+  mgr.on_capture_thread_joined_for_test();
+  BOOST_CHECK_EQUAL(mgr.plugin_reset_count_for_test(0), 1u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()  // noise_ptp_path_a_tests
+
+BOOST_AUTO_TEST_SUITE_END()  // noise_manager_tests
 
 #include "noise_detector.hpp"
 #include "vad.hpp"

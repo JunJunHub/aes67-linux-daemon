@@ -7,7 +7,6 @@
 #define NOISE_NOISE_MANAGER_HPP_
 
 #include <atomic>
-#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -78,6 +77,11 @@ struct SensorContext {
   // atomic<size_t>: on_frame 写 (capture 线程) + stub_call_count_for_test 读
   // (控制线程) 跨线程，atomic 保证可见性且无数据竞争。
   mutable std::shared_ptr<std::atomic<size_t>> frame_count;
+  // Spec3 Task 7 path A：plugin->reset() 累计调用次数（控制线程写 +
+  // plugin_reset_count_for_test 读，跨线程但同 atomic）。
+  // shared_ptr 包裹理由同 frame_count：COW 表复制后旧/新表共享同一计数器，
+  // test 读新表可见控制线程在 on_capture_thread_joined 的递增。
+  mutable std::shared_ptr<std::atomic<size_t>> reset_count;
 };
 
 // 不可变 sensor 表：控制线程建新表原子换，RT 线程周期顶部 load 快照。
@@ -136,10 +140,17 @@ class NoiseManager {
   //   再 pinned_table_ = nullptr + sensor_table_.advance_epoch()。
   void on_period_end();
 
-  // PTP 失锁联动：置 ptp_locked_=false + reset_pending_=true，
-  // housekeeper 延迟 200ms 后清 reset_pending_。
-  // Task 7 替换为真实 plugin->reset() + PcmCaptureService join（Spec3）。
+  // PTP 失锁联动（arch §3.7 L862 path A，Spec3 Task 7 替 Spec2 std::async
+  // stub）。 仅置 ptp_locked_=false + reset_pending_=true（均 atomic，无锁）。
+  // 不直接调 plugin->reset()（会与 RT process() 竞态）。真实 reset 由
+  // on_capture_thread_joined() 在 PcmCaptureService join capture 线程后调用。
   void on_ptp_unlocked();
+  // path A gate：PcmCaptureService 在 PTP unlock 时 snd_pcm_drop+close+join
+  // capture 线程后回调本方法（控制线程）。capture 线程已静止 -> 无 in-flight
+  // process() -> 安全 per-sensor plugin->reset() + 清 reset_pending_。
+  // reset_pending_=false 时 no-op（避免重复 reset）。#ifdef _USE_NOISE_
+  // 外不可用。
+  void on_capture_thread_joined();
 
   // 测试钩子（spec §D 接受此模式）
   size_t sensor_count_for_test() const;
@@ -147,9 +158,16 @@ class NoiseManager {
   // #2: ptp_locked_ 默认 false（arch §3.7 L855 安全默认），测试显式置位模拟
   // PTP 锁定。生产环境由 bridge 回调管理（Spec3 wiring）。
   void set_ptp_locked_for_test(bool locked) { ptp_locked_.store(locked); }
-  // #4: 观察 reset_pending_ 状态（on_ptp_unlocked 置位，housekeeper 200ms
-  // 后清）。
+  // #4: 观察 reset_pending_ 状态（on_ptp_unlocked 置位，
+  // on_capture_thread_joined 清）。
   bool is_reset_pending_for_test() const { return reset_pending_.load(); }
+  // Spec3 Task 7 path A 测试钩子：模拟 PcmCaptureService join capture 线程后
+  // 回调。生产环境由 PcmCaptureService::on_ptp_status_change("unlocked") 路径
+  // 在 stop_capture() join 后调用 on_capture_thread_joined()。
+  void on_capture_thread_joined_for_test() { on_capture_thread_joined(); }
+  // Spec3 Task 7 path A 测试钩子：返回 sensor 的 plugin->reset() 累计调用次数。
+  // 未找到 sensor 返回 0。
+  size_t plugin_reset_count_for_test(uint8_t sensor_id) const;
   // #3: 读取指定 sensor 的 on_frame 调用次数。
   // Task 7 真实处理器无 StubProcessor.call_count，改用
   // SensorContext.frame_count （on_frame 内递增）。保留 Task 1
@@ -227,7 +245,6 @@ class NoiseManager {
   // arch §3.7 L855：安全默认 false（假设未锁，直到 PTP 回调确认锁定）。
   std::atomic<bool> ptp_locked_{false};
   std::atomic<bool> reset_pending_{false};
-  std::future<void> reset_future_;  // 持有 housekeeper async 任务
   // Spec3 Task 4：持久化文件路径（arch §7.6）。
   // 空字符串禁用 save_status（no-op）。由 Config::noise_status_file_ 注入
   // （T6 wiring）或 set_status_file_for_test 设置。

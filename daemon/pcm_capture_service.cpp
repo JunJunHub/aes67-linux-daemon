@@ -135,10 +135,21 @@ bool PcmCaptureService::on_ptp_status_change(const std::string& status) {
   if (status == "locked") {
     return start_capture();
   } else if (status == "unlocked") {
-    return stop_capture();
+    // arch §3.7 L862 path A：stop_capture join capture 线程后通知
+    // NoiseManager 执行 plugin->reset()（经 capture_joined_cb_ 回调）。
+    bool ok = stop_capture();
+    if (capture_joined_cb_)
+      capture_joined_cb_();
+    return ok;
   }
   return true;
 #endif
+}
+
+void PcmCaptureService::set_capture_joined_callback(CaptureJoinedCallback cb) {
+  // init-only：运行期不再改，避免 std::function 读写竞态（同
+  // DenoiseProcessor::set_latency_change_cb 模式）。
+  capture_joined_cb_ = std::move(cb);
 }
 
 bool PcmCaptureService::on_sink_add(uint8_t /*id*/) {

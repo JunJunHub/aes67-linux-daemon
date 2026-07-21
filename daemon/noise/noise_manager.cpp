@@ -24,12 +24,7 @@ namespace noise {
 
 NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {}
 
-NoiseManager::~NoiseManager() {
-  // 等待 housekeeper async 任务完成，避免 use-after-free（任务捕获 this）。
-  if (reset_future_.valid()) {
-    reset_future_.wait();
-  }
-}
+NoiseManager::~NoiseManager() = default;
 
 bool NoiseManager::add_sensor(uint8_t sensor_id,
                               uint8_t sink_id,
@@ -66,6 +61,9 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   // 新表）。与 detector/analyzer 等 shared_ptr 成员同语义。
   ctx.last_analysis = std::make_shared<NoiseAnalysisResult>();
   ctx.frame_count = std::make_shared<std::atomic<size_t>>(0);
+  // Spec3 Task 7 path A：plugin reset 计数（控制线程 on_capture_thread_joined
+  // 写，plugin_reset_count_for_test 读，shared_ptr 跨 COW 表共享）。
+  ctx.reset_count = std::make_shared<std::atomic<size_t>>(0);
   // Spec3 Task 4：保存原始 cfg 供 save_status 序列化（arch §7.4）。
   ctx.cfg = cfg;
 
@@ -279,17 +277,44 @@ void NoiseManager::on_period_end() {
 }
 
 void NoiseManager::on_ptp_unlocked() {
-  // 不直接调 plugin->reset()（会与 RT process() 竞态）。
-  // 置位后由 housekeeper 延迟 reset（arch §3.7 L862）。
+  // arch §3.7 L862 path A：仅置标志，不直接调 plugin->reset()（会与 RT
+  // process() 竞态）。真实 reset 由 on_capture_thread_joined() 在
+  // PcmCaptureService join capture 线程后调用（capture 线程静止 -> 无 in-flight
+  // process()）。 不设 path B（arch L862：SCHED_OTHER 下 RT 线程可能被抢占在
+  // process 中途 致 epoch 不推进，path B 或 livelock 或与停滞 process 竞态）。
   ptp_locked_.store(false);
   reset_pending_.store(true);
-  // Task 7 简化：仍用延迟清标志（真实 plugin->reset() + PcmCaptureService
-  // join 在 Spec3 path A 实装）。#5: 重复 on_ptp_unlocked() 会阻塞 <=200ms
-  // （旧 future 析构等待）。Task 7 改为独立 housekeeper 线程（Spec3）。
-  reset_future_ = std::async(std::launch::async, [this]() {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    reset_pending_.store(false);
-  });
+}
+
+void NoiseManager::on_capture_thread_joined() {
+  // arch §3.7 L862 path A gate：PcmCaptureService 在 PTP unlock 时
+  // snd_pcm_drop+close+join capture 线程后回调本方法（控制线程）。
+  // 前置条件（由调用方保证）：capture 线程已 join，不再调 on_frame -> 无
+  // in-flight process() -> 安全 reset plugin 有状态成员（RNNoise
+  // DenoiseState / DTLN LSTM / DF STFT 缓冲）。
+  //
+  // reset_pending_=false 时 no-op：避免 PcmCaptureService 在非 PTP-unlock
+  // 路径的 stop_capture（如 terminate）误触发 reset，也避免重复 reset。
+  if (!reset_pending_.load())
+    return;
+  // 控制线程遍历当前 sensor 表（RCU load，安全）。每个 sensor 的 denoise
+  // processor 经 RcuPtr<PluginSlot> load 当前 plugin -> reset()。
+  // plugin->reset() 实现须仅清内部状态（不分配/不释放，RT-safe 契约），
+  // 控制线程调用安全。
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl != nullptr) {
+    for (auto& [id, ctx] : *tbl) {
+      (void)id;
+      if (ctx.denoise) {
+        // DenoiseProcessor 暴露 reset() 转发到当前 plugin slot（控制线程
+        // load rcu_ptr_，安全）。
+        ctx.denoise->reset_plugin();
+        if (ctx.reset_count)
+          ctx.reset_count->fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+  reset_pending_.store(false);
 }
 
 size_t NoiseManager::sensor_count_for_test() const {
@@ -308,6 +333,18 @@ size_t NoiseManager::stub_call_count_for_test(uint8_t sensor_id) const {
   // 保留 Task 1 方法名以兼容既有测试。
   const auto& fc = it->second.frame_count;
   return fc ? fc->load(std::memory_order_relaxed) : 0;
+}
+
+size_t NoiseManager::plugin_reset_count_for_test(uint8_t sensor_id) const {
+  // Spec3 Task 7 path A：返回 sensor 的 plugin->reset() 累计调用次数。
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return 0;
+  auto it = tbl->find(sensor_id);
+  if (it == tbl->end())
+    return 0;
+  const auto& rc = it->second.reset_count;
+  return rc ? rc->load(std::memory_order_relaxed) : 0;
 }
 
 NoiseAnalysisResult NoiseManager::get_analysis_result_for_test(

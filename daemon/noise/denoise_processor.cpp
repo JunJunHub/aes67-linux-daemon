@@ -147,6 +147,16 @@ void DenoiseProcessor::drain_retire() {
   retire_list_.reclaim_older_than(rcu_ptr_.epoch());
 }
 
+void DenoiseProcessor::reset_plugin() {
+  // Spec3 Task 7 path A：控制线程在 capture 线程 join 后调用。
+  // load rcu_ptr_（publish 的 release 已同步），转发到当前活动 plugin。
+  // 前置条件（由调用方 NoiseManager::on_capture_thread_joined 保证）：
+  // capture 线程已静止，无 in-flight process() -> 安全 reset 有状态成员。
+  PluginSlot* slot = rcu_ptr_.load();
+  if (slot && slot->plugin)
+    slot->plugin->reset();
+}
+
 std::vector<std::string> DenoiseProcessor::list_plugins() const {
   return DenoisePluginRegistry::instance().list();
 }

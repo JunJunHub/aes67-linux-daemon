@@ -33,6 +33,12 @@ class PcmCaptureService
                                            uint8_t channels,
                                            uint32_t sample_rate)>;
   using ProviderToken = uint32_t;
+  // Spec3 Task 7 path A：capture 线程 join 后回调（控制线程）。PTP unlock ->
+  // stop_capture() snd_pcm_drop+close+join capture 线程 -> 本回调 ->
+  // NoiseManager::on_capture_thread_joined()（arch §3.7 L862）。
+  // 调用方（T6 装配）负责把回调路由到 NoiseManager。FAKE_DRIVER 下
+  // stop_capture 同样 join fake_capture_loop，回调语义一致。
+  using CaptureJoinedCallback = std::function<void()>;
 
   static std::shared_ptr<PcmCaptureService> create(
       std::shared_ptr<SessionManager> session_manager,
@@ -40,6 +46,9 @@ class PcmCaptureService
 
   bool init();  // 注册 PTP observer + Sink observer
   bool terminate();
+  // Spec3 Task 7 path A：注册 capture 线程 join 后回调。init-only（运行期不改，
+  // 避免 std::function 读写竞态）。
+  void set_capture_joined_callback(CaptureJoinedCallback cb);
 
   ProviderToken register_provider(FrameProvider provider);
   void unregister_provider(ProviderToken token);
@@ -101,6 +110,8 @@ class PcmCaptureService
   noise::RcuPtr<std::vector<ProviderEntry>> providers_;
   std::atomic<ProviderToken> next_token_{1};
   noise::RetireQueue<std::vector<ProviderEntry>> providers_retire_;
+  // Spec3 Task 7 path A：capture 线程 join 后回调（init-only，运行期不改）。
+  CaptureJoinedCallback capture_joined_cb_;
   // 测试用 fake 参数
   uint32_t test_rate_{48000};
   uint8_t test_channels_{2};

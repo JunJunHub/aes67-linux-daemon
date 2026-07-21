@@ -465,3 +465,44 @@ BOOST_AUTO_TEST_CASE(non_hum_tone_not_classified_hum) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#include "noise_template_db.hpp"
+#include <array>
+
+// Spec2 1.8 NoiseTemplateDB：L2 模板匹配 - Bark 32 频带 + 余弦相似度。
+// Per task-6-brief + resolution #1：测试中 NoiseTemplateDB 需 noise::
+// 命名空间限定。
+BOOST_AUTO_TEST_SUITE(template_db_tests)
+
+BOOST_AUTO_TEST_CASE(add_match_remove_template) {
+  noise::NoiseTemplateDB db;
+  std::array<float, 32> feat{};
+  for (auto& f : feat)
+    f = 0.5f;
+  auto id = db.add_template("空调噪声", feat);
+  BOOST_CHECK_GT(id, 0u);
+  // 匹配：相同特征 -> 相似度 1.0
+  auto [match_id, sim] = db.match(feat);
+  BOOST_CHECK_EQUAL(match_id, id);
+  BOOST_CHECK_GT(sim, 0.9f);
+  // 不匹配：正交特征
+  std::array<float, 32> diff{};
+  diff[0] = 1.0f;
+  auto [mid2, sim2] = db.match(diff);
+  BOOST_CHECK_LT(sim2, 0.5f);
+  // 删除
+  BOOST_CHECK(db.remove_template(id));
+  auto [mid3, sim3] = db.match(feat);
+  BOOST_CHECK_EQUAL(mid3, 0u);  // 无匹配
+}
+
+BOOST_AUTO_TEST_CASE(list_templates) {
+  noise::NoiseTemplateDB db;
+  std::array<float, 32> f{};
+  db.add_template("风扇", f);
+  db.add_template("空调", f);
+  auto list = db.list_templates();
+  BOOST_CHECK_EQUAL(list.size(), 2u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

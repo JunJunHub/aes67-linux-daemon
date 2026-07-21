@@ -64,6 +64,14 @@ class Config {
   const std::string& get_syslog_proto() const { return syslog_proto_; };
   const std::string& get_syslog_server() const { return syslog_server_; };
   const std::string& get_status_file() const { return status_file_; };
+  // Spec3 Task 4：噪声持久化字段（arch §7.3）。
+  const std::string& get_noise_status_file() const {
+    return noise_status_file_;
+  };
+  const std::string& get_noise_template_dir() const {
+    return noise_template_dir_;
+  };
+  const std::string& get_fake_pcm_source() const { return fake_pcm_source_; };
   const std::string& get_interface_name() const { return interface_name_; };
   const std::string& get_interface_name(uint8_t idx) const {
     static const std::string empty = "";
@@ -149,6 +157,16 @@ class Config {
   void set_status_file(std::string_view status_file) {
     status_file_ = status_file;
   };
+  // Spec3 Task 4：噪声持久化字段 setter（arch §7.3）。
+  void set_noise_status_file(std::string_view noise_status_file) {
+    noise_status_file_ = noise_status_file;
+  };
+  void set_noise_template_dir(std::string_view noise_template_dir) {
+    noise_template_dir_ = noise_template_dir;
+  };
+  void set_fake_pcm_source(std::string_view fake_pcm_source) {
+    fake_pcm_source_ = fake_pcm_source;
+  };
   void set_interface_name(std::string_view interface_name) {
     interface_name_ = interface_name;
   };
@@ -199,6 +217,9 @@ class Config {
            lhs.get_syslog_proto() != rhs.get_syslog_proto() ||
            lhs.get_syslog_server() != rhs.get_syslog_server() ||
            lhs.get_status_file() != rhs.get_status_file() ||
+           lhs.get_noise_status_file() != rhs.get_noise_status_file() ||
+           lhs.get_noise_template_dir() != rhs.get_noise_template_dir() ||
+           lhs.get_fake_pcm_source() != rhs.get_fake_pcm_source() ||
            lhs.get_interface_name() != rhs.get_interface_name() ||
            lhs.get_mdns_enabled() != rhs.get_mdns_enabled() ||
            lhs.get_auto_sinks_update() != rhs.get_auto_sinks_update() ||
@@ -235,6 +256,13 @@ class Config {
   std::string syslog_proto_{""};
   std::string syslog_server_{""};
   std::string status_file_{"./status.json"};
+  // Spec3 Task 4：噪声持久化字段（arch §7.3）。
+  // 空字符串禁用对应持久化（save_status / TemplateDB::save 为 no-op）。
+  std::string noise_status_file_{"./noise_status.json"};
+  std::string noise_template_dir_{"./noise_templates"};
+  // FAKE_DRIVER 专用：PcmCaptureService::fake_capture_loop 替代 PCM 数据源。
+  // 空字符串=内置静音帧。仅 FAKE_DRIVER 生效，真实模式忽略。
+  std::string fake_pcm_source_{""};
   std::string interface_name_{"eth0"};
   std::vector<std::string> interfaces_;
   bool mdns_enabled_{true};

@@ -881,3 +881,75 @@ BOOST_AUTO_TEST_CASE(concurrent_metrics_read_while_collect) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Spec3 Task 4: 数据持久化 - noise_status.json + noise_templates + Config 字段
+// + 原子写。架构依据：docs/noise/architecture-design.md §7.1-§7.6。
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+
+#include "config.hpp"
+#include "noise/noise_status.hpp"
+#include "noise/noise_template_db.hpp"
+
+BOOST_AUTO_TEST_SUITE(noise_persistence_tests)
+
+// sensor 配置 roundtrip：add_sensor -> save -> load -> sensor_count > 0。
+// 验证 NoiseManager::save_status / load_status + write_atomic 原子写。
+BOOST_AUTO_TEST_CASE(sensor_config_roundtrip) {
+  const char* f = "test_noise_status.json";
+  std::remove(f);  // 测试清理（非 shell rm 禁令范围）
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 5, noise::NoiseSensorConfig{});
+  mgr.set_status_file_for_test(f);
+  BOOST_CHECK(mgr.save_status());
+  // 新 manager 加载
+  NoiseAudioBridgeStub bridge2;
+  noise::NoiseManager mgr2(bridge2);
+  mgr2.set_status_file_for_test(f);
+  BOOST_CHECK(mgr2.load_status(f, ""));
+  BOOST_CHECK_GT(mgr2.sensor_count_for_test(), 0);
+  std::remove(f);  // 清理
+}
+
+// 模板 roundtrip：add_template -> save -> load -> list_templates.size==1。
+// 验证 NoiseTemplateDB::save / load + JSON 序列化。
+BOOST_AUTO_TEST_CASE(template_roundtrip) {
+  const char* d = "test_noise_templates";
+  std::filesystem::remove_all(d);  // 测试清理
+  noise::NoiseTemplateDB db;
+  std::array<float, 32> feat{};
+  for (auto& x : feat)
+    x = 0.5f;
+  db.add_template("test", feat);
+  db.set_dir_for_test(d);
+  BOOST_CHECK(db.save(d));
+  noise::NoiseTemplateDB db2;
+  BOOST_CHECK(db2.load(d));
+  auto list = db2.list_templates();
+  BOOST_CHECK_EQUAL(list.size(), 1u);
+  std::filesystem::remove_all(d);
+}
+
+// Config 3 新字段：默认值 + setter/getter。
+BOOST_AUTO_TEST_CASE(config_has_noise_fields) {
+  Config c;
+  BOOST_CHECK(!c.get_noise_status_file().empty());  // 默认 ./noise_status.json
+  BOOST_CHECK(!c.get_noise_template_dir().empty());  // 默认 ./noise_templates
+  c.set_fake_pcm_source("/tmp/test.wav");
+  BOOST_CHECK_EQUAL(c.get_fake_pcm_source(), "/tmp/test.wav");
+}
+
+// write_atomic：tmp + rename，输出完整 JSON。
+BOOST_AUTO_TEST_CASE(atomic_write_no_halfwrite) {
+  const char* f = "test_atomic.json";
+  noise::write_atomic(f, R"({"sensors":[]})");
+  std::ifstream in(f);
+  std::string s((std::istreambuf_iterator<char>(in)), {});
+  BOOST_CHECK(s.find("\"sensors\"") != std::string::npos);
+  std::remove(f);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -102,7 +102,13 @@ std::string config_to_json(const Config& config) {
      << "\"" << ",\n  \"syslog_server\": \""
      << escape_json(config.get_syslog_server()) << "\""
      << ",\n  \"status_file\": \"" << escape_json(config.get_status_file())
-     << "\"" << ",\n  \"interface_name\": \""
+     << "\"" << ",\n  \"noise_status_file\": \""
+     << escape_json(config.get_noise_status_file()) << "\""
+     << ",\n  \"noise_template_dir\": \""
+     << escape_json(config.get_noise_template_dir()) << "\""
+     << ",\n  \"fake_pcm_source\": \""
+     << escape_json(config.get_fake_pcm_source()) << "\""
+     << ",\n  \"interface_name\": \""
      << escape_json(config.get_interface_name()) << "\""
      << ",\n  \"mdns_enabled\": " << std::boolalpha << config.get_mdns_enabled()
      << ",\n  \"custom_node_id\": \""
@@ -364,6 +370,15 @@ Config json_to_config_(std::istream& js, Config& config) {
         config.set_mdns_enabled(val.get_value<bool>());
       } else if (key == "status_file") {
         config.set_status_file(
+            remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "noise_status_file") {
+        config.set_noise_status_file(
+            remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "noise_template_dir") {
+        config.set_noise_template_dir(
+            remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "fake_pcm_source") {
+        config.set_fake_pcm_source(
             remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "syslog_proto") {
         config.set_syslog_proto(

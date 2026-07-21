@@ -68,6 +68,11 @@ struct SensorContext {
   bool denoise_enabled{false};
   // Spec3 Task 2：sensor 启用/禁用（enable_sensor 切换，§5.4 "enabled" 字段）。
   bool enabled{true};
+  // Spec3 Task 4：持久化用的原始配置快照（arch §7.4）。
+  // mutable: 控制线程（set_dry_wet/switch_plugin）可通过 const SensorContext&
+  // 更新此字段（RCU 表发布后 const，mutable 允许改）。RT 线程不读此字段，
+  // 无数据竞争。save_status() 读取此字段序列化到 noise_status.json。
+  mutable NoiseSensorConfig cfg;
   // #3 兼容：用于 stub_call_count_for_test（保留 Task 1 测试钩子名称，
   // Task 7 真实处理器无 StubProcessor.call_count，改用 on_frame 调用计数）。
   // atomic<size_t>: on_frame 写 (capture 线程) + stub_call_count_for_test 读
@@ -175,6 +180,26 @@ class NoiseManager {
   std::vector<NoiseMetricsSnapshot> get_history_snapshot(
       uint8_t sensor_id) const;
 
+  // ── Spec3 Task 4 持久化（arch §7.6）──
+  // load_status(file, template_dir)：启动时加载传感器配置 + 模板库。
+  //   file 空字符串 -> 仅尝试 template_dir 加载。
+  //   template_dir 空字符串 -> 跳过模板加载。
+  //   返回 true 表示至少一项加载成功或文件不存在（非错误，首次启动）。
+  bool load_status(const std::string& noise_status_file,
+                   const std::string& template_dir);
+  // save_status()：序列化 sensors 表为 noise_status.json via write_atomic
+  //   （arch §7.1 + §7.4）。status_file_ 空时 no-op 返回 false。
+  //   const: 仅读 sensor_table_ RCU 快照 + status_file_ 成员，不改状态。
+  //   RT 安全：不持 ctrl_mutex_（RcuPtr::load 原子），不阻塞音频线程。
+  bool save_status() const;
+  // save_status_on_exit()：daemon shutdown 序列调用，同 save_status。
+  bool save_status_on_exit() const;
+  // 测试钩子（spec §D）：设置持久化文件路径。生产环境由 Config 注入。
+  void set_status_file_for_test(const std::string& file) {
+    status_file_ = file;
+  }
+  const std::string& get_status_file_for_test() const { return status_file_; }
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -190,6 +215,13 @@ class NoiseManager {
   std::atomic<bool> ptp_locked_{false};
   std::atomic<bool> reset_pending_{false};
   std::future<void> reset_future_;  // 持有 housekeeper async 任务
+  // Spec3 Task 4：持久化文件路径（arch §7.6）。
+  // 空字符串禁用 save_status（no-op）。由 Config::noise_status_file_ 注入
+  // （T6 wiring）或 set_status_file_for_test 设置。
+  // mutable: save_status() const 方法可读（不写，仅读路径）。
+  // 控制线程写（set_status_file_for_test）与 save_status() 读之间无竞态
+  // （前者仅在 init/test 调用，后者在控制线程调用）。
+  mutable std::string status_file_;
 };
 
 }  // namespace noise

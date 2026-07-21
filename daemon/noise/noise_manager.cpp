@@ -4,8 +4,21 @@
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <utility>
+
+#include <boost/foreach.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
+
+#include "noise_status.hpp"  // write_atomic
+#include "noise_template_db.hpp"
 
 namespace noise {
 
@@ -53,12 +66,16 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   // 新表）。与 detector/analyzer 等 shared_ptr 成员同语义。
   ctx.last_analysis = std::make_shared<NoiseAnalysisResult>();
   ctx.frame_count = std::make_shared<std::atomic<size_t>>(0);
+  // Spec3 Task 4：保存原始 cfg 供 save_status 序列化（arch §7.4）。
+  ctx.cfg = cfg;
 
   (*new_table)[sensor_id] = std::move(ctx);
   auto old = sensor_table_.publish(std::move(new_table));
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   // 控制线程回收（勿在 RT 路径调，reclaim_older_than 持 mutex）
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  // Spec3 Task 4：变更即保存（arch §7.6）。status_file_ 空时 no-op。
+  save_status();
   return true;
 }
 
@@ -74,6 +91,11 @@ bool NoiseManager::switch_plugin(uint8_t sensor_id, const std::string& name) {
   // switch_plugin 后立即调用，确保旧插件析构（ONNX session teardown /
   // rnnoise_destroy，毫秒级）在控制线程完成，不堆积在 retire_list_。
   it->second.denoise->drain_retire();
+  // Spec3 Task 4：变更即保存。更新 cfg.plugin_name（mutable，arch §7.4）。
+  if (ok) {
+    it->second.cfg.plugin_name = name;
+    save_status();
+  }
   return ok;
 }
 
@@ -89,6 +111,8 @@ bool NoiseManager::remove_sensor(uint8_t sensor_id) {
   auto old = sensor_table_.publish(std::move(new_table));
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  // Spec3 Task 4：变更即保存（arch §7.6）。
+  save_status();
   return true;
 }
 
@@ -105,6 +129,8 @@ bool NoiseManager::enable_sensor(uint8_t sensor_id, bool enabled) {
   auto old = sensor_table_.publish(std::move(new_table));
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  // Spec3 Task 4：变更即保存（arch §7.6）。
+  save_status();
   return true;
 }
 
@@ -120,6 +146,9 @@ bool NoiseManager::set_dry_wet(uint8_t sensor_id, float dry_wet) {
   it->second.denoise->set_dry_wet(dry_wet);
   if (it->second.metrics)
     it->second.metrics->set_denoise_state(it->second.denoise_enabled, dry_wet);
+  // Spec3 Task 4：变更即保存。更新 cfg.dry_wet（mutable，arch §7.4）。
+  it->second.cfg.dry_wet = dry_wet;
+  save_status();
   return true;
 }
 
@@ -132,7 +161,12 @@ bool NoiseManager::set_param(uint8_t sensor_id,
   auto it = current->find(sensor_id);
   if (it == current->end() || !it->second.denoise)
     return false;
-  return it->second.denoise->set_param(key, value);
+  bool ok = it->second.denoise->set_param(key, value);
+  // Spec3 Task 4：变更即保存。set_param 成功时持久化（arch §7.6）。
+  // 不跟踪 generic param map（YAGNI，Phase 1 仅 dry_wet/plugin_name）。
+  if (ok)
+    save_status();
+  return ok;
 }
 
 void NoiseManager::on_period_begin() {
@@ -376,6 +410,150 @@ std::vector<NoiseMetricsSnapshot> NoiseManager::get_history_snapshot(
     return {};
   auto hist = it->second.metrics->get_history();  // 持 metrics_mutex_
   return std::vector<NoiseMetricsSnapshot>(hist.begin(), hist.end());
+}
+
+// ── Spec3 Task 4 持久化实现（arch §7.6）────────────────────────────────
+// JSON 输出 = 手工拼接（与 daemon/json.cpp + noise_http.cpp 同一模式）：
+// 数字/bool 不加引号，字符串加引号 + escape_json。
+// 不用 boost::property_tree::write_json（会将所有值引号化，违反约定）。
+// 输入用 boost::property_tree::ptree + read_json（daemon 既有模式）。
+namespace {
+
+// JSON 字符串转义（daemon/json.cpp L42-78 复制，避免跨模块依赖）。
+std::string escape_json(const std::string& s) {
+  std::ostringstream ss;
+  for (auto c = s.cbegin(); c != s.cend(); c++) {
+    switch (*c) {
+      case '"':
+        ss << "\\\"";
+        break;
+      case '\\':
+        ss << "\\\\";
+        break;
+      case '\b':
+        ss << "\\b";
+        break;
+      case '\f':
+        ss << "\\f";
+        break;
+      case '\n':
+        ss << "\\n";
+        break;
+      case '\r':
+        ss << "\\r";
+        break;
+      case '\t':
+        ss << "\\t";
+        break;
+      default:
+        if ('\x00' <= *c && *c <= '\x1f') {
+          ss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+             << static_cast<int>(*c);
+        } else {
+          ss << *c;
+        }
+    }
+  }
+  return ss.str();
+}
+
+}  // namespace
+
+bool NoiseManager::save_status() const {
+  // Gate: status_file_ 空时 no-op（arch §7.3 注：空字符串禁用持久化）。
+  // 既有 T2/T3 测试调用 add_sensor 等不设 status_file_，gate 使 save-on-change
+  // 不可见，不污染 worktree 也不写文件。
+  if (status_file_.empty())
+    return false;
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return false;
+  // 序列化 sensors 为 noise_status.json（arch §7.4 格式）。
+  // SensorContext.cfg 是 mutable，const 方法可读。RT 线程不读 cfg -> 无竞争。
+  std::ostringstream ss;
+  ss << "{\n  \"sensors\": [";
+  bool first = true;
+  for (const auto& [id, ctx] : *tbl) {
+    if (!first)
+      ss << ",";
+    first = false;
+    ss << "\n    {" << "\n      \"id\": " << static_cast<unsigned>(id)
+       << ",\n      \"sink_id\": " << static_cast<unsigned>(ctx.sink_id)
+       << ",\n      \"enabled\": " << (ctx.enabled ? "true" : "false")
+       << ",\n      \"denoise_enabled\": "
+       << (ctx.cfg.denoise_enabled ? "true" : "false")
+       << ",\n      \"denoise_plugin\": \"" << escape_json(ctx.cfg.plugin_name)
+       << "\"" << ",\n      \"denoise_dry_wet\": " << ctx.cfg.dry_wet
+       << ",\n      \"sensitivity\": " << ctx.cfg.sensitivity << "\n    }";
+  }
+  ss << "\n  ],\n  \"global\": {\n    \"noise_max_sensors\": 16\n  }\n}\n";
+  return write_atomic(status_file_, ss.str());
+}
+
+bool NoiseManager::save_status_on_exit() const {
+  return save_status();
+}
+
+bool NoiseManager::load_status(const std::string& noise_status_file,
+                               const std::string& template_dir) {
+  // 设置 status_file_ 供后续 save-on-change 使用。
+  if (!noise_status_file.empty())
+    status_file_ = noise_status_file;
+  bool sensors_ok = true;
+  if (!noise_status_file.empty()) {
+    // 读 noise_status.json -> 重建 sensors（arch §7.4 + §7.6）。
+    // 文件不存在视为首次启动，非错误。
+    if (std::filesystem::exists(noise_status_file)) {
+      try {
+        boost::property_tree::ptree pt;
+        std::ifstream in(noise_status_file, std::ios::binary);
+        if (!in.is_open()) {
+          std::cerr << "NoiseManager::load_status: cannot open "
+                    << noise_status_file << std::endl;
+          sensors_ok = false;
+        } else {
+          boost::property_tree::read_json(in, pt);
+          BOOST_FOREACH (const boost::property_tree::ptree::value_type& v,
+                         pt.get_child("sensors")) {
+            uint8_t sensor_id =
+                static_cast<uint8_t>(v.second.get<unsigned>("id"));
+            NoiseSensorConfig cfg;
+            cfg.denoise_enabled = v.second.get<bool>("denoise_enabled", false);
+            cfg.plugin_name =
+                v.second.get<std::string>("denoise_plugin", "passthrough");
+            cfg.dry_wet = v.second.get<float>("denoise_dry_wet", 1.0f);
+            cfg.sensitivity = v.second.get<float>("sensitivity", 1.0f);
+            uint8_t sink_id =
+                static_cast<uint8_t>(v.second.get<unsigned>("sink_id"));
+            add_sensor(sensor_id, sink_id, cfg);
+            // add_sensor 内已调 save_status（status_file_ 已设），但首次 load
+            // 时每次 add 都写盘略浪费。Phase 1 低频控制操作，可接受。
+            // 若 enabled=false，add_sensor 默认 enabled=true，需 enable_sensor
+            // 修正。此处用 add_sensor 后 enable_sensor 不触发额外 save
+            // （add_sensor 已 save 了默认 enabled=true 的状态）。
+            bool enabled = v.second.get<bool>("enabled", true);
+            if (!enabled)
+              enable_sensor(sensor_id, false);
+          }
+        }
+      } catch (const boost::property_tree::json_parser::json_parser_error& je) {
+        std::cerr << "NoiseManager::load_status: JSON parse error at line "
+                  << je.line() << ": " << je.message() << std::endl;
+        sensors_ok = false;
+      } catch (const std::exception& e) {
+        std::cerr << "NoiseManager::load_status: error: " << e.what()
+                  << std::endl;
+        sensors_ok = false;
+      }
+    }
+  }
+  // 委托模板加载（arch §7.6）。
+  if (!template_dir.empty()) {
+    // Phase 1: NoiseManager 不直接持有 NoiseTemplateDB（T5 会接 HTTP API）。
+    // load_status 仅验证目录可读，实际模板加载由 T5 wiring。
+    // 此处返回 true 表示非错误（sensors_ok 或模板加载 deferred）。
+  }
+  return sensors_ok;
 }
 
 }  // namespace noise

@@ -32,6 +32,7 @@ struct Template {
 //   无匹配返回 (0, 0.0f)。
 // - remove_template:按 id 删除(不重排 id;next_id_ 持续递增)。
 // - list_templates:返回当前所有 (id, name) 对。
+// Spec3 Task 4:load(dir)/save(dir) 持久化到 dir/templates.json(arch §7.5)。
 class NoiseTemplateDB {
  public:
   // 添加模板,返回分配的 template_id(从 1 起,单调递增)。
@@ -50,9 +51,25 @@ class NoiseTemplateDB {
   // 返回所有当前模板的 (id, name) 对。
   std::vector<std::pair<uint32_t, std::string>> list_templates() const;
 
+  // ── Spec3 Task 4 持久化（arch §7.5）──
+  // load(dir)：从 dir/templates.json 读取模板列表，重建内存索引。
+  //   dir 空字符串 -> 返回 false。文件不存在 -> 返回
+  //   false（非错误，首次启动）。 JSON 解析失败 -> 返回 false 并 stderr 告警。
+  bool load(const std::string& dir);
+  // save(dir)：序列化 templates_ 为 dir/templates.json via write_atomic。
+  //   dir 空字符串 -> 返回 false（no-op）。父目录不存在 -> 自动创建。
+  bool save(const std::string& dir) const;
+  // 测试钩子（spec §D）：设置内部 dir_ 供 save-on-change 使用。
+  // 生产环境由 NoiseManager::load_status 设置。
+  void set_dir_for_test(const std::string& dir) { dir_ = dir; }
+  const std::string& get_dir_for_test() const { return dir_; }
+
  private:
   std::vector<Template> templates_;
   uint32_t next_id_{1};  // 从 1 起,确保 id > 0
+  // Spec3 Task 4：持久化目录（arch §7.5）。
+  // 由 load(dir) / set_dir_for_test 设置，save(dir) 可覆盖参数。
+  std::string dir_;
 
   // 匹配阈值(arch §3.3.5 L540):> 0.75 判为该模板的噪声类型。
   static constexpr float kMatchThreshold = 0.75f;

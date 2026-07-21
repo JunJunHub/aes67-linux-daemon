@@ -8,6 +8,7 @@ set(NOISE_SOURCES
   noise_manager.cpp
   noise_metrics.cpp
   noise_http.cpp
+  noise_status.cpp
   vad.cpp
   noise_detector.cpp
   denoise_plugin_factory.cpp

@@ -155,6 +155,13 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   if (frame_size == 0 || frames == nullptr)
     return result;
 
+  // arch §3.3.1:分析 OriginalPCM(降噪关闭)时,需 VAD 过滤语音段,仅在
+  // 非语音段做频谱分析。speech 帧不是噪声 -> 跳过分析,返回 Unknown。
+  // 不推 FrameFeatures 到环形缓冲(语音帧不参与窗口聚合统计)。
+  if (detection.is_speech) {
+    return result;
+  }
+
   const float sample_rate = static_cast<float>(kDefaultSampleRate);
 
   // ── RMS + 噪声级 (dBFS) ─────────────────────────────────────────────
@@ -233,6 +240,18 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   float peak_50hz = std::max({e50, e100, e150});
   float peak_60hz = std::max({e60, e120, e180});
   float hum_peak = std::max(peak_50hz, peak_60hz);
+  // Resolution #5 extension:基频存在性守卫,防止非 hum 低频音(如 200Hz 纯音)
+  // 被 Goertzel 误判为 hum。200Hz 纯音在 180Hz(60Hz 3 倍频)产生强频谱泄漏,
+  // 但 60Hz 基频很弱;真实工频哼声的基频(50 或 60Hz)总是显著存在。
+  // 要求 max(e50, e60) >= 0.3 * hum_peak,否则视为非 hum,清零 hum_peak。
+  // 这是 fix #3 "real peak above real noise floor" 原则的延伸:
+  // 不仅 floor 要真实,peak 也要真实(基频存在),而非谐波泄漏冒充。
+  if (hum_peak > 1e-12f) {
+    float fundamental = std::max(e50, e60);
+    if (fundamental < 0.3f * hum_peak) {
+      hum_peak = 0.0f;
+    }
+  }
   // 周围频带中位数(FFT 功率谱 bins 4-30,即 375-2812 Hz)
   std::vector<float> surrounding;
   for (size_t k = 4; k <= 30 && k < num_bins; ++k) {
@@ -245,10 +264,12 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
     surrounding_median = surrounding[mid];
   }
   float peak_db = 0.0f;
+  // Resolution #5:仅在 surrounding_median 有意义(> 1e-12)时计算 peak_db。
+  // 原 60dB 兜底分支假设"峰值显著但周围近 0 -> 极强 hum",但近静音时
+  // peak/floor 都是微小数值(如频谱泄漏),并非真实 hum。
+  // 默认 peak_db=0 -> hum_conf=clamp((0-10)/20,0,1)=0,不触发 hum 候选。
   if (hum_peak > 1e-12f && surrounding_median > 1e-12f) {
     peak_db = 10.0f * std::log10(hum_peak / surrounding_median);
-  } else if (hum_peak > 1e-12f) {
-    peak_db = 60.0f;  // hum 显著但周围近 0 -> 极高峰值比
   }
   result.hum_strength_db = peak_db;
 
@@ -288,25 +309,12 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   auto candidates = classify_rule_based(power, kFftSize, sample_rate, frames,
                                         frame_size, sf_recomputed);
 
-  // 额外填充 Hum50Hz/60Hz 候选(需要 Goertzel 数据,classify_rule_based 无此数据)
-  // 重新计算 hum 候选以使用上面的 peak_db
+  // 额外填充 Hum50Hz/60Hz 候选(Goertzel 精确数据,classify_rule_based 不再添加)
   float hum_conf = clampf((peak_db - 10.0f) / 20.0f, 0.0f, 1.0f);
   if (hum_conf > 0.1f) {
     NoiseType hum_type =
         (peak_50hz >= peak_60hz) ? NoiseType::Hum50Hz : NoiseType::Hum60Hz;
-    // 替换或追加 hum 候选(classify_rule_based 可能已用粗 FFT bin 估了 hum)
-    bool found = false;
-    for (auto& c : candidates) {
-      if (c.type == NoiseType::Hum50Hz || c.type == NoiseType::Hum60Hz) {
-        c.type = hum_type;
-        c.confidence = hum_conf;
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      candidates.push_back({hum_type, hum_conf});
-    }
+    candidates.push_back({hum_type, hum_conf});
   }
 
   // 额外填充 Impulse 候选(需要时域数据)
@@ -478,35 +486,12 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
     }
   }
 
-  // ── 规则 3: 工频哼声(粗估,精确计算在 analyze() 中用 Goertzel)
-  // 这里用 FFT bin 估一个粗略值,analyze() 会用 Goertzel 精确值替换。
-  // 50Hz/100Hz 在 N=512、48kHz 时分辨率 93.75Hz,bin 1(93.75Hz)最近。
-  // 粗估:若 bin 1-2 的功率远超 bin 4-30 中位数,标记 hum 候选(低置信度)。
-  {
-    float peak_bin_power = 0.0f;
-    for (size_t k = 1; k <= 3 && k <= num_bins; ++k) {
-      if (power_spectrum[k - 1] > peak_bin_power)
-        peak_bin_power = power_spectrum[k - 1];
-    }
-    std::vector<float> surrounding;
-    for (size_t k = 4; k <= 30 && k <= num_bins; ++k) {
-      surrounding.push_back(power_spectrum[k - 1]);
-    }
-    if (!surrounding.empty()) {
-      std::sort(surrounding.begin(), surrounding.end());
-      float median = surrounding[surrounding.size() / 2];
-      if (median > 1e-12f && peak_bin_power > median) {
-        float peak_db_est = 10.0f * std::log10(peak_bin_power / median);
-        float conf = clampf((peak_db_est - 10.0f) / 20.0f, 0.0f, 1.0f);
-        // 粗估置信度打折(Goertzel 精确值在 analyze() 中替换)
-        conf *= 0.5f;
-        if (conf > 0.1f) {
-          // 默认 Hum50Hz(analyze() 中根据 50/60Hz 谐波强度修正)
-          candidates.push_back({NoiseType::Hum50Hz, conf});
-        }
-      }
-    }
-  }
+  // ── 规则 3: 工频哼声(Goertzel,在 analyze() 中计算)
+  // Resolution #2(Important #2):classify_rule_based 不再添加粗略 hum 候选。
+  // 原 FFT bin 1-3(93.75-281.25Hz)粗估会产生误判 -- 200Hz 纯音等非 hum
+  // 低频信号被误归为 Hum50Hz 且无法被 Goertzel 路径覆盖替换。
+  // hum 分类完全交由 analyze() 中的 Goertzel 精确检测(直接 DFT at
+  // 50/60/100/120/150/180 Hz,能正确区分 50 vs 60Hz)。
 
   // ── 规则 4: 脉冲(时域,在 analyze() 中计算,此处不重复)
   // analyze() 在调用 classify_rule_based 后追加 Impulse 候选。

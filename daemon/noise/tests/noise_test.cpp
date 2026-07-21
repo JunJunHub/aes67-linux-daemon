@@ -427,4 +427,41 @@ BOOST_AUTO_TEST_CASE(classify_impulse) {
   BOOST_CHECK(r.primary_type == noise::NoiseType::Impulse);
 }
 
+// Spec2 Task5 review Important #1:arch §3.3.1 要求分析 OriginalPCM 时
+// 用 VAD 过滤语音段,仅在非语音段做频谱分析。detection.is_speech=true 时
+// analyze() 必须跳过分析,返回 Unknown(语音帧不参与噪声分类)。
+BOOST_AUTO_TEST_CASE(analyze_skips_speech_frames) {
+  noise::NoiseAnalyzer ana;
+  float buf[synth::kFrameSize];
+  synth::white_noise(buf, synth::kFrameSize, 3);
+  noise::NoiseDetectionResult det;
+  det.is_speech = true;
+  det.spectral_flatness = 0.8f;
+  auto r = ana.analyze(buf, synth::kFrameSize, det);
+  BOOST_CHECK(r.primary_type == noise::NoiseType::Unknown);
+}
+
+// Spec2 Task5 review Important #2 + Minor #5:200Hz 纯音不应被误分类为 Hum。
+// 修复前:classify_rule_based 用 FFT bin 1-3(93.75-281.25Hz)粗估产生
+// Hum50Hz 候选;同时 Goertzel 路径因 200Hz 在 180Hz(60Hz 3 倍频)产生
+// 频谱泄漏,peak_60hz 偏高,触发 Hum60Hz 误判。
+// 修复后:classify_rule_based 不再添加 hum 候选(Important #2);Goertzel
+// 路径加基频存在性守卫(Minor #5 extension)--要求 max(e50,e60) >= 0.3 *
+// hum_peak,200Hz 纯音的基频很弱(1.24 vs hum_peak 10.47 -> ratio 0.118),
+// 视为非 hum。
+BOOST_AUTO_TEST_CASE(non_hum_tone_not_classified_hum) {
+  noise::NoiseAnalyzer ana;
+  float buf[synth::kFrameSize];
+  // 200Hz 纯音(不是 50/100/150Hz 工频哼声)
+  for (size_t i = 0; i < synth::kFrameSize; ++i) {
+    float t = static_cast<float>(i) / synth::kSampleRate;
+    buf[i] = 0.3f * std::sin(2 * 3.14159265358979f * 200 * t);
+  }
+  noise::NoiseDetectionResult det;
+  det.is_speech = false;
+  auto r = ana.analyze(buf, synth::kFrameSize, det);
+  BOOST_CHECK(r.primary_type != noise::NoiseType::Hum50Hz);
+  BOOST_CHECK(r.primary_type != noise::NoiseType::Hum60Hz);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

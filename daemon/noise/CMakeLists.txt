@@ -12,6 +12,7 @@ set(NOISE_SOURCES
   denoise_plugin_factory.cpp
   denoise_processor.cpp
   model-adapters/passthrough_plugin.cpp
+  noise_analyzer.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

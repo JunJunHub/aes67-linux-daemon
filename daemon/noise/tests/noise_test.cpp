@@ -387,3 +387,44 @@ BOOST_AUTO_TEST_CASE(rnnoise_outputs_vad) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#include "noise_analyzer.hpp"
+
+// Spec2 1.7 NoiseAnalyzer：L1 规则式分类（White/Hum50Hz/Impulse
+// 三种合成场景）。 Per task-5-brief + resolution #1：测试中类型需 noise::
+// 命名空间限定。
+BOOST_AUTO_TEST_SUITE(noise_analyzer_tests)
+
+BOOST_AUTO_TEST_CASE(classify_white_noise) {
+  noise::NoiseAnalyzer ana;
+  float buf[synth::kFrameSize];
+  synth::white_noise(buf, synth::kFrameSize, 3);
+  noise::NoiseDetectionResult det;
+  det.is_speech = false;
+  det.spectral_flatness = 0.8f;
+  auto r = ana.analyze(buf, synth::kFrameSize, det);
+  BOOST_CHECK(r.primary_type == noise::NoiseType::White);
+  BOOST_CHECK_GT(r.primary_confidence, 0.3f);
+}
+
+BOOST_AUTO_TEST_CASE(classify_hum_50hz) {
+  noise::NoiseAnalyzer ana;
+  float buf[synth::kFrameSize];
+  synth::hum_50hz(buf, synth::kFrameSize);
+  noise::NoiseDetectionResult det;
+  det.is_speech = false;
+  auto r = ana.analyze(buf, synth::kFrameSize, det);
+  BOOST_CHECK(r.primary_type == noise::NoiseType::Hum50Hz);
+}
+
+BOOST_AUTO_TEST_CASE(classify_impulse) {
+  noise::NoiseAnalyzer ana;
+  float buf[synth::kFrameSize];
+  synth::impulse(buf, synth::kFrameSize);
+  noise::NoiseDetectionResult det;
+  det.is_speech = false;
+  auto r = ana.analyze(buf, synth::kFrameSize, det);
+  BOOST_CHECK(r.primary_type == noise::NoiseType::Impulse);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

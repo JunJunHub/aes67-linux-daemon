@@ -20,6 +20,12 @@ constexpr float kLogEps = 1e-20f;
 constexpr float kSfNoisyThreshold = 0.6f;
 constexpr float kSnrNoisyThresholdDb = 20.0f;
 constexpr float kMaxSnrDb = 96.0f;
+// 静音 / 近零输入能量阈值(final review I1)。
+// 低于此值视为静音(PTP unlock、sink 未接收、intentional gaps),
+// 不应报 is_noisy=true,避免生产误报。
+// 取值与下方 noise_floor 兜底 1e-10f 对齐:信号低于此值时无法与
+// 噪声底兜底区分,直接判为静音。
+constexpr float kSilenceEnergyThreshold = 1e-10f;
 // 功率谱平滑窗口(3-tap moving average)。
 // 目的:降低白噪 FFT bin 间方差(单 bin |X|² 为指数分布,方差 = 均值²),
 // 使 SF 估计更稳定趋近理论值 1.0;对谐波信号(speech_like)几乎无影响,
@@ -115,6 +121,19 @@ NoiseDetectionResult NoiseDetector::process_frame(const float* frames,
   float signal_energy = 0.0f;
   for (size_t i = 0; i < frame_size; ++i) {
     signal_energy += frames[i] * frames[i];
+  }
+
+  // 静音 / 近零输入早返回(final review I1)。
+  // 静音常见(PTP unlock、sink 未接收、intentional gaps),必须直接判为
+  // 非噪声,否则下方 SNR 兜底(1e-10f)会让 is_noisy=true、confidence=1.0,
+  // 造成生产误报。静音 = 无噪声 = 高 SNR、SF 未定义置 0。
+  if (signal_energy < kSilenceEnergyThreshold) {
+    result.is_noisy = false;
+    result.confidence = 0.0f;
+    result.spectral_flatness = 0.0f;
+    result.estimated_snr_db = kMaxSnrDb;
+    result.is_speech = false;
+    return result;
   }
 
   // VAD(arch §3.2 L410-419,plan deviation:SimpleEnergyVad)

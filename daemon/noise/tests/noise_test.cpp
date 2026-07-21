@@ -284,6 +284,21 @@ BOOST_AUTO_TEST_CASE(detector_spectral_flatness_white_vs_speech) {
   BOOST_CHECK_LT(r2.spectral_flatness, 0.3f);  // 语音 SF 低
 }
 
+// Spec2 final review I1:静音(全零输入)不得被误报为噪声。
+// 修复前:signal_energy=0 -> noise_floor 兜底 1e-10f -> SNR=-inf clamp 0 ->
+// is_noisy = (SF>0.6)||(0<20) = true、confidence=1.0(生产误报:
+// PTP unlock、sink 未接收、intentional gaps 均为静音)。
+// 修复后:signal_energy < kSilenceEnergyThreshold 早返回 is_noisy=false。
+BOOST_AUTO_TEST_CASE(silence_is_not_noisy) {
+  noise::NoiseDetector det;
+  float buf[synth::kFrameSize];
+  synth::silence(buf, synth::kFrameSize);  // 全零
+  auto r = det.process_frame(buf, synth::kFrameSize);
+  BOOST_CHECK(!r.is_noisy);  // 静音不是噪声
+  BOOST_CHECK_EQUAL(r.confidence, 0.0f);
+  BOOST_CHECK(!r.is_speech);  // 静音不是语音
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 #include "denoise_processor.hpp"

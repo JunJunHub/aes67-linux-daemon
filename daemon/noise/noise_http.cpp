@@ -17,6 +17,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -560,10 +561,13 @@ void register_noise_template_routes(httplib::Server& svr,
              }
              auto bark = compute_bark_spectrum(samples.data(), samples.size(),
                                                sample_rate);
-             auto [match_id, sim] = template_db.match(bark);
+             std::pair<uint32_t, float> m = template_db.match(bark);
+             // 显式格式化 similarity 防止 NaN/默认精度问题（review Minor #2）
+             char sim_buf[32];
+             std::snprintf(sim_buf, sizeof(sim_buf), "%.6f", m.second);
              std::stringstream ss;
-             ss << "{\n  \"matched_template_id\": " << match_id
-                << ",\n  \"similarity\": " << sim
+             ss << "{\n  \"matched_template_id\": " << m.first
+                << ",\n  \"similarity\": " << sim_buf
                 << ",\n  \"requested_template_id\": " << id << "\n}\n";
              res.set_content(ss.str(), "application/json");
            });

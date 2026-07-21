@@ -120,9 +120,14 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
                                       const std::string& new_description) {
   for (auto& t : templates_) {
     if (t.template_id == template_id) {
+      // label/description 仅在非空时覆盖（PUT {"label":"x"} 不清空
+      // description， PUT {"description":"y"} 不清空
+      // label）。空字符串视为"不更新该字段"， 与 label 的条件式处理一致（review
+      // Minor #4）。
       if (!new_label.empty())
         t.name = new_label;
-      t.description = new_description;
+      if (!new_description.empty())
+        t.description = new_description;
       return true;
     }
   }
@@ -326,6 +331,15 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   }
   out.write(wav_bytes.data(), static_cast<std::streamsize>(wav_bytes.size()));
   out.close();
+  // 检查写入是否成功（review Minor #5）：disk-full / mid-write 失败会留下
+  // 截断的 WAV 文件，GET /:id/wav 会服务坏文件。失败时回滚（与 open 失败
+  // 同一路径）并删除已写的残片。
+  if (!out.good()) {
+    std::error_code rm_ec;
+    std::filesystem::remove(wav_path, rm_ec);
+    remove_template(id);
+    return 0;
+  }
   // 5. 更新 wav_file 字段 + save
   if (auto* t = const_cast<Template*>(get_template(id))) {
     t->wav_file = wav_name;

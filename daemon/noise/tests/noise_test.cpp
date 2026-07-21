@@ -1078,10 +1078,13 @@ BOOST_AUTO_TEST_SUITE_END()
 // 架构依据：docs/noise/architecture-design.md §5.3 + §7.5 + §7.7。
 #include "noise_http.hpp"
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <httplib.h>
+#include <sstream>
 #include <thread>
+#include <vector>
 
 // 辅助：生成最小合法 48kHz PCM-16 单声道 WAV（含白噪）。
 // RIFF header(12) + fmt chunk(24) + data chunk(8) + samples。
@@ -1321,10 +1324,56 @@ BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
   BOOST_CHECK_EQUAL(r3->status, 200);
   BOOST_CHECK(r3->body.find("\"imported\": 1") != std::string::npos);
 
-  // 验证导入的模板
+  // 验证导入的模板（review Important #1：LIST 端点只返回 id+label，
+  // 不含 bark_spectrum，无法验证特征数据往返。改用 DETAIL 端点验证
+  // bark_spectrum 完整存活。）
   auto r4 = cli2.Get("/api/noise/templates");
   BOOST_REQUIRE(r4);
   BOOST_CHECK(r4->body.find("风扇噪声") != std::string::npos);
+  // 从 LIST 响应解析新 id
+  auto id_pos2 = r4->body.find("\"id\": ");
+  BOOST_REQUIRE(id_pos2 != std::string::npos);
+  uint32_t imported_id =
+      static_cast<uint32_t>(std::stoi(r4->body.substr(id_pos2 + 6)));
+  // DETAIL 端点返回 bark_spectrum，验证非空（至少一个非零值）
+  auto r4b = cli2.Get("/api/noise/template/" + std::to_string(imported_id));
+  BOOST_REQUIRE(r4b);
+  BOOST_CHECK_EQUAL(r4b->status, 200);
+  BOOST_CHECK(r4b->body.find("bark_spectrum") != std::string::npos);
+  // 提取导出 JSON 中的 bark 数组与导入后 DETAIL 中的对比（容差比较）
+  auto extract_bark = [](const std::string& body,
+                         size_t start_hint) -> std::vector<float> {
+    std::vector<float> out;
+    auto bs = body.find("bark_spectrum", start_hint);
+    if (bs == std::string::npos)
+      return out;
+    auto lb = body.find('[', bs);
+    auto rb = body.find(']', lb);
+    if (lb == std::string::npos || rb == std::string::npos)
+      return out;
+    std::string arr = body.substr(lb + 1, rb - lb - 1);
+    std::stringstream ss(arr);
+    float v;
+    while (ss >> v) {
+      out.push_back(v);
+      if (ss.peek() == ',')
+        ss.ignore();
+    }
+    return out;
+  };
+  auto bark_exported = extract_bark(exported, 0);
+  auto bark_imported = extract_bark(r4b->body, 0);
+  BOOST_CHECK_EQUAL(bark_exported.size(), 32u);
+  BOOST_CHECK_EQUAL(bark_imported.size(), 32u);
+  if (bark_exported.size() == 32 && bark_imported.size() == 32) {
+    bool any_nonzero = false;
+    for (size_t i = 0; i < 32; ++i) {
+      BOOST_CHECK_CLOSE(bark_exported[i], bark_imported[i], 0.01);
+      if (std::fabs(bark_imported[i]) > 1e-9f)
+        any_nonzero = true;
+    }
+    BOOST_CHECK(any_nonzero);  // 防止全零静默通过
+  }
 
   // 重复导入同一 label -> 去重（skipped=1）
   auto r5 =
@@ -1380,11 +1429,82 @@ BOOST_AUTO_TEST_CASE(template_match_test_via_http) {
   // 相同 WAV -> matched_id 应为 tid，similarity > 0.9
   BOOST_CHECK(r2->body.find("\"matched_template_id\": " +
                             std::to_string(tid)) != std::string::npos);
+  // review Minor #2：解析 similarity 数值并断言 > 0.9（防 matched_id==tid
+  // 但 similarity==0.0 的静默回归）。
+  auto sim_key = r2->body.find("\"similarity\":");
+  BOOST_REQUIRE(sim_key != std::string::npos);
+  // 跳过 "similarity": 和后续空白，找到数字起点
+  size_t val_start = sim_key + std::string("\"similarity\":").size();
+  while (val_start < r2->body.size() &&
+         (r2->body[val_start] == ' ' || r2->body[val_start] == '\t'))
+    ++val_start;
+  std::string sim_substr = r2->body.substr(val_start);
+  float sim = 0.0f;
+  try {
+    sim = std::stof(sim_substr);
+  } catch (const std::exception& e) {
+    BOOST_ERROR("failed to parse similarity from: " << sim_substr);
+  }
+  BOOST_CHECK_GT(sim, 0.9f);
 
   svr.stop();
   svr_thread.join();
   std::filesystem::remove_all(d);
   std::remove("test_tpl3.wav");
+}
+
+// review Minor #3：corrupt WAV 拒绝测试。
+// 覆盖 3 种 corrupt 场景：(a) 截断（< 最小 header）；(b) 缺 WAVE magic；
+// (c) data chunk 在 fmt 之前。均应返回 400。
+BOOST_AUTO_TEST_CASE(template_post_rejects_corrupt_wav) {
+  const char* d = "test_tpl_dir_6";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // (a) 截断（10 字节，远小于 44 最小 header）
+  {
+    std::string trunc(10, '\0');
+    httplib::MultipartFormDataItems items = {
+        {"label", "trunc", "", ""}, {"wav", trunc, "t.wav", "audio/wav"}};
+    auto r = cli.Post("/api/noise/template", items);
+    BOOST_REQUIRE(r);
+    BOOST_CHECK_EQUAL(r->status, 400);
+  }
+  // (b) RIFF magic 对但缺 WAVE magic
+  {
+    std::string bad = "RIFF\0\0\0\0XXXXfmt \x10\0\0\0";
+    bad += std::string(16, '\0');
+    bad += "data\0\0\0\0";
+    httplib::MultipartFormDataItems items = {
+        {"label", "badwave", "", ""}, {"wav", bad, "t.wav", "audio/wav"}};
+    auto r = cli.Post("/api/noise/template", items);
+    BOOST_REQUIRE(r);
+    BOOST_CHECK_EQUAL(r->status, 400);
+  }
+  // (c) data chunk 在 fmt 之前（fmt 缺失 -> audio_format=0 -> 非 PCM）
+  {
+    std::string bad = "RIFF\0\0\0\0WAVEdata\x04\0\0\0\x00\x00\x00\x00fmt ";
+    bad += std::string(4, '\0');  // data_size 留空
+    httplib::MultipartFormDataItems items = {
+        {"label", "nodata", "", ""}, {"wav", bad, "t.wav", "audio/wav"}};
+    auto r = cli.Post("/api/noise/template", items);
+    BOOST_REQUIRE(r);
+    BOOST_CHECK_EQUAL(r->status, 400);
+  }
+
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

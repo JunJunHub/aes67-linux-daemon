@@ -74,6 +74,17 @@ struct FrameFeatures {
   float l1_confidence;                // L1 主类型置信度
 };
 
+// Spec3 Task 5：一次性 Bark 频谱提取（无环形缓冲状态）。
+// 供 add_template_from_wav 调用：从一段完整 PCM（WAV 文件）提取 32 维 Bark
+// 频带能量。内部按 kFftSize(512) 分帧、逐帧 FFT + Bark 频带累加、跨帧平均。
+// 与 NoiseAnalyzer::analyze() 共享同一 Bark 频带映射 + FFT 实现（DRY）。
+//   pcm: 浮点 PCM 样本（int16 /32768 归一化）。
+//   n: 样本数。
+//   sample_rate: 采样率（Phase 1 仅支持 48000；其他返回全零数组）。
+std::array<float, 32> compute_bark_spectrum(const float* pcm,
+                                            size_t n,
+                                            uint32_t sample_rate);
+
 // 噪声分析器:L1 规则式频谱分析 + Bark 频带 + 逐帧特征环形缓冲。
 // 架构依据:arch §3.3 L461-627。
 class NoiseAnalyzer {

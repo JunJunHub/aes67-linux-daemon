@@ -135,6 +135,28 @@ float dft_power_at_freq(const float* x,
 inline float clampf(float v, float lo, float hi) {
   return std::clamp(v, lo, hi);
 }
+
+// Spec3 Task 5：Bark 频带累加（DRY 提取，供 analyze() 与
+// compute_bark_spectrum() 共享同一频带映射逻辑）。
+// 将 FFT 正频功率谱 power（bins 1..fft_n/2-1，索引 0..num_bins-1）累加到
+// 32 维 Bark 频带能量数组 out（accumulate 语义：不清零，调用方负责初始化）。
+// 与 analyze() 原内联循环完全等价（同 kBandEdges + 同 bin 分配逻辑）。
+void accumulate_bark_bands(const std::vector<float>& power,
+                           size_t fft_n,
+                           float sample_rate,
+                           std::array<float, 32>& out) {
+  const size_t n_half = fft_n / 2;
+  const float bin_freq = sample_rate / static_cast<float>(fft_n);
+  for (size_t k = 1; k < n_half; ++k) {
+    float freq_hz = static_cast<float>(k) * bin_freq;
+    for (size_t b = 0; b < 32; ++b) {
+      if (freq_hz >= kBandEdges[b] && freq_hz < kBandEdges[b + 1]) {
+        out[b] += power[k - 1];
+        break;
+      }
+    }
+  }
+}
 }  // namespace
 
 NoiseAnalysisResult NoiseAnalyzer::analyze(
@@ -215,17 +237,9 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   }
 
   // ── Bark 32 频带能量(arch §3.3.3,1/3 倍频程) ────────────────────────
-  const float bin_freq = sample_rate / kFftSize;  // 93.75 Hz/bin
-  for (size_t k = 1; k < n_half; ++k) {
-    float freq_hz = static_cast<float>(k) * bin_freq;
-    // 找到 freq_hz 所属的 Bark 频带
-    for (size_t b = 0; b < 32; ++b) {
-      if (freq_hz >= kBandEdges[b] && freq_hz < kBandEdges[b + 1]) {
-        result.band_energy[b] += power[k - 1];
-        break;
-      }
-    }
-  }
+  // Spec3 Task 5：频带映射提取为共享 accumulate_bark_bands（DRY），
+  // 与 compute_bark_spectrum()（WAV 模板录入路径）共用同一逻辑。
+  accumulate_bark_bands(power, kFftSize, sample_rate, result.band_energy);
 
   // ── 工频哼声检测(Goertzel 等价:直接 DFT at 50/60/100/120/150/180 Hz)
   // arch §3.3.4:50/100Hz 倍频峰值超周围 -> conf = clamp((peak_db - 10)/20,0,1)
@@ -529,6 +543,58 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   }
 
   return candidates;
+}
+
+// Spec3 Task 5：一次性 Bark 频谱提取（arch §7.7 add_template 流程步骤 3）。
+// 从完整 PCM（WAV 文件内容）提取 32 维 Bark 频带能量，供模板录入使用。
+// 与 NoiseAnalyzer::analyze() 共享 accumulate_bark_bands（DRY：同一频带映射 +
+// 同一 FFT 实现）。
+//
+// 实现：按 kFrameSize(480) 样本分帧、每帧零填充到 kFftSize(512) 做 FFT，
+// 调 accumulate_bark_bands 累加到 32 维数组，最后跨帧取平均。这与
+// NoiseAnalyzer::aggregate_window() 的 bark_energy 均值聚合语义一致
+// （arch §3.3.7 L625），但无环形缓冲状态 -- 适合一次性 WAV 处理。
+//
+// Phase 1 限定：sample_rate 必须 == 48000（arch §11 风险1）。其他采样率
+// 返回全零数组（调用方应拒绝非 48kHz WAV，此处为防御性兜底）。
+std::array<float, 32> compute_bark_spectrum(const float* pcm,
+                                            size_t n,
+                                            uint32_t sample_rate) {
+  std::array<float, 32> bark{};
+  bark.fill(0.0f);
+  if (pcm == nullptr || n == 0 || sample_rate != kDefaultSampleRate)
+    return bark;
+
+  // 按 kDefaultFrameSize(480) 样本分帧（与 analyze() 的帧大小一致）。
+  // 每帧零填充到 kFftSize(512) 做 FFT，累加 Bark 频带能量。
+  size_t frame_count = 0;
+  for (size_t pos = 0; pos + kDefaultFrameSize <= n; pos += kDefaultFrameSize) {
+    std::vector<std::complex<float>> X(kFftSize,
+                                       std::complex<float>(0.0f, 0.0f));
+    for (size_t i = 0; i < kDefaultFrameSize; ++i) {
+      X[i] = std::complex<float>(pcm[pos + i], 0.0f);
+    }
+    fft_radix2(X);
+
+    const size_t n_half = kFftSize / 2;
+    const size_t num_bins = n_half - 1;
+    std::vector<float> power(num_bins);
+    for (size_t k = 1; k < n_half; ++k) {
+      power[k - 1] = std::norm(X[k]);
+    }
+    accumulate_bark_bands(power, kFftSize, static_cast<float>(sample_rate),
+                          bark);
+    ++frame_count;
+  }
+
+  // 跨帧平均（与 aggregate_window() 的 bark 均值聚合一致）。
+  if (frame_count > 0) {
+    float fc = static_cast<float>(frame_count);
+    for (size_t b = 0; b < 32; ++b) {
+      bark[b] /= fc;
+    }
+  }
+  return bark;
 }
 
 }  // namespace noise

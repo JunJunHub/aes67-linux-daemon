@@ -13,10 +13,15 @@
 //   不一致）。
 #include "noise_http.hpp"
 
+#include <boost/foreach.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
+#include <iterator>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -357,6 +362,319 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
                }
                res.set_content("", "text/plain");
              });
+}
+
+// ── Spec3 Task 5：噪声模板 HTTP API（arch §5.3）────────────────────────
+// 9 端点：CRUD + WAV 上传 + 匹配测试 + WAV 回听 + 导入导出。
+// JSON 输出手写拼接（reuse escape_json），输入用 boost::property_tree。
+// Phase 1 限定（arch §11 风险1）：WAV 须 48kHz PCM-16 mono，否则 400。
+namespace {
+
+// 单个模板序列化为 JSON 对象（不含外层 {}，由调用方决定缩进）。
+// 字段：id, label, description, bark_spectrum, wav_file（arch §7.5）。
+std::string template_to_json_object(const Template& t, const char* indent) {
+  std::stringstream ss;
+  ss << indent << "\"id\": " << t.template_id << ",\n"
+     << indent << "\"label\": \"" << escape_json(t.name) << "\"" << ",\n"
+     << indent << "\"description\": \"" << escape_json(t.description) << "\""
+     << ",\n"
+     << indent << "\"bark_spectrum\": [";
+  for (size_t j = 0; j < t.bark_features.size(); ++j) {
+    if (j > 0)
+      ss << ", ";
+    ss << t.bark_features[j];
+  }
+  ss << "],\n"
+     << indent << "\"wav_file\": \"" << escape_json(t.wav_file) << "\"";
+  return ss.str();
+}
+
+// 解析 URL path 中的 :id 为 uint32_t（模板 id 从 1 起，无 255 上限）。
+bool parse_template_id(const httplib::Request& req,
+                       httplib::Response& res,
+                       uint32_t& out) {
+  try {
+    int v = std::stoi(req.matches[1]);
+    if (v <= 0) {
+      res.status = 400;
+      res.set_content("template id must be positive", "text/plain");
+      return false;
+    }
+    out = static_cast<uint32_t>(v);
+    return true;
+  } catch (...) {
+    res.status = 400;
+    res.set_content("invalid id", "text/plain");
+    return false;
+  }
+}
+}  // namespace
+
+void register_noise_template_routes(httplib::Server& svr,
+                                    NoiseManager& /*mgr*/,
+                                    NoiseTemplateDB& template_db) {
+  using httplib::Request;
+  using httplib::Response;
+
+  // GET /api/noise/templates - 列出所有模板（arch §5.3）。
+  svr.Get("/api/noise/templates",
+          [&template_db](const Request& /*req*/, Response& res) {
+            auto list = template_db.list_templates();
+            std::stringstream ss;
+            ss << "{\n  \"templates\": [";
+            for (size_t i = 0; i < list.size(); ++i) {
+              if (i > 0)
+                ss << ",";
+              ss << "\n    {" << "\n      \"id\": " << list[i].first
+                 << ",\n      \"label\": \"" << escape_json(list[i].second)
+                 << "\"\n    }";
+            }
+            ss << "\n  ]\n}\n";
+            res.set_content(ss.str(), "application/json");
+          });
+
+  // GET /api/noise/templates/export - 导出完整模板库（含 bark_spectrum）。
+  svr.Get("/api/noise/templates/export", [&template_db](const Request& /*req*/,
+                                                        Response& res) {
+    auto list = template_db.list_templates();
+    std::stringstream ss;
+    ss << "{\n  \"templates\": [";
+    bool first = true;
+    for (const auto& [id, name] : list) {
+      const Template* t = template_db.get_template(id);
+      if (t == nullptr)
+        continue;
+      if (!first)
+        ss << ",";
+      first = false;
+      ss << "\n    {\n" << template_to_json_object(*t, "      ") << "\n    }";
+    }
+    ss << "\n  ]\n}\n";
+    res.set_content(ss.str(), "application/json");
+  });
+
+  // POST /api/noise/templates/import - 导入模板库（JSON body，按 label 去重）。
+  // 输入格式同 export：{ "templates": [ {label, bark_spectrum, description?,
+  // ...} ] } 已存在的 label 跳过（去重）；不导入 wav_file（导入的模板无原始
+  // WAV）。
+  svr.Post("/api/noise/templates/import", [&template_db](const Request& req,
+                                                         Response& res) {
+    try {
+      boost::property_tree::ptree pt;
+      std::stringstream ss(req.body);
+      boost::property_tree::read_json(ss, pt);
+      int imported = 0;
+      int skipped = 0;
+      // 收集现有 label 用于去重
+      auto existing = template_db.list_templates();
+      std::set<std::string> existing_labels;
+      for (const auto& [eid, ename] : existing)
+        existing_labels.insert(ename);
+      BOOST_FOREACH (const boost::property_tree::ptree::value_type& v,
+                     pt.get_child("templates")) {
+        std::string label = v.second.get<std::string>("label");
+        if (existing_labels.count(label) > 0) {
+          ++skipped;
+          continue;
+        }
+        std::array<float, 32> feat{};
+        size_t idx = 0;
+        BOOST_FOREACH (const boost::property_tree::ptree::value_type& f,
+                       v.second.get_child("bark_spectrum")) {
+          if (idx < 32)
+            feat[idx++] = f.second.get_value<float>();
+        }
+        std::string desc = v.second.get<std::string>("description", "");
+        template_db.add_template(label, feat, desc, "");
+        existing_labels.insert(label);
+        ++imported;
+      }
+      std::stringstream out;
+      out << "{\n  \"imported\": " << imported
+          << ",\n  \"skipped\": " << skipped << "\n}\n";
+      res.set_content(out.str(), "application/json");
+    } catch (const std::exception& e) {
+      res.status = 400;
+      res.set_content(std::string("invalid JSON: ") + e.what(), "text/plain");
+    }
+  });
+
+  // GET /api/noise/template/([0-9]+)/wav - 获取模板原始 WAV 二进制。
+  svr.Get("/api/noise/template/([0-9]+)/wav", [&template_db](const Request& req,
+                                                             Response& res) {
+    uint32_t id;
+    if (!parse_template_id(req, res, id))
+      return;
+    const Template* t = template_db.get_template(id);
+    if (t == nullptr) {
+      res.status = 404;
+      res.set_content("template not found", "text/plain");
+      return;
+    }
+    if (t->wav_file.empty()) {
+      res.status = 404;
+      res.set_content("template has no WAV file", "text/plain");
+      return;
+    }
+    std::string wav_path = template_db.get_dir_for_test() + "/" + t->wav_file;
+    std::ifstream in(wav_path, std::ios::binary);
+    if (!in.is_open()) {
+      res.status = 404;
+      res.set_content("WAV file missing on disk", "text/plain");
+      return;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), {});
+    res.set_content(content, "audio/wav");
+  });
+
+  // GET /api/noise/template/([0-9]+)/test - 占位（POST 才是匹配测试）。
+  // cpp-httplib 区分 GET/POST 同路径，此处不注册 GET /test。
+
+  // POST /api/noise/template/([0-9]+)/test - 上传 WAV 测试匹配。
+  // 返回 { "matched_template_id": N, "similarity": 0.xx }
+  svr.Post("/api/noise/template/([0-9]+)/test",
+           [&template_db](const Request& req, Response& res) {
+             uint32_t id;
+             if (!parse_template_id(req, res, id))
+               return;
+             if (template_db.get_template(id) == nullptr) {
+               res.status = 404;
+               res.set_content("template not found", "text/plain");
+               return;
+             }
+             if (!req.has_file("wav")) {
+               res.status = 400;
+               res.set_content("missing wav file field", "text/plain");
+               return;
+             }
+             auto wav = req.get_file_value("wav");
+             // 复用 parse_wav_pcm16_48k_mono + compute_bark_spectrum（DRY：
+             // 与 add_template_from_wav 共用同一 WAV 解析 + Bark 提取路径）。
+             std::vector<float> samples;
+             uint32_t sample_rate = 0;
+             if (!parse_wav_pcm16_48k_mono(wav.content, samples, sample_rate)) {
+               res.status = 400;
+               res.set_content("WAV must be 48kHz PCM-16 mono (Phase 1 limit)",
+                               "text/plain");
+               return;
+             }
+             auto bark = compute_bark_spectrum(samples.data(), samples.size(),
+                                               sample_rate);
+             auto [match_id, sim] = template_db.match(bark);
+             std::stringstream ss;
+             ss << "{\n  \"matched_template_id\": " << match_id
+                << ",\n  \"similarity\": " << sim
+                << ",\n  \"requested_template_id\": " << id << "\n}\n";
+             res.set_content(ss.str(), "application/json");
+           });
+
+  // GET /api/noise/template/([0-9]+) - 模板详情（含 bark_spectrum）。
+  svr.Get("/api/noise/template/([0-9]+)",
+          [&template_db](const Request& req, Response& res) {
+            uint32_t id;
+            if (!parse_template_id(req, res, id))
+              return;
+            const Template* t = template_db.get_template(id);
+            if (t == nullptr) {
+              res.status = 404;
+              res.set_content("template not found", "text/plain");
+              return;
+            }
+            std::stringstream ss;
+            ss << "{\n  " << template_to_json_object(*t, "  ") << "\n}\n";
+            res.set_content(ss.str(), "application/json");
+          });
+
+  // DELETE /api/noise/template/([0-9]+) - 删除模板 + WAV 文件。
+  svr.Delete("/api/noise/template/([0-9]+)", [&template_db](const Request& req,
+                                                            Response& res) {
+    uint32_t id;
+    if (!parse_template_id(req, res, id))
+      return;
+    const Template* t = template_db.get_template(id);
+    if (t == nullptr) {
+      res.status = 404;
+      res.set_content("template not found", "text/plain");
+      return;
+    }
+    // 先删 WAV 文件（若存在）
+    if (!t->wav_file.empty()) {
+      std::string wav_path = template_db.get_dir_for_test() + "/" + t->wav_file;
+      std::error_code ec;
+      std::filesystem::remove(wav_path, ec);
+      // 忽略删除失败（文件可能已不存在），仍删内存记录
+    }
+    if (!template_db.remove_template(id)) {
+      res.status = 404;
+      res.set_content("template not found", "text/plain");
+      return;
+    }
+    // 持久化更新
+    template_db.save(template_db.get_dir_for_test());
+    res.set_content("", "text/plain");
+  });
+
+  // PUT /api/noise/template/([0-9]+) - 更新 label/description。
+  // Body: { "label": "...", "description": "..." }
+  svr.Put("/api/noise/template/([0-9]+)", [&template_db](const Request& req,
+                                                         Response& res) {
+    uint32_t id;
+    if (!parse_template_id(req, res, id))
+      return;
+    try {
+      boost::property_tree::ptree pt;
+      std::stringstream ss(req.body);
+      boost::property_tree::read_json(ss, pt);
+      std::string label = pt.get<std::string>("label", "");
+      std::string desc = pt.get<std::string>("description", "");
+      if (!template_db.update_template(id, label, desc)) {
+        res.status = 404;
+        res.set_content("template not found", "text/plain");
+        return;
+      }
+      template_db.save(template_db.get_dir_for_test());
+      res.set_content("", "text/plain");
+    } catch (const std::exception& e) {
+      res.status = 400;
+      res.set_content(std::string("invalid JSON: ") + e.what(), "text/plain");
+    }
+  });
+
+  // POST /api/noise/template - 录入新模板（multipart: wav + label +
+  // description）。 arch §7.7: HTTP 接收 WAV -> 提取 32 维 Bark -> 存
+  // templates.json + WAV 文件。
+  svr.Post(
+      "/api/noise/template", [&template_db](const Request& req, Response& res) {
+        if (!req.has_file("wav")) {
+          res.status = 400;
+          res.set_content("missing wav file field", "text/plain");
+          return;
+        }
+        auto wav = req.get_file_value("wav");
+        std::string label;
+        std::string description;
+        if (req.has_file("label"))
+          label = req.get_file_value("label").content;
+        if (req.has_file("description"))
+          description = req.get_file_value("description").content;
+        if (label.empty()) {
+          res.status = 400;
+          res.set_content("missing label field", "text/plain");
+          return;
+        }
+        uint32_t id =
+            template_db.add_template_from_wav(label, description, wav.content);
+        if (id == 0) {
+          res.status = 400;
+          res.set_content("WAV ingestion failed (must be 48kHz PCM-16 mono)",
+                          "text/plain");
+          return;
+        }
+        std::stringstream ss;
+        ss << "{\n  \"id\": " << id << ",\n  \"label\": \""
+           << escape_json(label) << "\"" << ",\n  \"status\": \"created\"\n}\n";
+        res.set_content(ss.str(), "application/json");
+      });
 }
 
 }  // namespace noise

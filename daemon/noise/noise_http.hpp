@@ -26,9 +26,10 @@
 #include <utility>
 #include <vector>
 
-#include "noise_analyzer.hpp"  // NoiseType
-#include "noise_manager.hpp"   // NoiseManager, SensorInfo
-#include "noise_metrics.hpp"   // NoiseMetricsSnapshot
+#include "noise_analyzer.hpp"     // NoiseType
+#include "noise_manager.hpp"      // NoiseManager, SensorInfo
+#include "noise_metrics.hpp"      // NoiseMetricsSnapshot
+#include "noise_template_db.hpp"  // NoiseTemplateDB (Spec3 Task 5)
 
 namespace noise {
 
@@ -60,6 +61,27 @@ std::string history_to_json(const std::vector<NoiseMetricsSnapshot>& history);
 // （映射到 NoiseSensorConfig::plugin_name）, denoise_dry_wet, sensitivity,
 // enabled（可选，PUT 后调 enable_sensor 应用）。
 void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr);
+
+// Spec3 Task 5：注册噪声模板 HTTP 路由到 svr（arch §5.3，9 端点）。
+// template_db 由调用方（T6 wiring）独立持有并传入；NoiseManager 不拥有它
+// （review Important #1：DB 作为独立参数）。
+//
+// 端点（arch §5.3）：
+//   GET    /api/noise/templates              - 列出所有模板
+//   POST   /api/noise/template               - 录入新模板（multipart:
+//   wav+label） GET    /api/noise/template/([0-9]+)      - 模板详情（含
+//   bark_spectrum） DELETE /api/noise/template/([0-9]+)      - 删除模板（+ WAV
+//   文件） PUT    /api/noise/template/([0-9]+)      - 更新 label/description
+//   POST   /api/noise/template/([0-9]+)/test - 上传 WAV 测试匹配
+//   GET    /api/noise/template/([0-9]+)/wav  - 获取模板原始 WAV
+//   GET    /api/noise/templates/export       - 导出模板库 (JSON)
+//   POST   /api/noise/templates/import       - 导入模板库 (JSON)
+//
+// Phase 1 限定（arch §11 风险1）：WAV 须 48kHz PCM-16 mono，否则 400。
+// JSON 输出 = 手工拼接（reuse escape_json），输入用 boost::property_tree。
+void register_noise_template_routes(httplib::Server& svr,
+                                    NoiseManager& mgr,
+                                    NoiseTemplateDB& template_db);
 
 }  // namespace noise
 

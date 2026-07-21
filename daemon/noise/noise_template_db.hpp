@@ -17,13 +17,27 @@
 
 namespace noise {
 
+// Spec3 Task 5：最小 RIFF/fmt/data WAV 解析器（PCM 16-bit mono 48kHz）。
+// 供 add_template_from_wav + HTTP /template/:id/test 路径复用（DRY）。
+// 成功：out_samples 填充 float PCM（int16 /32768），out_sample_rate = 48000。
+// 失败（非 PCM / 非 16-bit / 非 mono / 非 48kHz / 格式错误）：返回 false。
+// Phase 1 限定（arch §11 风险1）。
+bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
+                              std::vector<float>& out_samples,
+                              uint32_t& out_sample_rate);
+
 // 噪声模板:L2 模板匹配的最小单元。
 // bark_features 为归一化前的 32 维 Bark 频带能量(由调用方决定是否归一化,
 // 余弦相似度本身对放缩不敏感)。
+// Spec3 Task 5:新增 description + wav_file 字段（arch §7.5）。
+//   wav_file 为相对于 template_dir 的文件名（如 "template-1.wav"），
+//   空字符串表示该模板无原始 WAV（如 JSON 导入的模板）。
 struct Template {
   uint32_t template_id{0};
   std::string name;
   std::array<float, 32> bark_features{};
+  std::string description;  // Spec3 Task 5（arch §7.5）
+  std::string wav_file;     // Spec3 Task 5：相对 template_dir 的文件名
 };
 
 // L2 模板匹配库(arch §3.3.5)。
@@ -39,6 +53,13 @@ class NoiseTemplateDB {
   uint32_t add_template(const std::string& name,
                         const std::array<float, 32>& bark_features);
 
+  // Spec3 Task 5：带 description/wav_file 的添加（arch §7.5）。
+  // wav_file 为相对 template_dir 的文件名；空字符串表示无 WAV（JSON 导入）。
+  uint32_t add_template(const std::string& name,
+                        const std::array<float, 32>& bark_features,
+                        const std::string& description,
+                        const std::string& wav_file);
+
   // 匹配给定 Bark 频谱,返回 (template_id, similarity)。
   // 最高相似度 > 0.75 才视为匹配;否则返回 (0, 0.0f)。
   // 空库直接返回 (0, 0.0f)。零范数守卫:|a|==0 或 |b|==0 时该对相似度记 0。
@@ -50,6 +71,14 @@ class NoiseTemplateDB {
 
   // 返回所有当前模板的 (id, name) 对。
   std::vector<std::pair<uint32_t, std::string>> list_templates() const;
+
+  // Spec3 Task 5：按 id 查找模板详情。未找到返回 nullptr。
+  const Template* get_template(uint32_t template_id) const;
+
+  // Spec3 Task 5：更新 label/description。未找到返回 false。
+  bool update_template(uint32_t template_id,
+                       const std::string& new_label,
+                       const std::string& new_description);
 
   // ── Spec3 Task 4 持久化（arch §7.5）──
   // load(dir)：从 dir/templates.json 读取模板列表，重建内存索引。
@@ -63,6 +92,19 @@ class NoiseTemplateDB {
   // 生产环境由 NoiseManager::load_status 设置。
   void set_dir_for_test(const std::string& dir) { dir_ = dir; }
   const std::string& get_dir_for_test() const { return dir_; }
+
+  // ── Spec3 Task 5：WAV 录入（arch §7.7）──
+  // add_template_from_wav：读 WAV header（RIFF/fmt/data，PCM 16-bit）->
+  //   提取 32 维 Bark（复用 NoiseAnalyzer 的 compute_bark_spectrum）->
+  //   写 WAV 到 dir/template-<id>.wav -> add_template -> save(dir)。
+  //   返回分配的 template_id（>0）；失败返回 0。
+  //   Phase 1 限定（arch §11 风险1）：仅支持 48kHz PCM 16-bit 单声道 WAV。
+  //   非 48kHz / 非 PCM-16 / mono 检查失败 -> 返回 0（HTTP 层映射为 400）。
+  //   dir 空字符串 -> 返回 0（无持久化目录）。
+  //   wav_bytes 为完整 WAV 文件二进制（含 RIFF header）。
+  uint32_t add_template_from_wav(const std::string& label,
+                                 const std::string& description,
+                                 const std::string& wav_bytes);
 
  private:
   std::vector<Template> templates_;

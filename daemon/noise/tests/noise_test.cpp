@@ -1073,3 +1073,318 @@ BOOST_AUTO_TEST_CASE(load_status_rejects_corrupt_json) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Spec3 Task 5: 噪声模板 HTTP API（arch §5.3，9 端点）+ WAV 录入。
+// 架构依据：docs/noise/architecture-design.md §5.3 + §7.5 + §7.7。
+#include "noise_http.hpp"
+#include <array>
+#include <cstring>
+#include <fstream>
+#include <httplib.h>
+#include <thread>
+
+// 辅助：生成最小合法 48kHz PCM-16 单声道 WAV（含白噪）。
+// RIFF header(12) + fmt chunk(24) + data chunk(8) + samples。
+inline void write_test_wav(const std::string& path, size_t num_samples = 4800) {
+  // 生成白噪样本（int16）
+  std::vector<int16_t> samples(num_samples);
+  uint32_t seed = 42;
+  for (auto& s : samples) {
+    seed = seed * 1103515245u + 12345u;
+    int16_t v = static_cast<int16_t>((seed >> 16) - 32768);
+    s = v;
+  }
+  // 写 WAV 文件
+  std::ofstream out(path, std::ios::binary);
+  BOOST_REQUIRE(out.is_open());
+  uint32_t data_size = static_cast<uint32_t>(num_samples * 2);
+  uint32_t riff_size = 36 + data_size;
+  // RIFF header
+  out.write("RIFF", 4);
+  uint32_t le32 = riff_size;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  out.write("WAVE", 4);
+  // fmt chunk
+  out.write("fmt ", 4);
+  le32 = 16;  // fmt chunk size
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  uint16_t le16 = 1;  // PCM
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 1;  // mono
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le32 = 48000;  // sample rate
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  le32 = 48000 * 2;  // byte rate
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  le16 = 2;  // block align
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 16;  // bits per sample
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  // data chunk
+  out.write("data", 4);
+  le32 = data_size;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  out.write(reinterpret_cast<const char*>(samples.data()),
+            static_cast<std::streamsize>(data_size));
+  out.close();
+}
+
+// 读取文件为字节串（供 multipart 上传）。
+inline std::string read_file_bytes(const std::string& path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(in)), {});
+}
+
+BOOST_AUTO_TEST_SUITE(noise_template_api_tests)
+
+// CRUD：POST 上传 WAV -> GET 列表 -> GET 详情 -> DELETE。
+BOOST_AUTO_TEST_CASE(template_crud_via_http) {
+  const char* d = "test_tpl_dir";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // POST multipart 上传 WAV
+  write_test_wav("test_tpl.wav");
+  std::string wav_bytes = read_file_bytes("test_tpl.wav");
+  httplib::MultipartFormDataItems items = {
+      {"label", "空调噪声", "", ""},
+      {"description", "机房空调", "", ""},
+      {"wav", wav_bytes, "test.wav", "audio/wav"}};
+  auto r1 = cli.Post("/api/noise/template", items);
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 200);
+  BOOST_CHECK(r1->body.find("\"id\"") != std::string::npos);
+  // 提取返回的 id
+  auto id_pos = r1->body.find("\"id\": ");
+  BOOST_REQUIRE(id_pos != std::string::npos);
+  uint32_t returned_id =
+      static_cast<uint32_t>(std::stoi(r1->body.substr(id_pos + 6)));
+
+  // GET templates 列表
+  auto r2 = cli.Get("/api/noise/templates");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK(r2->body.find("\"templates\"") != std::string::npos);
+  BOOST_CHECK(r2->body.find("空调噪声") != std::string::npos);
+
+  // GET template/:id 详情（含 bark_spectrum）
+  auto r3 = cli.Get("/api/noise/template/" + std::to_string(returned_id));
+  BOOST_REQUIRE(r3);
+  BOOST_CHECK_EQUAL(r3->status, 200);
+  BOOST_CHECK(r3->body.find("bark_spectrum") != std::string::npos);
+  BOOST_CHECK(r3->body.find("wav_file") != std::string::npos);
+
+  // GET template/:id/wav - 回听 WAV
+  auto r4 =
+      cli.Get("/api/noise/template/" + std::to_string(returned_id) + "/wav");
+  BOOST_REQUIRE(r4);
+  BOOST_CHECK_EQUAL(r4->status, 200);
+  BOOST_CHECK_EQUAL(r4->body.size(), wav_bytes.size());
+
+  // PUT 更新 label/description（JSON body，非 multipart）
+  auto r5 = cli.Put("/api/noise/template/" + std::to_string(returned_id),
+                    R"({"label":"空调噪声v2","description":"更新描述"})",
+                    "application/json");
+  BOOST_REQUIRE(r5);
+  BOOST_CHECK_EQUAL(r5->status, 200);
+  auto r6 = cli.Get("/api/noise/template/" + std::to_string(returned_id));
+  BOOST_REQUIRE(r6);
+  BOOST_CHECK(r6->body.find("空调噪声v2") != std::string::npos);
+
+  // DELETE
+  auto r7 = cli.Delete("/api/noise/template/" + std::to_string(returned_id));
+  BOOST_REQUIRE(r7);
+  BOOST_CHECK_EQUAL(r7->status, 200);
+  auto r8 = cli.Get("/api/noise/template/" + std::to_string(returned_id));
+  BOOST_REQUIRE(r8);
+  BOOST_CHECK_EQUAL(r8->status, 404);
+
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
+  std::remove("test_tpl.wav");
+}
+
+// 非法 WAV（非 48kHz）返回 400。
+BOOST_AUTO_TEST_CASE(template_post_rejects_non_48k_wav) {
+  const char* d = "test_tpl_dir_2";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // 构造 44.1kHz WAV（非法）
+  std::ostringstream wav_ss;
+  wav_ss.write("RIFF", 4);
+  uint32_t le32 = 36 + 4;
+  wav_ss.write(reinterpret_cast<const char*>(&le32), 4);
+  wav_ss.write("WAVE", 4);
+  wav_ss.write("fmt ", 4);
+  le32 = 16;
+  wav_ss.write(reinterpret_cast<const char*>(&le32), 4);
+  uint16_t le16 = 1;
+  wav_ss.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 1;
+  wav_ss.write(reinterpret_cast<const char*>(&le16), 2);
+  le32 = 44100;  // 非 48kHz
+  wav_ss.write(reinterpret_cast<const char*>(&le32), 4);
+  le32 = 44100 * 2;
+  wav_ss.write(reinterpret_cast<const char*>(&le32), 4);
+  le16 = 2;
+  wav_ss.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 16;
+  wav_ss.write(reinterpret_cast<const char*>(&le16), 2);
+  wav_ss.write("data", 4);
+  le32 = 4;
+  wav_ss.write(reinterpret_cast<const char*>(&le32), 4);
+  wav_ss.write("\0\0\0\0", 4);
+  std::string bad_wav = wav_ss.str();
+
+  httplib::MultipartFormDataItems items = {
+      {"label", "bad", "", ""}, {"wav", bad_wav, "test.wav", "audio/wav"}};
+  auto r = cli.Post("/api/noise/template", items);
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 400);
+
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
+}
+
+// 导入导出 roundtrip。
+BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
+  const char* d = "test_tpl_dir_3";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // 录入一个模板
+  write_test_wav("test_tpl2.wav");
+  std::string wav_bytes = read_file_bytes("test_tpl2.wav");
+  httplib::MultipartFormDataItems items = {
+      {"label", "风扇噪声", "", ""},
+      {"wav", wav_bytes, "test.wav", "audio/wav"}};
+  auto r1 = cli.Post("/api/noise/template", items);
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 200);
+
+  // 导出
+  auto r2 = cli.Get("/api/noise/templates/export");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  std::string exported = r2->body;
+  BOOST_CHECK(exported.find("风扇噪声") != std::string::npos);
+  BOOST_CHECK(exported.find("bark_spectrum") != std::string::npos);
+
+  // 导入到新 DB（模拟迁移）
+  const char* d2 = "test_tpl_dir_4";
+  std::filesystem::remove_all(d2);
+  std::filesystem::create_directories(d2);
+  noise::NoiseTemplateDB db2;
+  db2.set_dir_for_test(d2);
+  httplib::Server svr2;
+  noise::register_noise_template_routes(svr2, mgr, db2);
+  int port2 = svr2.bind_to_any_port("127.0.0.1");
+  std::thread svr_thread2([&svr2]() { svr2.listen_after_bind(); });
+  httplib::Client cli2("127.0.0.1", port2);
+
+  auto r3 =
+      cli2.Post("/api/noise/templates/import", exported, "application/json");
+  BOOST_REQUIRE(r3);
+  BOOST_CHECK_EQUAL(r3->status, 200);
+  BOOST_CHECK(r3->body.find("\"imported\": 1") != std::string::npos);
+
+  // 验证导入的模板
+  auto r4 = cli2.Get("/api/noise/templates");
+  BOOST_REQUIRE(r4);
+  BOOST_CHECK(r4->body.find("风扇噪声") != std::string::npos);
+
+  // 重复导入同一 label -> 去重（skipped=1）
+  auto r5 =
+      cli2.Post("/api/noise/templates/import", exported, "application/json");
+  BOOST_REQUIRE(r5);
+  BOOST_CHECK_EQUAL(r5->status, 200);
+  BOOST_CHECK(r5->body.find("\"skipped\": 1") != std::string::npos);
+
+  svr.stop();
+  svr2.stop();
+  svr_thread.join();
+  svr_thread2.join();
+  std::filesystem::remove_all(d);
+  std::filesystem::remove_all(d2);
+  std::remove("test_tpl2.wav");
+}
+
+// /template/:id/test 匹配测试。
+BOOST_AUTO_TEST_CASE(template_match_test_via_http) {
+  const char* d = "test_tpl_dir_5";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_CHECK_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // 录入模板
+  write_test_wav("test_tpl3.wav", 4800);
+  std::string wav_bytes = read_file_bytes("test_tpl3.wav");
+  httplib::MultipartFormDataItems items = {
+      {"label", "模板A", "", ""}, {"wav", wav_bytes, "test.wav", "audio/wav"}};
+  auto r1 = cli.Post("/api/noise/template", items);
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 200);
+  auto id_pos = r1->body.find("\"id\": ");
+  uint32_t tid = static_cast<uint32_t>(std::stoi(r1->body.substr(id_pos + 6)));
+
+  // 上传相同 WAV 做匹配测试 -> 应高相似度
+  httplib::MultipartFormDataItems test_items = {
+      {"wav", wav_bytes, "test.wav", "audio/wav"}};
+  auto r2 = cli.Post("/api/noise/template/" + std::to_string(tid) + "/test",
+                     test_items);
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK(r2->body.find("similarity") != std::string::npos);
+  // 相同 WAV -> matched_id 应为 tid，similarity > 0.9
+  BOOST_CHECK(r2->body.find("\"matched_template_id\": " +
+                            std::to_string(tid)) != std::string::npos);
+
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
+  std::remove("test_tpl3.wav");
+}
+
+BOOST_AUTO_TEST_SUITE_END()

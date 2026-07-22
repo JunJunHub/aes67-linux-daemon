@@ -94,7 +94,20 @@ struct DaemonInstance {
 #if defined _MEMORY_CHECK_
       search_path("valgrind"),
 #endif
-      "../aes67-daemon",       "-c", "daemon.conf", "-p", "9999"};
+#ifdef AES67_DAEMON_BIN
+      AES67_DAEMON_BIN,
+#else
+      "../aes67-daemon",
+#endif
+      "-c",
+      "daemon.conf",
+      "-p",
+      "9999"
+#ifdef AES67_DAEMON_TEST_DIR
+      ,
+      process::start_dir = AES67_DAEMON_TEST_DIR
+#endif
+  };
   inline static bool ok{false};
 };
 

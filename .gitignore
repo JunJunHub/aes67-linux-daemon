@@ -140,3 +140,10 @@ packaging/output/
 
 # AES70 docs
 docs/AES70-2023
+# Noise module runtime artifacts
+# (daemon persistence: noise_status.json + noise_templates/ written at CWD by
+#  save_status / NoiseTemplateDB::save; recurs during daemon-test [daemon/tests/]
+#  and manual daemon runs [root]. Not cleaned by tests.)
+# noise-test 的 test_* 临时文件写 daemon/build/（已由 build/ 覆盖忽略）。
+noise_status.json
+noise_templates/

@@ -194,9 +194,9 @@ int main(int argc, char* argv[]) {
       // noise_manager， http_server 需注入 pcm_capture 用于 /denoised /noise
       // 路由）。
       auto pcm_capture = PcmCaptureService::create(session_manager, config);
-      if (pcm_capture == nullptr || !pcm_capture->init()) {
+      if (pcm_capture == nullptr) {
         throw std::runtime_error(
-            std::string("PcmCaptureService:: init failed"));
+            std::string("PcmCaptureService:: create failed"));
       }
       auto noise_bridge =
           std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
@@ -226,6 +226,16 @@ int main(int argc, char* argv[]) {
             else if (status == "unlocked")
               noise_manager->on_ptp_unlocked();
           });
+      // init() 须在两个 forward callback 装配之后调用：init() 会直接调
+      // on_ptp_status_change（用缓存的 status），此时 forward cb 须已就绪，
+      // 否则 FAKE_DRIVER 下唯一的 ""->"unlocked" 触发时 cb 为 null ->
+      // ptp_locked_ 不被置 true -> pipeline 不启用（T6b review Minor M1
+      // 修复）。 真实硬件不受影响（PTP 自然 unlocked->locked 转换会再次触发，cb
+      // 已就绪）。
+      if (!pcm_capture->init()) {
+        throw std::runtime_error(
+            std::string("PcmCaptureService:: init failed"));
+      }
 #endif
 
       /* start mDNS server */

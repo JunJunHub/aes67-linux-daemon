@@ -474,7 +474,7 @@ BOOST_AUTO_TEST_CASE(get_config) {
 #else
   BOOST_CHECK_MESSAGE(mdns_enabled == false, "config as excepcted");
 #endif
-  BOOST_CHECK_MESSAGE(streamer_enabled == false, "config as excepcted");
+  BOOST_CHECK_MESSAGE(streamer_enabled == true, "config as excepcted");
   BOOST_CHECK_MESSAGE(streamer_channels == 8, "config as excepcted");
   BOOST_CHECK_MESSAGE(streamer_files_num == 6, "config as excepcted");
   BOOST_CHECK_MESSAGE(streamer_file_duration == 3, "config as excepcted");
@@ -955,3 +955,144 @@ BOOST_AUTO_TEST_CASE(add_remove_check_mdns_browser_update_all) {
                         "no remote mdns sources found");
 }
 #endif
+
+// ── Spec4 T2: Streamer PCM 直通 ?format=pcm（arch §5.2）──────────────────
+// 三路 ?format=pcm 分支测试：原始/降噪/噪声路返回 audio/pcm + 16-bit LE；
+// denoise 关闭时降噪/噪声路 404；AAC 默认路不受影响。
+// 依赖 in-process daemon（FAKE_DRIVER + WITH_NOISE + WITH_STREAMER）。
+// PcmCaptureService fake_capture_loop 分发静音帧 -> NoiseManager pipeline
+// 填充 DenoiseOutput -> Streamer encode_pcm 返回 S16 LE bytes。
+
+// 辅助：添加/删除 noise sensor。
+static bool add_noise_sensor(uint8_t sensor_id,
+                             uint8_t sink_id,
+                             bool denoise_enabled) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+  std::string url =
+      std::string("/api/noise/sensor/") + std::to_string(sensor_id);
+  std::ostringstream os;
+  os << "{\"sink_id\": " << static_cast<int>(sink_id)
+     << ", \"denoise_enabled\": " << (denoise_enabled ? "true" : "false")
+     << ", \"denoise_plugin\": \"passthrough\"" << ", \"enabled\": true}";
+  auto res = cli.Put(url.c_str(), os.str(), "application/json");
+  return res && res->status == 200;
+}
+
+static bool remove_noise_sensor(uint8_t sensor_id) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+  std::string url =
+      std::string("/api/noise/sensor/") + std::to_string(sensor_id);
+  auto res = cli.Delete(url.c_str());
+  return res && res->status == 200;
+}
+
+BOOST_AUTO_TEST_CASE(pcm_passthrough_original) {
+  // 1. 添加 noise sensor（denoise 开启，passthrough plugin）
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  // 2. 等待 pipeline 处理静音帧（≥1 period ≈ 128ms，等 2s 足够）
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  // 3. GET /api/streamer/stream/0?format=pcm
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+  httplib::Params params = {{"format", "pcm"}};
+  auto res = cli.Get("/api/streamer/stream/0", params, httplib::Headers{});
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_TEST_MESSAGE("PCM original: status="
+                     << res->status << " content-type="
+                     << res->get_header_value("Content-Type")
+                     << " body_size=" << res->body.size()
+                     << " body=" << res->body.substr(0, 80));
+  BOOST_CHECK_EQUAL(res->status, 200);
+  BOOST_CHECK_EQUAL(res->get_header_value("Content-Type"), "audio/pcm");
+  // 4. 16-bit LE：body 非空 + 偶数长度
+  BOOST_CHECK_GT(res->body.size(), 0u);
+  BOOST_CHECK_EQUAL(res->body.size() % 2, 0u);
+  // 5. 解码 int16 回 float，验证等价原始帧（静音 ≈ 0）
+  const int16_t* s16 = reinterpret_cast<const int16_t*>(res->body.data());
+  size_t n = res->body.size() / 2;
+  for (size_t i = 0; i < n; ++i) {
+    float f = static_cast<float>(s16[i]) / 32768.0f;
+    BOOST_CHECK_SMALL(f, 0.001f);
+  }
+
+  // 清理
+  remove_noise_sensor(0);
+}
+
+BOOST_AUTO_TEST_CASE(pcm_passthrough_denoised) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+  httplib::Params params = {{"format", "pcm"}};
+
+  // Case 1: denoise 开启 -> 200 + audio/pcm + 16-bit LE
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true),
+                        "added noise sensor 0 (denoise on)");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  auto res =
+      cli.Get("/api/streamer/stream/0/denoised", params, httplib::Headers{});
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res->status, 200);
+  BOOST_CHECK_EQUAL(res->get_header_value("Content-Type"), "audio/pcm");
+  BOOST_CHECK_GT(res->body.size(), 0u);
+  BOOST_CHECK_EQUAL(res->body.size() % 2, 0u);
+  remove_noise_sensor(0);
+
+  // Case 2: denoise 关闭 -> 404
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, false),
+                        "added noise sensor 0 (denoise off)");
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  auto res2 =
+      cli.Get("/api/streamer/stream/0/denoised", params, httplib::Headers{});
+  BOOST_REQUIRE_MESSAGE(res2 != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res2->status, 404);
+  remove_noise_sensor(0);
+}
+
+BOOST_AUTO_TEST_CASE(pcm_passthrough_noise) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+  httplib::Params params = {{"format", "pcm"}};
+
+  // Case 1: denoise 开启 -> 200 + audio/pcm + 16-bit LE
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true),
+                        "added noise sensor 0 (denoise on)");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  auto res =
+      cli.Get("/api/streamer/stream/0/noise", params, httplib::Headers{});
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res->status, 200);
+  BOOST_CHECK_EQUAL(res->get_header_value("Content-Type"), "audio/pcm");
+  BOOST_CHECK_GT(res->body.size(), 0u);
+  BOOST_CHECK_EQUAL(res->body.size() % 2, 0u);
+  remove_noise_sensor(0);
+
+  // Case 2: denoise 关闭 -> 404
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, false),
+                        "added noise sensor 0 (denoise off)");
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  auto res2 =
+      cli.Get("/api/streamer/stream/0/noise", params, httplib::Headers{});
+  BOOST_REQUIRE_MESSAGE(res2 != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res2->status, 404);
+  remove_noise_sensor(0);
+}
+
+BOOST_AUTO_TEST_CASE(aac_route_unchanged) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(30);
+  cli.set_read_timeout(30);
+
+  // 不加 ?format=pcm -> 既有 AAC 路行为不变（Content-Type != audio/pcm）
+  // 原始 AAC 路可能因无 sink 数据返回错误，但 Content-Type 绝不是 audio/pcm
+  auto res = cli.Get("/api/streamer/stream/0");
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_NE(res->get_header_value("Content-Type"), "audio/pcm");
+}

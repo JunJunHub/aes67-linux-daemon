@@ -793,4 +793,56 @@ std::error_code Streamer::encode_denoise_aac(uint8_t sink_id,
   out.assign(reinterpret_cast<const char*>(out_buf.data()), ret);
   return std::error_code{};
 }
+
+// Spec4 T2：PCM 直通 - float [-1,1] -> S16 LE（arch §5.2 + D-S4.6）。
+// 与 encode_denoise_aac 的 float->S16 转换一致（v * 32767.0f + clamp [-1,1]）。
+// 输出 16-bit signed LE interleaved，skip faac 编码。
+static void float_to_s16_le(const float* src, size_t n, std::string& out) {
+  out.resize(n * sizeof(int16_t));
+  int16_t* dst = reinterpret_cast<int16_t*>(out.data());
+  for (size_t i = 0; i < n; ++i) {
+    float v = src[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    dst[i] = static_cast<int16_t>(v * 32767.0f);
+  }
+}
+
+// Spec4 T2：原始路 PCM 直通 - 取 DenoiseOutput.original（arch §3.4 L649
+// 统一三路接口）。
+std::error_code Streamer::encode_original_pcm(uint8_t sink_id,
+                                              std::string& out) {
+  if (!noise_manager_) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const noise::DenoiseOutput* dout =
+      noise_manager_->get_denoise_output(sink_id);
+  if (dout == nullptr || dout->frame_count == 0 || dout->original == nullptr) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  float_to_s16_le(dout->original, dout->frame_count, out);
+  return std::error_code{};
+}
+
+// Spec4 T2：降噪/噪声路 PCM 直通 - 取 DenoiseOutput.denoised 或 .noise。
+std::error_code Streamer::encode_denoise_pcm(uint8_t sink_id,
+                                             bool denoised,
+                                             std::string& out) {
+  if (!noise_manager_) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const noise::DenoiseOutput* dout =
+      noise_manager_->get_denoise_output(sink_id);
+  if (dout == nullptr || dout->frame_count == 0) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const float* src = denoised ? dout->denoised : dout->noise;
+  if (src == nullptr) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  float_to_s16_le(src, dout->frame_count, out);
+  return std::error_code{};
+}
 #endif

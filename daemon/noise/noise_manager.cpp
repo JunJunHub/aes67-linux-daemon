@@ -286,6 +286,17 @@ void NoiseManager::on_ptp_unlocked() {
   reset_pending_.store(true);
 }
 
+void NoiseManager::on_ptp_locked() {
+  // Spec3 Task 6b（C1 修复）：on_ptp_unlocked 的对偶。置 ptp_locked_=true
+  // 启用 pipeline（on_frame 不再短路）+ 清 reset_pending_（若有先前 unlock
+  // 残留的 pending reset，PTP 重新锁定后不再需要）。均 atomic，无锁。
+  // 生产环境由 PcmCaptureService::on_ptp_status_change 经
+  // ptp_status_forward_cb_("locked") 转发调用。此前 ptp_locked_ 仅由 test hook
+  // set_ptp_locked_for_test 设置，生产 pipeline 永不运行（C1）。
+  ptp_locked_.store(true);
+  reset_pending_.store(false);
+}
+
 void NoiseManager::on_capture_thread_joined() {
   // arch §3.7 L862 path A gate：PcmCaptureService 在 PTP unlock 时
   // snd_pcm_drop+close+join capture 线程后回调本方法（控制线程）。

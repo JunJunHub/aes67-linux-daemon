@@ -158,7 +158,7 @@ class Streamer {
   uint32_t file_counter_{0};
   std::atomic<uint8_t> file_id_{0};
   std::unique_ptr<uint8_t[]> buffer_;
-  std::unordered_map<uint8_t, std::unique_ptr<uint8_t[]>> out_buffer_;
+  std::unordered_map<uint8_t, std::unique_ptr<uint8_t[]> > out_buffer_;
   std::unordered_map<uint8_t, uint32_t> out_buffer_size_{0};
   uint8_t channels_{8};
   uint32_t rate_{0};

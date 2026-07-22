@@ -214,6 +214,18 @@ int main(int argc, char* argv[]) {
       // 线程，capture 已静止 -> 安全 plugin->reset()）。
       pcm_capture->set_capture_joined_callback(
           [noise_manager]() { noise_manager->on_capture_thread_joined(); });
+      // Spec3 Task 6b（C1 修复）：转发 PTP 状态到 NoiseManager。
+      // PcmCaptureService 已做 FAKE_DRIVER 转译（fake "unlocked" ->
+      // "locked"）， 此处按已转译的 status 路由到 on_ptp_locked /
+      // on_ptp_unlocked。 修复 C1：此前 ptp_locked_ 仅由 test hook 设置，生产
+      // pipeline 永不运行。
+      pcm_capture->set_ptp_status_forward_callback(
+          [noise_manager](const std::string& status) {
+            if (status == "locked")
+              noise_manager->on_ptp_locked();
+            else if (status == "unlocked")
+              noise_manager->on_ptp_unlocked();
+          });
 #endif
 
       /* start mDNS server */

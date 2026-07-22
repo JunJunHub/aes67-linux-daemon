@@ -39,6 +39,13 @@ class PcmCaptureService
   // 调用方（T6 装配）负责把回调路由到 NoiseManager。FAKE_DRIVER 下
   // stop_capture 同样 join fake_capture_loop，回调语义一致。
   using CaptureJoinedCallback = std::function<void()>;
+  // Spec3 Task 6b（C1 修复）：PTP 状态转发回调（init-only，同
+  // CaptureJoinedCallback 模式）。PcmCaptureService::on_ptp_status_change 经此
+  // 把已转译的 "locked"/"unlocked" 转发给 NoiseManager::on_ptp_locked /
+  // on_ptp_unlocked。 修复 C1：此前 ptp_locked_ 仅由 test hook 设置，生产
+  // pipeline 永不运行。
+  using PtpStatusForwardCallback =
+      std::function<void(const std::string& status)>;
 
   static std::shared_ptr<PcmCaptureService> create(
       std::shared_ptr<SessionManager> session_manager,
@@ -49,6 +56,9 @@ class PcmCaptureService
   // Spec3 Task 7 path A：注册 capture 线程 join 后回调。init-only（运行期不改，
   // 避免 std::function 读写竞态）。
   void set_capture_joined_callback(CaptureJoinedCallback cb);
+  // Spec3 Task 6b：注册 PTP 状态转发回调。init-only（同
+  // set_capture_joined_callback 模式）。
+  void set_ptp_status_forward_callback(PtpStatusForwardCallback cb);
 
   ProviderToken register_provider(FrameProvider provider);
   void unregister_provider(ProviderToken token);
@@ -112,6 +122,8 @@ class PcmCaptureService
   noise::RetireQueue<std::vector<ProviderEntry>> providers_retire_;
   // Spec3 Task 7 path A：capture 线程 join 后回调（init-only，运行期不改）。
   CaptureJoinedCallback capture_joined_cb_;
+  // Spec3 Task 6b：PTP 状态转发回调（init-only，运行期不改）。
+  PtpStatusForwardCallback ptp_status_forward_cb_;
   // 测试用 fake 参数
   uint32_t test_rate_{48000};
   uint8_t test_channels_{2};

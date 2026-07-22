@@ -126,17 +126,30 @@ bool PcmCaptureService::is_capturing() const {
 bool PcmCaptureService::on_ptp_status_change(const std::string& status) {
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: ptp status " << status;
 #ifdef _USE_FAKE_DRIVER_
-  // FAKE_DRIVER：PTP 永远 UNLOCKED，忽略 PTP 状态直接起 fake loop（§4.3）
+  // FAKE_DRIVER：PTP 永远 UNLOCKED，忽略 PTP 状态直接起 fake loop（§4.3）。
+  // 但需 forward "locked" 给 NoiseManager 使 pipeline 运行（C1 修复）：
+  // fake "unlocked" 在功能上等价于 locked（无真实 PTP 可失锁）。
   if (!running_.load() && status == "unlocked") {
-    return start_capture();
+    bool ok = start_capture();
+    if (ptp_status_forward_cb_)
+      ptp_status_forward_cb_("locked");
+    return ok;
   }
   return true;
 #else
   if (status == "locked") {
-    return start_capture();
+    bool ok = start_capture();
+    // Spec3 Task 6b（C1 修复）：forward "locked" -> NoiseManager::on_ptp_locked
+    // 启用 pipeline。
+    if (ptp_status_forward_cb_)
+      ptp_status_forward_cb_("locked");
+    return ok;
   } else if (status == "unlocked") {
-    // arch §3.7 L862 path A：stop_capture join capture 线程后通知
-    // NoiseManager 执行 plugin->reset()（经 capture_joined_cb_ 回调）。
+    // arch §3.7 L862 path A：先 forward "unlocked" 置 reset_pending_=true，
+    // 再 stop_capture join capture 线程 -> capture_joined_cb_ 回调
+    // -> on_capture_thread_joined（控制线程，capture 已静止 -> 安全 reset）。
+    if (ptp_status_forward_cb_)
+      ptp_status_forward_cb_("unlocked");
     bool ok = stop_capture();
     if (capture_joined_cb_)
       capture_joined_cb_();
@@ -150,6 +163,12 @@ void PcmCaptureService::set_capture_joined_callback(CaptureJoinedCallback cb) {
   // init-only：运行期不再改，避免 std::function 读写竞态（同
   // DenoiseProcessor::set_latency_change_cb 模式）。
   capture_joined_cb_ = std::move(cb);
+}
+
+void PcmCaptureService::set_ptp_status_forward_callback(
+    PtpStatusForwardCallback cb) {
+  // init-only：同 set_capture_joined_callback 模式。
+  ptp_status_forward_cb_ = std::move(cb);
 }
 
 bool PcmCaptureService::on_sink_add(uint8_t /*id*/) {

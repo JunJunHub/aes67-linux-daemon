@@ -314,6 +314,43 @@ BOOST_AUTO_TEST_CASE(ptp_unlock_reset_exactly_once_per_sensor) {
   BOOST_CHECK_EQUAL(mgr.plugin_reset_count_for_test(0), 1u);
 }
 
+// ── Spec3 Task 6b：on_ptp_locked 启用 pipeline（C1 修复）─────────────────
+// arch §3.7 L862：on_ptp_locked 是 on_ptp_unlocked 的对偶 -- 置
+// ptp_locked_=true
+// + 清 reset_pending_。生产环境由 PcmCaptureService::on_ptp_status_change
+// 经 ptp_status_forward_cb_ 转发。本测试验证 on_ptp_locked() 后 on_frame 不再
+// 短路、pipeline 产出数据。
+BOOST_AUTO_TEST_CASE(on_ptp_locked_enables_pipeline) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  mgr.add_sensor(0, 0, cfg);
+  // 模拟先 unlock（置 reset_pending_=true + ptp_locked_=false）
+  mgr.on_ptp_unlocked();
+  BOOST_CHECK(mgr.is_reset_pending_for_test());
+  // on_ptp_locked：启用 pipeline + 清残留 reset_pending_
+  mgr.on_ptp_locked();
+  BOOST_CHECK(mgr.is_ptp_locked_for_test());
+  BOOST_CHECK(!mgr.is_reset_pending_for_test());
+  // pipeline 应运行：on_frame 产出 denoise output + metrics 非默认
+  float in[synth::kFrameSize];
+  synth::white_noise(in, synth::kFrameSize, 7);
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, synth::kFrameSize);
+  mgr.on_period_end();
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0u);
+  const auto* out = mgr.get_denoise_output(0);
+  BOOST_CHECK(out != nullptr);
+  BOOST_CHECK_GT(out->frame_count, 0u);
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(0, snap));
+  // input_level 反映输入 PCM RMS（白噪声），pipeline 实际聚合后应高于 -100dBfs
+  // 默认值。注意 noise_level_dbfs 对 passthrough 是
+  // -120（noise=orig-denoised=0）， 故用 input_level_dbfs 断言 pipeline 运行。
+  BOOST_CHECK_GT(snap.input_level_dbfs, -100.0f);
+}
+
 BOOST_AUTO_TEST_SUITE_END()  // noise_ptp_path_a_tests
 
 // ── Spec3 Task 6：get_denoise_output 访问器（arch §4.4）──────────────────

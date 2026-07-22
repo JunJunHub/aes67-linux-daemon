@@ -145,6 +145,12 @@ class NoiseManager {
   // 不直接调 plugin->reset()（会与 RT process() 竞态）。真实 reset 由
   // on_capture_thread_joined() 在 PcmCaptureService join capture 线程后调用。
   void on_ptp_unlocked();
+  // Spec3 Task 6b（C1 修复）：on_ptp_unlocked 的对偶。置 ptp_locked_=true +
+  // 清 reset_pending_。生产环境由 PcmCaptureService::on_ptp_status_change 经
+  // ptp_status_forward_cb_ 转发 "locked" 调用（FAKE_DRIVER 下 fake "unlocked"
+  // 被转译为 "locked"，§4.3）。 修复 C1：此前 ptp_locked_ 仅由 test hook 设置，
+  // 生产 pipeline 永不运行。
+  void on_ptp_locked();
   // path A gate：PcmCaptureService 在 PTP unlock 时 snd_pcm_drop+close+join
   // capture 线程后回调本方法（控制线程）。capture 线程已静止 -> 无 in-flight
   // process() -> 安全 per-sensor plugin->reset() + 清 reset_pending_。

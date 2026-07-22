@@ -706,3 +706,86 @@ bool Streamer::live_stream_wait(httplib::DataSink& httpSink,
   }
   return true;
 }
+
+#ifdef _USE_NOISE_
+// Spec3 Task 6：三路 AAC 编码 - /denoised /noise 路由入口（arch §4.4/§5.2）。
+// 从 NoiseManager::get_denoise_output(sink_id) 拿 front 缓冲（previous period
+// 的 DenoiseOutput），取 denoised 或 noise 通道的 float 样本，转 S16 后经
+// faac 编码为 ADTS AAC 返回。
+//   denoised=true  -> out->denoised（降噪后 PCM）
+//   denoised=false -> out->noise（噪声分量 = original - denoised）
+// sensor 不存在 / denoise 关 -> get_denoise_output 返回 nullptr ->
+// error（404）。 线程安全：HTTP 控制线程调用，front 缓冲 cross-thread
+// 读安全（RT 写 back， on_period_end swap front/back，arch §4.4 约束1）。
+std::error_code Streamer::encode_denoise_aac(uint8_t sink_id,
+                                             bool denoised,
+                                             std::string& out) {
+  if (!noise_manager_) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const noise::DenoiseOutput* dout =
+      noise_manager_->get_denoise_output(sink_id);
+  if (dout == nullptr || dout->frame_count == 0) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const float* src = denoised ? dout->denoised : dout->noise;
+  if (src == nullptr) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+
+  // float [-1,1] -> S16 LE
+  size_t n = dout->frame_count;
+  std::vector<int16_t> s16(n);
+  for (size_t i = 0; i < n; ++i) {
+    float v = src[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    s16[i] = static_cast<int16_t>(v * 32767.0f);
+  }
+
+  // 临时 faac 编码器（1 通道，config 采样率）。
+  unsigned long in_samples = 0;
+  unsigned long out_buf_size = 0;
+  faacEncHandle enc =
+      faacEncOpen(config_->get_sample_rate(), 1, &in_samples, &out_buf_size);
+  if (!enc) {
+    BOOST_LOG_TRIVIAL(error)
+        << "streamer:: encode_denoise_aac: faacEncOpen failed";
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  faacEncConfigurationPtr faac_cfg = faacEncGetCurrentConfiguration(enc);
+  if (faac_cfg) {
+    faac_cfg->aacObjectType = LOW;
+    faac_cfg->mpegVersion = MPEG4;
+    faac_cfg->useTns = 0;
+    faac_cfg->useLfe = 0;
+    faac_cfg->shortctl = SHORTCTL_NORMAL;
+    faac_cfg->allowMidside = 2;
+    faac_cfg->bitRate = 64000;
+    faac_cfg->outputFormat = 1;  // ADTS
+    faac_cfg->inputFormat = FAAC_INPUT_16BIT;
+    faacEncSetConfiguration(enc, faac_cfg);
+  }
+
+  // faac 需 in_samples 个样本/帧。front 缓冲通常 480 样本 < 1024（AAC-LC），
+  // 补零到 in_samples 后一次编码。
+  std::vector<int16_t> buf(in_samples, 0);
+  size_t copy_n = std::min(n, static_cast<size_t>(in_samples));
+  std::copy(s16.data(), s16.data() + copy_n, buf.data());
+
+  std::vector<uint8_t> out_buf(out_buf_size);
+  int ret = faacEncEncode(enc, reinterpret_cast<int32_t*>(buf.data()),
+                          in_samples, out_buf.data(), out_buf_size);
+  faacEncClose(enc);
+
+  if (ret < 0) {
+    BOOST_LOG_TRIVIAL(error)
+        << "streamer:: encode_denoise_aac: faacEncEncode failed";
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  out.assign(reinterpret_cast<const char*>(out_buf.data()), ret);
+  return std::error_code{};
+}
+#endif

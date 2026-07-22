@@ -152,6 +152,18 @@ class NoiseManager {
   // 外不可用。
   void on_capture_thread_joined();
 
+  // ── Spec3 Task 6 Streamer 三路数据通路（arch §4.4）──
+  // get_denoise_output(sink_id): 返回指定 sink 的 DenoiseProcessor front 缓冲
+  //   （previous period 的 DenoiseOutput，与 DenoiseProcessor::get_output()
+  //   同义）。Streamer / HTTP 线程调用：cross-thread 读 front 安全（RT 路径
+  //   写 back_，on_period_end swap front/back，读者 acquire 与 swap release
+  //   配对，arch §4.4 约束1）。 返回 nullptr 若：
+  //   - 无 sensor 匹配 sink_id
+  //   - sensor 的 denoise_enabled=false（denoise 关 -> HTTP /denoised 404）
+  //   返回的 DenoiseOutput* 在下次 on_period_end swap 前有效（arch §11
+  //   风险23）。
+  const DenoiseOutput* get_denoise_output(uint8_t sink_id) const;
+
   // 测试钩子（spec §D 接受此模式）
   size_t sensor_count_for_test() const;
   bool is_ptp_locked_for_test() const { return ptp_locked_.load(); }

@@ -681,4 +681,14 @@ void register_noise_template_routes(httplib::Server& svr,
       });
 }
 
+// register_noise_routes：聚合 sensor + template 路由（arch §5.1 + §5.3）。
+// T6 main.cpp 装配时调用一次，把全部 /api/noise/* 路由注册到同一
+// httplib::Server。 顺序无关（路由按 method+path 匹配，无重叠）。
+void register_noise_routes(httplib::Server& svr,
+                           NoiseManager& mgr,
+                           NoiseTemplateDB& template_db) {
+  register_noise_sensor_routes(svr, mgr);
+  register_noise_template_routes(svr, mgr, template_db);
+}
+
 }  // namespace noise

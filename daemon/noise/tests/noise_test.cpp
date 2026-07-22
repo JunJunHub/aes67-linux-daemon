@@ -165,6 +165,7 @@ BOOST_AUTO_TEST_CASE(fake_capture_loop_dispatches_to_provider) {
 BOOST_AUTO_TEST_SUITE_END()
 
 #include "noise_manager.hpp"
+#include "tests/synth_audio.hpp"
 #include <chrono>
 #include <thread>
 
@@ -315,11 +316,64 @@ BOOST_AUTO_TEST_CASE(ptp_unlock_reset_exactly_once_per_sensor) {
 
 BOOST_AUTO_TEST_SUITE_END()  // noise_ptp_path_a_tests
 
+// ── Spec3 Task 6：get_denoise_output 访问器（arch §4.4）──────────────────
+// Streamer 三路 AAC 经 NoiseManager::get_denoise_output 拿 front 缓冲。
+// 返回 nullptr 若 sensor 不存在 / denoise_enabled=false。
+BOOST_AUTO_TEST_SUITE(noise_streamer_three_path_tests)
+
+// get_denoise_output 返回 front 缓冲（previous period 的 DenoiseOutput）。
+// passthrough plugin：denoised == original（add_sensor 默认装 passthrough，
+// 不调 switch_plugin 以免触发静音窗口）。
+BOOST_AUTO_TEST_CASE(get_denoise_output_returns_front) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  // cfg.plugin_name 默认 "passthrough"，add_sensor 直装，无静音窗口。
+  mgr.add_sensor(0, 0, cfg);
+  mgr.set_ptp_locked_for_test(true);
+  float in[synth::kFrameSize];
+  synth::white_noise(in, synth::kFrameSize, 1);
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, synth::kFrameSize);
+  mgr.on_period_end();
+  const auto* out = mgr.get_denoise_output(0);
+  BOOST_CHECK(out != nullptr);
+  BOOST_CHECK_GT(out->frame_count, 0u);
+  // passthrough: denoised == original
+  BOOST_CHECK_CLOSE(out->denoised[0], out->original[0], 0.01);
+}
+
+// sensor 不存在 -> nullptr。
+BOOST_AUTO_TEST_CASE(get_denoise_output_null_when_no_sensor) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  BOOST_CHECK(mgr.get_denoise_output(99) == nullptr);
+}
+
+// denoise_enabled=false -> nullptr（denoise 关 -> 404）。
+BOOST_AUTO_TEST_CASE(get_denoise_output_null_when_denoise_disabled) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;  // 默认 false，显式
+  mgr.add_sensor(0, 0, cfg);
+  mgr.set_ptp_locked_for_test(true);
+  float in[synth::kFrameSize];
+  synth::white_noise(in, synth::kFrameSize, 2);
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, synth::kFrameSize);
+  mgr.on_period_end();
+  // denoise_enabled=false -> 返回 nullptr（HTTP /denoised -> 404）。
+  BOOST_CHECK(mgr.get_denoise_output(0) == nullptr);
+}
+
+BOOST_AUTO_TEST_SUITE_END()  // noise_streamer_three_path_tests
+
 BOOST_AUTO_TEST_SUITE_END()  // noise_manager_tests
 
 #include "noise_detector.hpp"
 #include "vad.hpp"
-#include "tests/synth_audio.hpp"
 
 BOOST_AUTO_TEST_SUITE(noise_detector_tests)
 // SimpleEnergyVad: 学完 15 帧静音 noise floor 后,静音判非语音、speech_like

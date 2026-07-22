@@ -83,6 +83,14 @@ void register_noise_template_routes(httplib::Server& svr,
                                     NoiseManager& mgr,
                                     NoiseTemplateDB& template_db);
 
+// Spec3 Task 6：聚合注册 sensor + template 路由（main.cpp 单点调用）。
+// 等价于依次调用 register_noise_sensor_routes +
+// register_noise_template_routes。 模板 DB 由调用方持有并传入（review Important
+// #1：DB 独立参数）。
+void register_noise_routes(httplib::Server& svr,
+                           NoiseManager& mgr,
+                           NoiseTemplateDB& template_db);
+
 }  // namespace noise
 
 #endif  // NOISE_NOISE_HTTP_HPP_

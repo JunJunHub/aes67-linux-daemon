@@ -48,6 +48,14 @@ class HttpServer {
   bool init();
   bool terminate();
 
+#ifdef _USE_NOISE_
+  // Spec3 Task 6：暴露内部 httplib::Server 供 main.cpp 注入 /api/noise/*
+  // 路由（register_noise_routes）。init() 之后调用（svr_ 已配置但未 listen）。
+  // YAGNI：不新增 HttpServer 上的 noise-specific 方法，直接暴露 server() 让
+  // noise 模块用自己的 register_noise_routes 注册。
+  httplib::Server& server() { return svr_; }
+#endif
+
  private:
   std::shared_ptr<SessionManager> session_manager_;
   std::shared_ptr<Browser> browser_;

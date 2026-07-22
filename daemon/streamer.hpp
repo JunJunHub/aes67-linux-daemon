@@ -28,6 +28,7 @@
 #include "session_manager.hpp"
 
 #ifdef _USE_NOISE_
+#include "noise/noise_manager.hpp"
 #include "pcm_capture_service.hpp"
 #endif
 
@@ -67,6 +68,12 @@ class Streamer {
   void set_pcm_capture(std::shared_ptr<PcmCaptureService> pcm_capture) {
     pcm_capture_ = std::move(pcm_capture);
   }
+  // Spec3 Task 6：NoiseManager 注入（arch §4.4）。Streamer 三路 AAC 的
+  // /denoised /noise 路由经 noise_manager_->get_denoise_output 拿 front 缓冲。
+  // 不改 Streamer::create 公开签名，避免上游 sync 冲突。
+  void set_noise_manager(std::shared_ptr<noise::NoiseManager> noise_manager) {
+    noise_manager_ = std::move(noise_manager);
+  }
 #endif
 
   std::error_code get_info(const StreamSink& sink, StreamerInfo& info);
@@ -83,6 +90,17 @@ class Streamer {
   bool live_stream_wait(httplib::DataSink& httpSink,
                         const std::string& ip,
                         int port);
+#ifdef _USE_NOISE_
+  // Spec3 Task 6：三路 AAC - /denoised /noise 路由的编码入口（arch
+  // §4.4/§5.2）。 从 noise_manager_->get_denoise_output(sink_id) 拿 front
+  // 缓冲（previous period），将 float 样本转 S16 后经 faac 编码为 ADTS AAC
+  // 返回。 denoised=true -> out->denoised；false -> out->noise。 sensor 不存在
+  // / denoise 关 -> get_denoise_output 返回 nullptr -> error。 原始
+  // /api/streamer/stream/:sinkId 路由不受影响（byte-for-byte 兼容）。
+  std::error_code encode_denoise_aac(uint8_t sink_id,
+                                     bool denoised,
+                                     std::string& out);
+#endif
 
  protected:
   explicit Streamer(std::shared_ptr<SessionManager> session_manager,
@@ -118,6 +136,9 @@ class Streamer {
 #ifdef _USE_NOISE_
   std::shared_ptr<PcmCaptureService> pcm_capture_;
   PcmCaptureService::ProviderToken pcm_token_{0};
+  // Spec3 Task 6：NoiseManager 引用（arch §4.4）。/denoised /noise 路由经此
+  // 取 front 缓冲。WITH_NOISE=OFF 时不存在此成员（zero-regression 保证）。
+  std::shared_ptr<noise::NoiseManager> noise_manager_;
 #endif
 
   std::shared_ptr<SessionManager> session_manager_;
@@ -137,7 +158,7 @@ class Streamer {
   uint32_t file_counter_{0};
   std::atomic<uint8_t> file_id_{0};
   std::unique_ptr<uint8_t[]> buffer_;
-  std::unordered_map<uint8_t, std::unique_ptr<uint8_t[]> > out_buffer_;
+  std::unordered_map<uint8_t, std::unique_ptr<uint8_t[]>> out_buffer_;
   std::unordered_map<uint8_t, uint32_t> out_buffer_size_{0};
   uint8_t channels_{8};
   uint32_t rate_{0};

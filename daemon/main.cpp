@@ -35,6 +35,14 @@
 #include "streamer.hpp"
 #endif
 
+#ifdef _USE_NOISE_
+#include "noise/noise_http.hpp"
+#include "noise/noise_manager.hpp"
+#include "noise/noise_template_db.hpp"
+#include "noise_session_manager_bridge.hpp"
+#include "pcm_capture_service.hpp"
+#endif
+
 #ifdef _USE_SYSTEMD_
 #include <systemd/sd-daemon.h>
 #endif
@@ -171,6 +179,43 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error(std::string("SessionManager:: init failed"));
       }
 
+#ifdef _USE_NOISE_
+      // Spec3 Task 6 1.11 装配（arch §10 1.11 + §4.4）：
+      //   PcmCaptureService::create(session_manager, config)
+      //   -> NoiseSessionManagerBridge(pcm_capture)
+      //   -> NoiseManager(bridge)
+      //   -> load_status (sensor 配置) + template_db.load (模板库)
+      //   -> register_noise_routes (sensor + template HTTP 路由)
+      //   -> pcm_capture->set_capture_joined_callback (T7 path A：PTP unlock
+      //      后 capture 线程 join -> NoiseManager::on_capture_thread_joined)
+      //   -> streamer->set_noise_manager (Streamer 三路 AAC 持引用)
+      // 顺序约束：必须在 session_manager 之后（PcmCaptureService 注册其
+      // observer），在 streamer/http_server 之前（streamer 需注入
+      // noise_manager， http_server 需注入 pcm_capture 用于 /denoised /noise
+      // 路由）。
+      auto pcm_capture = PcmCaptureService::create(session_manager, config);
+      if (pcm_capture == nullptr || !pcm_capture->init()) {
+        throw std::runtime_error(
+            std::string("PcmCaptureService:: init failed"));
+      }
+      auto noise_bridge =
+          std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
+      auto noise_manager = std::make_shared<noise::NoiseManager>(*noise_bridge);
+      // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
+      if (!config->get_noise_status_file().empty()) {
+        noise_manager->load_status(config->get_noise_status_file());
+      }
+      auto noise_template_db = std::make_shared<noise::NoiseTemplateDB>();
+      if (!config->get_noise_template_dir().empty()) {
+        noise_template_db->load(config->get_noise_template_dir());
+      }
+      // T7 path A 回调：PcmCaptureService 在 PTP unlock -> stop_capture join
+      // capture 线程后回调 -> NoiseManager::on_capture_thread_joined（控制
+      // 线程，capture 已静止 -> 安全 plugin->reset()）。
+      pcm_capture->set_capture_joined_callback(
+          [noise_manager]() { noise_manager->on_capture_thread_joined(); });
+#endif
+
       /* start mDNS server */
       MDNSServer mdns_server(session_manager, config);
       if (config->get_mdns_enabled() && !mdns_server.init()) {
@@ -199,6 +244,21 @@ int main(int argc, char* argv[]) {
       if (!http_server.init()) {
         throw std::runtime_error(std::string("HttpServer:: init failed"));
       }
+
+#ifdef _USE_NOISE_
+      // Spec3 Task 6：Streamer 持 noise_manager 引用（三路 AAC /denoised /noise
+      // 路由需要，arch §4.4）。WITH_STREAMER=OFF 时 streamer 不存在，跳过
+      // （Phase 1 限定：denoise/noise AAC 路由仅在 WITH_STREAMER+WITH_NOISE
+      // 同时启用时可用）。
+#ifdef _USE_STREAMER_
+      if (streamer)
+        streamer->set_noise_manager(noise_manager);
+#endif
+      // 注册 /api/noise/* 路由（sensor + template，arch §5.1/§5.3）。
+      // http_server.init() 之后调用（svr_ 已配置，未 listen）。
+      noise::register_noise_routes(http_server.server(), *noise_manager,
+                                   *noise_template_db);
+#endif
 
       /* load session status from file */
       session_manager->load_status();
@@ -248,6 +308,14 @@ int main(int argc, char* argv[]) {
 
       /* save session status to file */
       session_manager->save_status();
+#ifdef _USE_NOISE_
+      // Spec3 Task 6：shutdown 序列保存 noise 传感器配置（arch §7.6）。
+      // 持 ctrl_mutex_ 防与并发 HTTP 控制操作竞态（review Minor #2）。
+      if (noise_manager)
+        noise_manager->save_status_on_exit();
+      if (noise_template_db && !config->get_noise_template_dir().empty())
+        noise_template_db->save(config->get_noise_template_dir());
+#endif
 
       /* stop http server */
       if (!http_server.terminate()) {

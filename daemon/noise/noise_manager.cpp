@@ -317,6 +317,26 @@ void NoiseManager::on_capture_thread_joined() {
   reset_pending_.store(false);
 }
 
+// ── Spec3 Task 6 Streamer 三路数据通路（arch §4.4）──────────────────────
+// Streamer / HTTP 控制线程调用：返回 front 缓冲（previous period）。
+// RCU load sensor 表（控制线程读，安全），lookup by sink_id -> denoise->
+// get_output()（DenoiseProcessor::get_output 返回 front_view_）。
+const DenoiseOutput* NoiseManager::get_denoise_output(uint8_t sink_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return nullptr;
+  for (const auto& [id, ctx] : *tbl) {
+    (void)id;
+    if (ctx.sink_id != sink_id)
+      continue;
+    // denoise 关 -> 返回 nullptr（HTTP /denoised 404，arch §5.2）。
+    if (!ctx.denoise_enabled || !ctx.denoise)
+      return nullptr;
+    return ctx.denoise->get_output();
+  }
+  return nullptr;
+}
+
 size_t NoiseManager::sensor_count_for_test() const {
   const SensorTable* tbl = sensor_table_.load();
   return tbl ? tbl->size() : 0;

@@ -458,6 +458,64 @@ bool HttpServer::init() {
 #endif
   });
 
+#ifdef _USE_NOISE_
+  // Spec3 Task 6：Streamer 三路 AAC - /denoised /noise 路由（arch §4.4/§5.2）。
+  // 从 noise_manager 经 Streamer::encode_denoise_aac 编码 front 缓冲为 ADTS
+  // AAC。 sensor 不存在 / denoise 关 -> 404。原始 /api/streamer/stream/:sinkId
+  // 不变。 路由需 _USE_STREAMER_（streamer_ 存在）+
+  // _USE_NOISE_（encode_denoise_aac 存在）。WITH_NOISE=OFF
+  // 时整块不编译（zero-regression 保证）。
+#ifdef _USE_STREAMER_
+  svr_.Get("/api/streamer/stream/([0-9]+)/denoised", [this](const Request& req,
+                                                            Response& res) {
+    if (!this->config_->get_streamer_enabled()) {
+      set_error(400, "streamer not enabled", res);
+      return;
+    }
+    uint8_t sinkId;
+    try {
+      sinkId = std::stoi(req.matches[1]);
+    } catch (...) {
+      set_error(400, "failed to convert id", res);
+      return;
+    }
+    std::string aac;
+    auto ret = streamer_->encode_denoise_aac(sinkId, true, aac);
+    if (ret) {
+      set_error(404, "denoise not available for sink " + std::to_string(sinkId),
+                res);
+      return;
+    }
+    set_headers(res, "audio/aac");
+    res.body = std::move(aac);
+  });
+
+  svr_.Get("/api/streamer/stream/([0-9]+)/noise", [this](const Request& req,
+                                                         Response& res) {
+    if (!this->config_->get_streamer_enabled()) {
+      set_error(400, "streamer not enabled", res);
+      return;
+    }
+    uint8_t sinkId;
+    try {
+      sinkId = std::stoi(req.matches[1]);
+    } catch (...) {
+      set_error(400, "failed to convert id", res);
+      return;
+    }
+    std::string aac;
+    auto ret = streamer_->encode_denoise_aac(sinkId, false, aac);
+    if (ret) {
+      set_error(404, "denoise not available for sink " + std::to_string(sinkId),
+                res);
+      return;
+    }
+    set_headers(res, "audio/aac");
+    res.body = std::move(aac);
+  });
+#endif  // _USE_STREAMER_
+#endif  // _USE_NOISE_
+
   svr_.set_logger([](const Request& req, const Response& res) {
     if (res.status == 200) {
       BOOST_LOG_TRIVIAL(info) << "http_server:: " << req.method << " "

@@ -836,29 +836,65 @@ uint8_t NoiseManager::add_ref_comparator(uint8_t ref_sink_id,
 }
 
 bool NoiseManager::remove_ref_comparator(uint8_t comparator_id) {
-  std::lock_guard<std::mutex> lock(ref_mutex_);
-  auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
-                         [comparator_id](const RefComparatorEntry& e) {
-                           return e.id == comparator_id;
-                         });
-  if (it == ref_comparators_.end())
-    return false;
-  // 注销路由：从 ref_routing_ 中移除指向此 comparator 的条目。
-  for (auto& [sink_id, routes] : ref_routing_) {
-    routes.erase(std::remove_if(routes.begin(), routes.end(),
-                                [comparator_id](const RefRoute& r) {
-                                  return r.comparator_id == comparator_id;
-                                }),
-                 routes.end());
+  // Spec4 T4 review fix：移除 comparator 后，若此 cmp_sink 不再被任何
+  // comparator 监控，清除该 sensor 的 ref_configured_ + ref_* 字段。
+  // 否则 stale ref_similarity 会卡死告警去抖（desired != None 永不 clear）。
+  // 在 ref_mutex_ 内计算决策，释放后执行 clear_ref_configured（避免
+  // ref_mutex_ -> metrics_mutex_ 嵌套，虽然 comparison_loop 已有此序但保持
+  // remove 路径干净）。
+  uint8_t cmp_sink = 0;
+  bool need_clear_ref = false;
+  {
+    std::lock_guard<std::mutex> lock(ref_mutex_);
+    auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                           [comparator_id](const RefComparatorEntry& e) {
+                             return e.id == comparator_id;
+                           });
+    if (it == ref_comparators_.end())
+      return false;
+    // 保存被移除 comparator 的 cmp_sink，用于后续判断是否需清除 metrics。
+    if (it->comparator)
+      cmp_sink = it->comparator->cmp_sink_id();
+    // 注销路由：从 ref_routing_ 中移除指向此 comparator 的条目。
+    for (auto& [sink_id, routes] : ref_routing_) {
+      routes.erase(std::remove_if(routes.begin(), routes.end(),
+                                  [comparator_id](const RefRoute& r) {
+                                    return r.comparator_id == comparator_id;
+                                  }),
+                   routes.end());
+    }
+    // 清理空 routes 的 sink 条目。
+    for (auto rit = ref_routing_.begin(); rit != ref_routing_.end();) {
+      if (rit->second.empty())
+        rit = ref_routing_.erase(rit);
+      else
+        ++rit;
+    }
+    ref_comparators_.erase(it);
+    // 检查是否仍有 comparator 监控此 cmp_sink。
+    need_clear_ref = true;
+    for (const auto& e : ref_comparators_) {
+      if (e.comparator && e.comparator->cmp_sink_id() == cmp_sink) {
+        need_clear_ref = false;
+        break;
+      }
+    }
   }
-  // 清理空 routes 的 sink 条目。
-  for (auto rit = ref_routing_.begin(); rit != ref_routing_.end();) {
-    if (rit->second.empty())
-      rit = ref_routing_.erase(rit);
-    else
-      ++rit;
+  // 释放 ref_mutex_ 后，清除 sensor 的 ref_configured_（若需）。
+  // sensor_table_.load() 是 RCU 读（同 comparison_loop 写 metrics 的模式），
+  // clear_ref_configured 持 metrics_mutex_（控制线程，非 RT，安全）。
+  if (need_clear_ref) {
+    const SensorTable* tbl = sensor_table_.load();
+    if (tbl != nullptr) {
+      for (const auto& [sid, ctx] : *tbl) {
+        (void)sid;
+        if (ctx.sink_id == cmp_sink && ctx.metrics) {
+          ctx.metrics->clear_ref_configured();
+          break;
+        }
+      }
+    }
   }
-  ref_comparators_.erase(it);
   // 若无 comparator 残留，comparison 线程在下个 loop 检测到空表后退出。
   // 不主动 stop（避免在 remove 路径中 join 线程的复杂性；stop 在析构/
   // on_capture_thread_joined 时统一处理）。

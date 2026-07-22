@@ -2296,9 +2296,57 @@ BOOST_AUTO_TEST_CASE(ref_comparator_concurrent_start_stop_no_crash) {
   BOOST_CHECK(true);
 }
 
-BOOST_AUTO_TEST_SUITE_END()
+// T4 review fix: remove_ref_comparator 后，cmp_sink 的 metrics ref_* 被清除。
+// 验证 stale ref_similarity 不残留（避免告警卡死）。
+BOOST_AUTO_TEST_CASE(ref_comparator_remove_clears_ref_metrics) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  // 两个 sensor：sink 0 = ref，sink 1 = cmp。
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+  // 配置 ref_comparator（ref_sink=0, cmp_sink=1）。
+  uint8_t cid = mgr.add_ref_comparator(0, 1);
+  BOOST_CHECK_NE(cid, 0u);
 
-// ── Spec4 T3：SSE 基础设施（SseBroadcaster + SPSC + drop-oldest）──────────
+  // 喂帧 -> comparison 线程写入 ref_*。
+  constexpr size_t kFrameSize = 480;
+  constexpr size_t kTotalFrames = 200;  // ~2s @100fps
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    // cmp = ref + 小噪声（与 ref_results_in_metrics_snapshot 同模式）。
+    uint32_t seed = static_cast<uint32_t>(f + 1);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float noise = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + noise;
+    }
+    mgr.on_frame(0, ref_frame, kFrameSize);
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_period_end();
+  }
+  bool done = mgr.wait_comparison_done_for_test(3000);
+  BOOST_CHECK(done);
+
+  // 验证 ref_similarity 被写入（> 0）。
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);
+
+  // 移除 comparator -> 应清除 cmp_sink 的 ref_configured_ + ref_*。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid));
+
+  // 验证 ref_* 回到默认值（clear_ref_configured 已调用）。
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_EQUAL(snap.ref_similarity, 0.0f);
+  BOOST_CHECK_EQUAL(snap.ref_noise_db, -100.0f);
+  BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 // 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1 +
 //   docs/noise/architecture-design.md §11 风险 9/17。
 // TDD Step 1：先写失败测试（push/drop/unsubscribe），再实现 SseBroadcaster。
@@ -2830,6 +2878,48 @@ BOOST_AUTO_TEST_CASE(alert_ref_similarity_when_configured) {
     BOOST_CHECK(ev->level == noise::AlertLevel::Warning);
     BOOST_CHECK(ev->rule == "ref_similarity");
   }
+}
+
+// T4 review fix: clear_ref_configured() 后 ref 规则停止评估，
+// 告警可通过去抖 clear（避免 stale ref_similarity 卡死）。
+// 复现 bug：set_ref_result -> ref_configured_=true + ref_similarity=0.7
+// -> Warning raised。若不 clear_ref_configured，ref_similarity=0.7 保持
+// -> desired 永远 Warning -> clear_count_ 永不递增 -> 告警卡死。
+// 修复后：clear_ref_configured -> ref_configured_=false -> ref 规则跳过
+// -> desired=None -> clear_count_ 递增 -> 告警 clear。
+BOOST_AUTO_TEST_CASE(alert_clears_after_clear_ref_configured) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+  ar.hum_strength_db = -70.0f;
+
+  // 配置 RefComparator -> set_ref_result 置 ref_configured_=true
+  // + ref_similarity=0.7 < 0.8 -> Warning。
+  m.set_ref_result(/*similarity=*/0.7f, /*noise_db=*/-30.0f,
+                   /*delay_ms=*/0.0f);
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev_raise = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev_raise.has_value());
+  BOOST_CHECK(ev_raise->level == noise::AlertLevel::Warning);
+  BOOST_CHECK(ev_raise->rule == "ref_similarity");
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 模拟 remove_ref_comparator -> clear_ref_configured()
+  m.clear_ref_configured();
+  // ref_similarity 应回到默认 0.0。
+  BOOST_CHECK_EQUAL(m.snapshot_for_test().ref_similarity, 0.0f);
+
+  // 下一 period：ref 规则跳过（ref_configured_=false），
+  // 其他规则也无触发 -> desired=None -> clear 计数 -> 告警 clear。
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev_clear = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev_clear.has_value());
+  BOOST_CHECK(!ev_clear->is_active);  // clear event
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
 }
 
 // TDD Step 1.7: raise/clear 多次 -> get_alert_history 返回历史。

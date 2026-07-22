@@ -172,6 +172,18 @@ class NoiseMetrics {
   // 据此判断是否评估 ref_similarity 规则（避免未配置时误报）。
   void set_ref_result(float similarity, float noise_db, float delay_ms);
 
+  // Spec4 T4 review fix：控制线程清除 ref_configured_ + 重置 ref_* 字段。
+  // remove_ref_comparator 在移除最后一个监控某 cmp_sink 的 comparator 后
+  // 调用，使 ref 规则停止评估（避免 stale ref_similarity 卡死告警去抖）。
+  // 持 metrics_mutex_ 与 set_ref_result / collect 互斥。
+  void clear_ref_configured() {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    ref_configured_ = false;
+    latest_.ref_similarity = 0.0f;
+    latest_.ref_noise_db = -100.0f;
+    latest_.ref_delay_ms = 0.0f;
+  }
+
   // Spec4 T4：控制线程设置告警配置（add_sensor 时调用）。
   // 写入 latest_ 的 snr_alert_threshold_db / ref_similarity_threshold /
   // alert_debounce_periods 字段。持 metrics_mutex_ 与 collect() 互斥。
@@ -254,9 +266,10 @@ class NoiseMetrics {
   // 当前已 raise 的告警级别（None 表示未告警）。用于检测状态变化。
   AlertLevel raised_level_{AlertLevel::None};
   // Spec4 T5/T4：RefComparator 是否已配置并写入过 ref_* 字段。
-  // set_ref_result 首次调用后置 true（持久，不重置）。T4 告警引擎据此判断
-  // 是否评估 ref_similarity 规则。未配置时 ref_similarity 保持默认 0.0
-  // （避免误报：0.0 < 0.8 阈值会触发告警）。
+  // set_ref_result 首次调用后置 true。clear_ref_configured() 重置为 false
+  // （remove_ref_comparator 在无剩余 comparator 监控此 sink 时调用）。
+  // T4 告警引擎据此判断是否评估 ref_similarity 规则。未配置时
+  // ref_similarity 保持默认 0.0（避免误报：0.0 < 0.8 阈值会触发告警）。
   bool ref_configured_{false};
   // 告警历史 ring（per-sensor in-memory，D-S4.2: Phase 2 不持久化）。
   // evaluate_alerts 在 raise/clear 时 push 到此 deque（capped

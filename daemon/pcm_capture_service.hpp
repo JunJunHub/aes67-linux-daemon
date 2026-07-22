@@ -71,6 +71,11 @@ class PcmCaptureService
   // ── 测试专用（FAKE_DRIVER 下驱动 fake_capture_loop，不依赖
   // SessionManager）──
   static std::shared_ptr<PcmCaptureService> create_for_test();
+  // Spec3 Task 8：E2E 测试需要 Config（fake_pcm_source）但无 SessionManager。
+  // config_ 注入后 fake_capture_loop 能读 fake_pcm_source WAV。init() 不可用
+  // （session_manager_ 为空），测试走 start_fake_for_test 直接驱动。
+  static std::shared_ptr<PcmCaptureService> create_for_test_with_config(
+      std::shared_ptr<Config> config);
   void start_fake_for_test(uint32_t sample_rate, uint8_t channels);
   void stop_for_test();
 

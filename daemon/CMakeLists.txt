@@ -103,5 +103,13 @@ if(ENABLE_TESTS AND WITH_NOISE)
   target_include_directories(noise-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(noise-test PRIVATE noise ${Boost_LIBRARIES} ${ALSA_LIBRARY} Threads::Threads)
   target_compile_definitions(noise-test PRIVATE -D_USE_FAKE_DRIVER_ -D_USE_NOISE_)
+  # Spec3 Task 8：E2E 测试 /denoised AAC 断言需 faac 编码。WITH_STREAMER=ON
+  # 时链接 faac + 定义 _USE_STREAMER_（E2E test_case 的 #ifdef 守卫）。
+  # WITH_STREAMER=OFF 时 E2E test_case 不编译（faac 不可用），其余 noise-test 正常。
+  if(WITH_STREAMER)
+    find_library(AAC_LIBRARY NAMES faac)
+    target_link_libraries(noise-test PRIVATE ${AAC_LIBRARY})
+    target_compile_definitions(noise-test PRIVATE -D_USE_STREAMER_)
+  endif()
   add_test(NAME noise-test COMMAND noise-test -p)
 endif()

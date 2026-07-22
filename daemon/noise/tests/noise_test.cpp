@@ -1599,3 +1599,242 @@ BOOST_AUTO_TEST_CASE(template_post_rejects_corrupt_wav) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec3 Task 8: E2E FAKE_DRIVER 全链路集成测试（arch §10 1.12）─────────────
+// fake_pcm_source WAV -> PcmCaptureService::fake_capture_loop -> 帧回调 ->
+// NoiseManager ①②③④ -> HTTP /api/noise/sensor/0 noise_type=white +
+// /api/streamer/stream/0/denoised 非空 AAC。
+//
+// E2E 接线说明（与生产 main.cpp 的差异，arch L1807 降级条款授权）：
+// 1. PcmCaptureService 用 create_for_test_with_config（无 SessionManager，
+//    绕过 init()）。fake_capture_loop 读 config_->get_fake_pcm_source() WAV。
+// 2. 帧路由：bridge.register_frame_provider 是 Spec1 stub（no-op），故测试
+//    手动注册 PcmCaptureService provider -> demux ch0 ->
+//    NoiseManager.on_frame。 生产环境由 Spec2 1.4b bridge 实现负责（T8 不修）。
+// 3. /denoised 路由：Streamer::encode_denoise_aac 需完整 Streamer（需
+//    SessionManager），测试不可用。故路由内联 faac 编码（复刻 Streamer 逻辑）。
+//    生产环境由 http_server.cpp 调 Streamer->encode_denoise_aac（T6 实现）。
+#ifdef _USE_STREAMER_
+#include <faac.h>
+#include <algorithm>
+
+BOOST_AUTO_TEST_SUITE(noise_e2e_tests)
+
+// 合成含噪 WAV（48kHz PCM-16 mono，白噪 + 弱 150Hz 语音）。
+// 白噪占主导使 NoiseAnalyzer L1 规则分类为 White（SF > 0.7）。
+static void write_e2e_noisy_wav(const std::string& path,
+                                size_t num_samples = 48000) {
+  std::vector<float> noise_buf(num_samples);
+  std::vector<float> speech_buf(num_samples);
+  synth::white_noise(noise_buf.data(), num_samples, 42);
+  synth::speech_like(speech_buf.data(), num_samples);
+  std::vector<int16_t> samples(num_samples);
+  for (size_t i = 0; i < num_samples; ++i) {
+    // 0.95 * white_noise + 0.05 * speech（白噪主导 -> SF 高 -> White）
+    float v = 0.95f * noise_buf[i] + 0.05f * speech_buf[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    samples[i] = static_cast<int16_t>(v * 32767.0f);
+  }
+  std::ofstream out(path, std::ios::binary);
+  BOOST_REQUIRE(out.is_open());
+  uint32_t data_size = static_cast<uint32_t>(num_samples * 2);
+  uint32_t riff_size = 36 + data_size;
+  out.write("RIFF", 4);
+  out.write(reinterpret_cast<const char*>(&riff_size), 4);
+  out.write("WAVE", 4);
+  out.write("fmt ", 4);
+  uint32_t le32 = 16;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  uint16_t le16 = 1;  // PCM
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 1;  // mono
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le32 = 48000;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  le32 = 48000 * 2;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  le16 = 2;
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  le16 = 16;
+  out.write(reinterpret_cast<const char*>(&le16), 2);
+  out.write("data", 4);
+  le32 = data_size;
+  out.write(reinterpret_cast<const char*>(&le32), 4);
+  out.write(reinterpret_cast<const char*>(samples.data()),
+            static_cast<std::streamsize>(data_size));
+  out.close();
+}
+
+BOOST_AUTO_TEST_CASE(e2e_fake_pcm_source_white_noise_and_denoised_aac) {
+  // 1. 合成含噪 WAV
+  std::string wav_path = "test_e2e_noisy.wav";
+  write_e2e_noisy_wav(wav_path);
+
+  // 2. Config：fake_pcm_source 指向 WAV，禁用持久化避免测试写文件
+  auto config = std::make_shared<Config>();
+  config->set_fake_pcm_source(wav_path);
+  config->set_noise_status_file("");
+  config->set_noise_template_dir("");
+
+  // 3. PcmCaptureService（注入 Config，无 SessionManager）
+  auto pcm_capture = PcmCaptureService::create_for_test_with_config(config);
+
+  // 4. Bridge + NoiseManager
+  auto bridge = std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
+  noise::NoiseManager mgr(*bridge);
+  mgr.set_status_file_for_test("");
+
+  // 5. PTP 状态转发（C1 修复：on_ptp_locked 启用 pipeline）
+  pcm_capture->set_ptp_status_forward_callback(
+      [&mgr](const std::string& status) {
+        if (status == "locked")
+          mgr.on_ptp_locked();
+        else
+          mgr.on_ptp_unlocked();
+      });
+
+  // 6. HTTP server + noise routes
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+
+  // /denoised 路由：内联 faac 编码（复刻 Streamer::encode_denoise_aac，
+  // 因 Streamer 构造需 SessionManager 不可用于测试）。
+  svr.Get("/api/streamer/stream/([0-9]+)/denoised",
+          [&mgr, &config](const httplib::Request& req, httplib::Response& res) {
+            uint8_t sinkId;
+            try {
+              sinkId = static_cast<uint8_t>(std::stoi(req.matches[1]));
+            } catch (...) {
+              res.status = 400;
+              return;
+            }
+            const auto* dout = mgr.get_denoise_output(sinkId);
+            if (!dout || dout->frame_count == 0 || !dout->denoised) {
+              res.status = 404;
+              return;
+            }
+            size_t n = dout->frame_count;
+            std::vector<int16_t> s16(n);
+            for (size_t i = 0; i < n; ++i) {
+              float v = dout->denoised[i];
+              if (v > 1.0f)
+                v = 1.0f;
+              if (v < -1.0f)
+                v = -1.0f;
+              s16[i] = static_cast<int16_t>(v * 32767.0f);
+            }
+            unsigned long in_samples = 0, out_buf_size = 0;
+            faacEncHandle enc = faacEncOpen(config->get_sample_rate(), 1,
+                                            &in_samples, &out_buf_size);
+            if (!enc) {
+              res.status = 500;
+              return;
+            }
+            faacEncConfigurationPtr faac_cfg =
+                faacEncGetCurrentConfiguration(enc);
+            if (faac_cfg) {
+              faac_cfg->aacObjectType = LOW;
+              faac_cfg->mpegVersion = MPEG4;
+              faac_cfg->useTns = 0;
+              faac_cfg->useLfe = 0;
+              faac_cfg->shortctl = SHORTCTL_NORMAL;
+              faac_cfg->allowMidside = 2;
+              faac_cfg->bitRate = 64000;
+              faac_cfg->outputFormat = 1;  // ADTS
+              faac_cfg->inputFormat = FAAC_INPUT_16BIT;
+              faacEncSetConfiguration(enc, faac_cfg);
+            }
+            std::vector<int16_t> buf(in_samples, 0);
+            size_t copy_n = std::min(n, static_cast<size_t>(in_samples));
+            std::copy(s16.data(), s16.data() + copy_n, buf.data());
+            std::vector<uint8_t> out_buf(out_buf_size);
+            // faac 首次 encode 可能返回 0（内部 look-ahead 缓冲未满）。
+            // 多次喂同一帧数据直到产出 AAC（最多 5 次 = 5120 样本）。
+            int ret = 0;
+            for (int i = 0; i < 5 && ret <= 0; ++i) {
+              ret = faacEncEncode(enc, reinterpret_cast<int32_t*>(buf.data()),
+                                  in_samples, out_buf.data(), out_buf_size);
+            }
+            faacEncClose(enc);
+            if (ret < 0) {
+              res.status = 500;
+              return;
+            }
+            res.set_header("Content-Type", "audio/aac");
+            res.body.assign(reinterpret_cast<const char*>(out_buf.data()),
+                            static_cast<size_t>(ret));
+          });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+
+  // 7. 添加 sensor 0（denoise=rnnoise）
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  cfg.plugin_name = "rnnoise";
+  mgr.add_sensor(0, 0, cfg);
+
+  // 8. 启用 pipeline（PTP locked）
+  mgr.on_ptp_locked();
+
+  // 9. 注册帧 provider：demux ch0 -> 480 样本块 -> NoiseManager.on_frame
+  //    （bridge.register_frame_provider 是 Spec1 stub，手动接线）
+  auto token = pcm_capture->register_provider(
+      [&mgr](const uint8_t* pcm, size_t frame_count, uint8_t channels,
+             uint32_t /*rate*/) {
+        const int16_t* src = reinterpret_cast<const int16_t*>(pcm);
+        constexpr size_t kSubFrame = 480;  // DenoiseProcessor max_frame_
+        float mono[kSubFrame];
+        mgr.on_period_begin();
+        for (size_t off = 0; off + kSubFrame <= frame_count; off += kSubFrame) {
+          for (size_t i = 0; i < kSubFrame; ++i) {
+            mono[i] = static_cast<float>(src[(off + i) * channels]) / 32768.0f;
+          }
+          mgr.on_frame(0, mono, kSubFrame);
+        }
+        mgr.on_period_end();
+      });
+
+  // 10. 启动 fake capture（读 WAV，分发帧）
+  pcm_capture->start_fake_for_test(48000, 2);
+
+  // 11. 等待 pipeline 处理（2s ≈ 15 periods × 12 sub-frames = 180 on_frame）
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  // 12. 断言 noise_type（白噪 -> White 或 Broadband 均合理）
+  auto r1 = cli.Get("/api/noise/sensor/0");
+  BOOST_REQUIRE(r1);
+  BOOST_CHECK_EQUAL(r1->status, 200);
+  auto nt_pos = r1->body.find("\"noise_type\": \"");
+  BOOST_REQUIRE(nt_pos != std::string::npos);
+  size_t val_start = nt_pos + std::string("\"noise_type\": \"").size();
+  size_t val_end = r1->body.find('"', val_start);
+  std::string noise_type = r1->body.substr(val_start, val_end - val_start);
+  BOOST_TEST_MESSAGE("E2E noise_type: " << noise_type);
+  // 白噪输入 -> 期望 white（SF > 0.7 规则）。broadband 也是合理分类
+  // （SF 0.3-0.7 区间）。unknown 表示 pipeline 未运行或 VAD 误判。
+  BOOST_CHECK(noise_type == "white" || noise_type == "broadband");
+
+  // 13. 断言 denoised AAC 非空
+  auto r2 = cli.Get("/api/streamer/stream/0/denoised");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK_EQUAL(r2->get_header_value("Content-Type"), "audio/aac");
+  BOOST_CHECK_GT(r2->body.size(), 0u);
+  BOOST_TEST_MESSAGE("E2E denoised AAC size: " << r2->body.size());
+
+  // 14. 清理
+  pcm_capture->stop_for_test();
+  pcm_capture->unregister_provider(token);
+  svr.stop();
+  svr_thread.join();
+  std::remove(wav_path.c_str());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif  // _USE_STREAMER_

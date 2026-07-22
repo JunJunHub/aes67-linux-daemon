@@ -7,11 +7,15 @@
 #include <alsa/asoundlib.h>
 #include <boost/log/trivial.hpp>
 #include <chrono>
+#include <cstring>
+#include <fstream>
 #include <future>
+#include <iterator>
 #include <thread>
 #include <vector>
 
 #include "config.hpp"
+#include "noise/noise_template_db.hpp"  // parse_wav_pcm16_48k_mono（Spec3 T8）
 #include "session_manager.hpp"
 
 constexpr uint32_t PcmCaptureService::kPeriodSamples;
@@ -28,6 +32,16 @@ std::shared_ptr<PcmCaptureService> PcmCaptureService::create_for_test() {
   // publish 初始空 provider 表，满足 RcuPtr::load() 永不为空契约
   // （production 路径由 init() 完成，测试路径不走 init()）。
   auto svc = std::shared_ptr<PcmCaptureService>(new PcmCaptureService());
+  svc->providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
+  return svc;
+}
+
+std::shared_ptr<PcmCaptureService>
+PcmCaptureService::create_for_test_with_config(std::shared_ptr<Config> config) {
+  // Spec3 Task 8 E2E：注入 Config 使 fake_capture_loop 能读 fake_pcm_source
+  // WAV。 不走 init()（无 SessionManager），测试直接调 start_fake_for_test。
+  auto svc = std::shared_ptr<PcmCaptureService>(new PcmCaptureService());
+  svc->config_ = std::move(config);
   svc->providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
   return svc;
 }
@@ -223,12 +237,68 @@ void PcmCaptureService::fake_capture_loop() {
   const size_t period_bytes = kPeriodSamples * channels * bytes_per_sample;
   std::vector<uint8_t> silent(period_bytes, 0);
 
+  // Spec3 Task 8：若 config_->get_fake_pcm_source() 非空，读 WAV（48kHz
+  // PCM-16 mono）循环喂帧（替内置静音）。复用 T5 的 parse_wav_pcm16_48k_mono
+  // （DRY，不重复 WAV 解析）。
+  std::vector<int16_t> wav_samples;  // mono S16
+  bool use_wav = false;
+  if (config_ && !config_->get_fake_pcm_source().empty()) {
+    std::ifstream file(config_->get_fake_pcm_source(), std::ios::binary);
+    if (file.is_open()) {
+      std::string wav_bytes((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+      std::vector<float> float_samples;
+      uint32_t sample_rate = 0;
+      if (noise::parse_wav_pcm16_48k_mono(wav_bytes, float_samples,
+                                          sample_rate)) {
+        wav_samples.reserve(float_samples.size());
+        for (float v : float_samples) {
+          if (v > 1.0f)
+            v = 1.0f;
+          if (v < -1.0f)
+            v = -1.0f;
+          wav_samples.push_back(static_cast<int16_t>(v * 32767.0f));
+        }
+        use_wav = !wav_samples.empty();
+        BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_pcm_source loaded "
+                                << wav_samples.size() << " samples from "
+                                << config_->get_fake_pcm_source();
+      } else {
+        BOOST_LOG_TRIVIAL(warning)
+            << "PcmCaptureService: failed to parse fake_pcm_source WAV ("
+            << config_->get_fake_pcm_source() << "), using silence";
+      }
+    } else {
+      BOOST_LOG_TRIVIAL(warning)
+          << "PcmCaptureService: cannot open " << config_->get_fake_pcm_source()
+          << ", using silence";
+    }
+  }
+
+  // period 缓冲：WAV 模式下每 period 从 wav_samples 循环填充；否则用静音帧。
+  std::vector<uint8_t> period_buf(period_bytes, 0);
+  size_t wav_pos = 0;
+
   // period 时长 = 6144 / 48000 ≈ 128ms
   const auto period_duration =
       std::chrono::microseconds(kPeriodSamples * 1000000ULL / rate);
   auto next_period = std::chrono::steady_clock::now();
   while (!stop_flag_.load()) {
-    dispatch(silent.data(), kPeriodSamples, channels, rate);
+    if (use_wav) {
+      // 从 wav_samples 循环读取 kPeriodSamples 帧，交错复制到 channels 通道。
+      for (size_t i = 0; i < kPeriodSamples; ++i) {
+        int16_t s = wav_samples[wav_pos];
+        wav_pos = (wav_pos + 1) % wav_samples.size();
+        for (uint8_t ch = 0; ch < channels; ++ch) {
+          std::memcpy(
+              period_buf.data() + (i * channels + ch) * bytes_per_sample, &s,
+              bytes_per_sample);
+        }
+      }
+      dispatch(period_buf.data(), kPeriodSamples, channels, rate);
+    } else {
+      dispatch(silent.data(), kPeriodSamples, channels, rate);
+    }
     next_period += period_duration;
     std::this_thread::sleep_until(next_period);
   }

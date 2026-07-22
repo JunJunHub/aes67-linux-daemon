@@ -22,6 +22,7 @@
 #include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
 #include "ref_comparator.hpp"
+#include "sse_broadcaster.hpp"
 
 namespace noise {
 
@@ -208,6 +209,42 @@ class NoiseManager {
   //   风险23）。
   const DenoiseOutput* get_denoise_output(uint8_t sink_id) const;
 
+  // ── Spec4 Task 3：SSE broadcaster 访问器（HTTP SSE 路由用）──
+  // NoiseManager 持有 per-sensor 的 metrics_broadcaster_ + pcm_broadcaster_
+  // （denoised/noise PCM）+ 全局 alert_broadcaster_（T4 用）。
+  // on_period_end 时 capture 线程 push 事件到对应 broadcaster（非阻塞，
+  // D-S4.1/风险 9）。SSE handler 线程经 broadcaster.subscribe() 取队列 drain。
+  //
+  // get_metrics_broadcaster(sensor_id)：返回指定 sensor 的 metrics
+  //   broadcaster（shared_ptr）。若 sensor 不存在，返回空 shared_ptr
+  //   （HTTP 路由返回 404）。
+  //   返回 shared_ptr 而非裸指针：SSE handler 的 releaser lambda 需在
+  //   Response 析构时调 unsubscribe，此时 sensor 可能已被 remove_sensor
+  //   删除。shared_ptr 延长 broadcaster 生命周期直到最后一个 handler 退出，
+  //   避免 use-after-free（review Critical #1）。
+  // get_pcm_broadcaster(sensor_id, denoised)：返回指定 sensor 的 PCM
+  //   broadcaster。denoised=true -> denoised PCM；false -> noise PCM。
+  //   sensor 不存在或 denoise 关 -> nullptr。
+  // get_alert_broadcaster()：返回全局告警 broadcaster（T4 push）。
+  //   始终非 nullptr（NoiseManager 构造时创建）。
+  //
+  // broadcaster 访问器返回 shared_ptr，调用方（HTTP 路由）捕获到 SSE handler
+  // 的 releaser lambda 中。sensor 被 remove 后 broadcaster 仍存活（shared_ptr
+  // 延长生命周期），releaser 安全调 unsubscribe。queue 的 shared_ptr 也延长
+  // 队列生命周期，handler 退出后自然释放。
+  std::shared_ptr<SseBroadcaster> get_metrics_broadcaster(uint8_t sensor_id);
+  std::shared_ptr<SseBroadcaster> get_pcm_broadcaster(uint8_t sensor_id,
+                                                      bool denoised);
+  std::shared_ptr<SseBroadcaster> get_alert_broadcaster() {
+    return std::shared_ptr<SseBroadcaster>(&alert_broadcaster_,
+                                           [](SseBroadcaster*) {});
+  }
+
+  // 测试钩子：on_period_end 后检查 broadcaster 是否收到事件。
+  size_t metrics_broadcaster_count_for_test(uint8_t sensor_id) const;
+  size_t pcm_broadcaster_dropped_for_test(uint8_t sensor_id,
+                                          bool denoised) const;
+
   // 测试钩子（spec §D 接受此模式）
   size_t sensor_count_for_test() const;
   bool is_ptp_locked_for_test() const { return ptp_locked_.load(); }
@@ -373,6 +410,35 @@ class NoiseManager {
   void route_to_ref_comparators(uint8_t sink_id,
                                 const float* frames,
                                 size_t frame_size);
+
+  // ── Spec4 Task 3：SSE broadcaster 实例 + on_period_end push ──
+  // per-sensor broadcaster：sensor_id -> {metrics, pcm_denoised, pcm_noise}。
+  // 用 map 而非定长数组（sensor_id 范围 0-255，实际 sensor 数量少，map 按
+  // 需分配）。add_sensor 时创建，remove_sensor 时从 map 移除。
+  // on_period_end（capture 线程，RT）push 事件：非阻塞，drop-oldest 背压。
+  // shared_ptr：SSE handler 的 releaser 捕获 broadcaster shared_ptr，sensor
+  // 被移除后 broadcaster 仍存活直到 handler 退出（避免 use-after-free）。
+  struct SensorBroadcasters {
+    std::shared_ptr<SseBroadcaster> metrics;
+    std::shared_ptr<SseBroadcaster> pcm_denoised;
+    std::shared_ptr<SseBroadcaster> pcm_noise;
+  };
+  std::map<uint8_t, SensorBroadcasters> sse_broadcasters_;
+  // 保护 sse_broadcasters_ map 的并发访问：add_sensor/remove_sensor
+  // （控制线程写）vs push_sse_events（capture 线程读）vs get_*_broadcaster
+  // （HTTP 线程读）。与 ref_mutex_ 同模式：短临界区（map lookup + 指针
+  // 解引用），不影响 RT 预算。push 内部各队列 try_lock 非阻塞。
+  mutable std::mutex sse_mutex_;
+  // 全局告警 broadcaster（T4 push，T3 仅创建实例 + 提供 accessor）。
+  SseBroadcaster alert_broadcaster_;
+  // metrics push 节拍控制：复用 kHistorySampleIntervalFrames（~1s）。
+  // on_period_end 递增 metrics_push_counter_，每 N 次 push 一次 metrics 快照。
+  size_t metrics_push_counter_{0};
+
+  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 后）：
+  // push metrics 快照（~1s 节拍）+ PCM chunk（每 period）到对应 broadcaster。
+  // 非阻塞：SseBroadcaster::push 内部 try_lock + drop-oldest（风险 9/17）。
+  void push_sse_events(const SensorTable& table);
 };
 
 }  // namespace noise

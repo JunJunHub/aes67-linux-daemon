@@ -21,6 +21,12 @@
 #include "noise_status.hpp"  // write_atomic
 #include "noise_template_db.hpp"
 
+// Spec4 T3：SSE metrics 事件需要 noise_type_to_string，声明在 noise_http.hpp。
+// 不 include noise_http.hpp（避免 manager -> http 反向依赖），forward declare。
+namespace noise {
+std::string noise_type_to_string(NoiseType type);
+}  // namespace noise
+
 namespace noise {
 
 NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {
@@ -96,6 +102,17 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
       [this](uint8_t sid, const float* frames, size_t n, uint8_t /*ch*/) {
         on_frame(sid, frames, n);
       });
+  // Spec4 Task 3：为 sensor 创建 SSE broadcaster 实例（per-sensor）。
+  // metrics/pcm_denoised/pcm_noise 各一。alert 用全局 alert_broadcaster_。
+  // 持 sse_mutex_ 保护 sse_broadcasters_ map（与 push_sse_events 互斥）。
+  {
+    std::lock_guard<std::mutex> sse_lock(sse_mutex_);
+    sse_broadcasters_[sensor_id] = SensorBroadcasters{
+        std::make_shared<SseBroadcaster>(),  // metrics
+        std::make_shared<SseBroadcaster>(),  // pcm_denoised
+        std::make_shared<SseBroadcaster>()   // pcm_noise
+    };
+  }
   // Spec3 Task 4：变更即保存（arch §7.6）。status_file_ 空时 no-op。
   save_status();
   return true;
@@ -136,6 +153,14 @@ bool NoiseManager::remove_sensor(uint8_t sensor_id) {
   auto old = sensor_table_.publish(std::move(new_table));
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  // Spec4 Task 3：移除该 sensor 的 SSE broadcaster 实例。
+  // 已订阅的 SSE handler 仍持 shared_ptr<queue>，可 drain 残留事件后退出
+  // （broadcaster 析构后 push 不再投递）。handler 的 releaser 调 unsubscribe
+  // 时发现已不存在，no-op 返回 false。持 sse_mutex_ 保护 map。
+  {
+    std::lock_guard<std::mutex> sse_lock(sse_mutex_);
+    sse_broadcasters_.erase(sensor_id);
+  }
   // Spec3 Task 4：变更即保存（arch §7.6）。
   save_status();
   return true;
@@ -298,6 +323,11 @@ void NoiseManager::on_frame(uint8_t sink_id,
 }
 
 void NoiseManager::on_period_end() {
+  // 注意：pinned_table_ 在本方法末尾置空。SSE push 须在 advance_epoch 前
+  // 访问 pinned_table_ 的 sensor 数据（metrics 快照 + DenoiseOutput front）。
+  // push 在 advance_epoch 后也无妨（数据已 swap 到 front，仍可读），但
+  // 当前实现：push 在 advance_epoch 前，使用 pinned_table_ 的 ctx.metrics
+  // 快照 + ctx.denoise->get_output()（previous period front，刚被 swap）。
   if (pinned_table_ != nullptr) {
     for (auto& [id, ctx] : *pinned_table_) {
       (void)id;
@@ -306,6 +336,11 @@ void NoiseManager::on_period_end() {
       if (ctx.metrics)
         ctx.metrics->on_period_end();
     }
+    // Spec4 Task 3：SSE push（D-S4.1，非阻塞）。
+    // 在 denoise/metrics on_period_end（swap front/back + collect 完成）后，
+    // advance_epoch 前调用 push_sse_events。此时 front 缓冲已是本 period
+    // 数据（swap 后），metrics latest_ 已更新（collect 写入）。
+    push_sse_events(*pinned_table_);
   }
   pinned_table_ = nullptr;
   sensor_table_.advance_epoch();
@@ -924,6 +959,222 @@ void NoiseManager::stop_comparison_thread() {
   std::lock_guard<std::mutex> lock(comparison_thread_mutex_);
   if (comparison_thread_.joinable()) {
     comparison_thread_.join();
+  }
+}
+
+// ── Spec4 Task 3：SSE broadcaster 访问器 + on_period_end push ──────────
+// 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1 +
+//   docs/noise/architecture-design.md §5.1（SSE 端点）+ §11 风险 9/17。
+//
+// RT 非阻塞设计（风险 9）：
+// - push_sse_events 在 on_period_end（capture 线程）调用。
+// - SseBroadcaster::push 内部：持 subscribers_mutex_ 拷贝 shared_ptr 列表
+//   （短临界区），锁外遍历各队列 try_push（mutex try_lock，满则 drop oldest）。
+// - metrics JSON 组装：手工拼接（与 metrics_to_json 同模式），无堆分配
+//   （stringstream 局部变量，编译器可能 RVO）。
+// - PCM base64 编码：每 period 一次，帧大小 480 样本 * 2 bytes = 960 bytes
+//   -> base64 ~1280 bytes。编码耗时 ~μs 级（查表），可接受（不超 RT 预算）。
+//   若未来帧变大或路数增多，可将 base64 移到 SSE handler 线程（push 原始
+//   PCM bytes，handler 编码）。
+//
+// metrics push 节拍（D-S4.5）：复用 kHistorySampleIntervalFrames（~1s）。
+// 每 N 次 on_period_end push 一次 metrics 快照（避免每 period 都 push）。
+
+namespace {
+
+// Base64 编码表（RFC 4648）。
+constexpr const char* kBase64Table =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+// base64 编码（PCM bytes -> SSE base64 chunk）。
+// 输入：原始 bytes（const char* + len）。输出：base64 字符串。
+// 用于 PCM SSE：denoised/noise float 样本 -> S16 -> base64。
+// 每 3 字节 -> 4 字符，末尾 padding '='。
+std::string base64_encode(const char* data, size_t len) {
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  size_t i = 0;
+  while (i + 2 < len) {
+    uint32_t v = (static_cast<uint8_t>(data[i]) << 16) |
+                 (static_cast<uint8_t>(data[i + 1]) << 8) |
+                 static_cast<uint8_t>(data[i + 2]);
+    out.push_back(kBase64Table[(v >> 18) & 0x3f]);
+    out.push_back(kBase64Table[(v >> 12) & 0x3f]);
+    out.push_back(kBase64Table[(v >> 6) & 0x3f]);
+    out.push_back(kBase64Table[v & 0x3f]);
+    i += 3;
+  }
+  if (i < len) {
+    uint32_t v = static_cast<uint8_t>(data[i]) << 16;
+    if (i + 1 < len)
+      v |= static_cast<uint8_t>(data[i + 1]) << 8;
+    out.push_back(kBase64Table[(v >> 18) & 0x3f]);
+    out.push_back(kBase64Table[(v >> 12) & 0x3f]);
+    out.push_back(i + 1 < len ? kBase64Table[(v >> 6) & 0x3f] : '=');
+    out.push_back('=');
+  }
+  return out;
+}
+
+// float 样本 -> S16 LE bytes（与 Streamer::encode_denoise_pcm 同转换）。
+// 输入：const float* + count。输出：std::string（S16 LE bytes）。
+// 用于 PCM SSE：denoised/noise 路的 float PCM -> S16 -> base64。
+std::string float_to_s16_le_bytes(const float* samples, size_t count) {
+  std::string bytes;
+  bytes.reserve(count * 2);
+  for (size_t i = 0; i < count; ++i) {
+    float s = samples[i];
+    // clamp [-1.0, 1.0]
+    if (s > 1.0f)
+      s = 1.0f;
+    else if (s < -1.0f)
+      s = -1.0f;
+    int16_t s16 = static_cast<int16_t>(s * 32767.0f);
+    bytes.push_back(static_cast<char>(s16 & 0xff));
+    bytes.push_back(static_cast<char>((s16 >> 8) & 0xff));
+  }
+  return bytes;
+}
+
+}  // namespace
+
+std::shared_ptr<SseBroadcaster> NoiseManager::get_metrics_broadcaster(
+    uint8_t sensor_id) {
+  std::lock_guard<std::mutex> lock(sse_mutex_);
+  auto it = sse_broadcasters_.find(sensor_id);
+  if (it == sse_broadcasters_.end())
+    return nullptr;
+  return it->second.metrics;
+}
+
+std::shared_ptr<SseBroadcaster> NoiseManager::get_pcm_broadcaster(
+    uint8_t sensor_id,
+    bool denoised) {
+  std::lock_guard<std::mutex> lock(sse_mutex_);
+  auto it = sse_broadcasters_.find(sensor_id);
+  if (it == sse_broadcasters_.end())
+    return nullptr;
+  return denoised ? it->second.pcm_denoised : it->second.pcm_noise;
+}
+
+size_t NoiseManager::metrics_broadcaster_count_for_test(
+    uint8_t sensor_id) const {
+  std::lock_guard<std::mutex> lock(sse_mutex_);
+  auto it = sse_broadcasters_.find(sensor_id);
+  if (it == sse_broadcasters_.end())
+    return 0;
+  return it->second.metrics ? it->second.metrics->subscriber_count() : 0;
+}
+
+size_t NoiseManager::pcm_broadcaster_dropped_for_test(uint8_t sensor_id,
+                                                      bool denoised) const {
+  std::lock_guard<std::mutex> lock(sse_mutex_);
+  auto it = sse_broadcasters_.find(sensor_id);
+  if (it == sse_broadcasters_.end())
+    return 0;
+  auto* bc =
+      denoised ? it->second.pcm_denoised.get() : it->second.pcm_noise.get();
+  return bc ? bc->total_dropped() : 0;
+}
+
+void NoiseManager::push_sse_events(const SensorTable& table) {
+  // 遍历 sensor 表，push metrics + PCM 到对应 broadcaster。
+  // metrics 节拍：每 period push 一次（~128ms/event）。
+  // D-S4.5 原设计 ~1s/event（复用 kHistorySampleIntervalFrames=100），但
+  // on_period_end 每 ALSA period（~128ms）调用一次，100 periods = 12.8s 太慢。
+  // 改为每 period push（128ms 间隔），SSE handler drain + UI 轮询可接受。
+  // PCM 节拍：每 period push 一次。
+
+  // 持 sse_mutex_ 快照 broadcaster 指针列表（短临界区：map lookup +
+  // 指针拷贝）， 锁外 push（push 内部各队列 try_lock 非阻塞，不持
+  // sse_mutex_）。 与 route_to_ref_comparators 持 ref_mutex_ 同模式（风险
+  // 9：短临界区 mutex 不影响 RT 预算，重活在锁外）。
+  struct BcEntry {
+    uint8_t sensor_id;
+    std::shared_ptr<SseBroadcaster> metrics;
+    std::shared_ptr<SseBroadcaster> pcm_denoised;
+    std::shared_ptr<SseBroadcaster> pcm_noise;
+  };
+  std::vector<BcEntry> bc_list;
+  {
+    std::lock_guard<std::mutex> lock(sse_mutex_);
+    bc_list.reserve(sse_broadcasters_.size());
+    for (const auto& [sid, bcs] : sse_broadcasters_) {
+      bc_list.push_back({sid, bcs.metrics, bcs.pcm_denoised, bcs.pcm_noise});
+    }
+  }
+
+  for (const auto& [sensor_id, ctx] : table) {
+    // 查找该 sensor 的 broadcaster 快照。
+    BcEntry* bc = nullptr;
+    for (auto& e : bc_list) {
+      if (e.sensor_id == sensor_id) {
+        bc = &e;
+        break;
+      }
+    }
+    if (bc == nullptr)
+      continue;
+
+    // metrics push（每 period，~128ms 间隔）
+    if (bc->metrics && ctx.metrics) {
+      NoiseMetricsSnapshot snap = ctx.metrics->get_snapshot();
+      // 组装 SSE 事件 JSON（与 metrics_to_json 同字段，外加 sensor_id）。
+      // 手工拼接（reuse noise_http.cpp escape_json 模式，但此处字段值
+      // 均为数字/枚举，无需转义）。
+      std::ostringstream ss;
+      ss << "data: {\"sensor_id\": " << static_cast<unsigned>(sensor_id)
+         << ", \"noise_level_dbfs\": " << snap.noise_level_dbfs
+         << ", \"noise_type\": \"" << noise_type_to_string(snap.noise_type)
+         << "\", \"noise_type_confidence\": " << snap.noise_type_confidence
+         << ", \"is_mixed\": " << (snap.is_mixed ? "true" : "false")
+         << ", \"estimated_snr_db\": " << snap.estimated_snr_db
+         << ", \"denoise_enabled\": "
+         << (snap.denoise_enabled ? "true" : "false")
+         << ", \"denoise_dry_wet\": " << snap.denoise_dry_wet
+         << ", \"noise_reduction_db\": " << snap.noise_reduction_db
+         << ", \"alert_threshold_dbfs\": " << snap.alert_threshold_dbfs
+         << ", \"is_alerting\": " << (snap.is_alerting ? "true" : "false")
+         << ", \"spectral_centroid_hz\": " << snap.spectral_centroid_hz
+         << ", \"spectral_flatness\": " << snap.spectral_flatness
+         << ", \"hum_strength_db\": " << snap.hum_strength_db
+         << ", \"ref_similarity\": " << snap.ref_similarity
+         << ", \"ref_noise_db\": " << snap.ref_noise_db
+         << ", \"ref_delay_ms\": " << snap.ref_delay_ms << "}\n\n";
+      bc->metrics->push(ss.str());
+    }
+
+    // PCM push（每 period）
+    // denoise 关 -> 不 push PCM（与 /denoised /noise 路由 404 语义一致）。
+    // get_output() 返回 previous period 的 front（on_period_end 已 swap）。
+    if (ctx.denoise_enabled && ctx.denoise) {
+      const DenoiseOutput* out = ctx.denoise->get_output();
+      if (out != nullptr && out->frame_count > 0) {
+        // denoised PCM
+        if (bc->pcm_denoised && out->denoised != nullptr) {
+          std::string s16 =
+              float_to_s16_le_bytes(out->denoised, out->frame_count);
+          std::string b64 = base64_encode(s16.data(), s16.size());
+          std::string event = "data: {\"sensor_id\": " +
+                              std::to_string(static_cast<unsigned>(sensor_id)) +
+                              ", \"channel\": \"denoised\", \"frame_count\": " +
+                              std::to_string(out->frame_count) +
+                              ", \"pcm_base64\": \"" + b64 + "\"}\n\n";
+          bc->pcm_denoised->push(event);
+        }
+        // noise PCM
+        if (bc->pcm_noise && out->noise != nullptr) {
+          std::string s16 = float_to_s16_le_bytes(out->noise, out->frame_count);
+          std::string b64 = base64_encode(s16.data(), s16.size());
+          std::string event = "data: {\"sensor_id\": " +
+                              std::to_string(static_cast<unsigned>(sensor_id)) +
+                              ", \"channel\": \"noise\", \"frame_count\": " +
+                              std::to_string(out->frame_count) +
+                              ", \"pcm_base64\": \"" + b64 + "\"}\n\n";
+          bc->pcm_noise->push(event);
+        }
+      }
+    }
   }
 }
 

@@ -91,6 +91,19 @@ void register_noise_routes(httplib::Server& svr,
                            NoiseManager& mgr,
                            NoiseTemplateDB& template_db);
 
+// Spec4 Task 3：注册 SSE 路由（arch §5.1 + D-S4.5）。
+// 4 端点：
+//   GET /api/noise/sensor/([0-9]+)/metrics/sse - 指标快照 SSE（~1s/event）
+//   GET /api/noise/sensor/([0-9]+)/denoised     - PCM base64 SSE（denoised）
+//   GET /api/noise/sensor/([0-9]+)/noise       - PCM base64 SSE（noise）
+//   GET /api/noise/alerts/sse                  - 告警事件 SSE（T4 push）
+//
+// SSE 使用 cpp-httplib set_chunked_content_provider + text/event-stream。
+// 每订阅者 SseBroadcaster SPSC 队列，capture 线程 on_period_end push，
+// handler 线程 drain + sink.write。客户端断连 -> sink.is_writable()=false
+// -> sink.done() -> releaser 调 unsubscribe。
+void register_noise_sse_routes(httplib::Server& svr, NoiseManager& mgr);
+
 }  // namespace noise
 
 #endif  // NOISE_NOISE_HTTP_HPP_

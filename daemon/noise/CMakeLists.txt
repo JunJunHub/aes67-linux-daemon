@@ -17,6 +17,7 @@ set(NOISE_SOURCES
   noise_analyzer.cpp
   noise_template_db.cpp
   ref_comparator.cpp
+  sse_broadcaster.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

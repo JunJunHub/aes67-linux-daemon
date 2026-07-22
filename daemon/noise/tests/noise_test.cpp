@@ -2281,3 +2281,349 @@ BOOST_AUTO_TEST_CASE(ref_comparator_concurrent_start_stop_no_crash) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec4 T3：SSE 基础设施（SseBroadcaster + SPSC + drop-oldest）──────────
+// 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1 +
+//   docs/noise/architecture-design.md §11 风险 9/17。
+// TDD Step 1：先写失败测试（push/drop/unsubscribe），再实现 SseBroadcaster。
+#include "sse_broadcaster.hpp"
+#include <atomic>
+#include <thread>
+
+BOOST_AUTO_TEST_SUITE(sse_broadcaster_tests)
+
+// TDD Step 1.1: push N 事件 -> 订阅者 drain 收到全部。
+BOOST_AUTO_TEST_CASE(broadcaster_push_drain) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe();
+  BOOST_REQUIRE(handle);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 1u);
+
+  // push 5 个事件
+  for (int i = 0; i < 5; ++i) {
+    bc.push("data: {\"event\": " + std::to_string(i) + "}\n\n");
+  }
+  // drain
+  std::vector<std::string> events;
+  bool got = handle.queue->try_drain(events);
+  BOOST_CHECK(got);
+  BOOST_CHECK_EQUAL(events.size(), 5u);
+  // 验证顺序与内容
+  for (int i = 0; i < 5; ++i) {
+    BOOST_CHECK_EQUAL(events[i],
+                      "data: {\"event\": " + std::to_string(i) + "}\n\n");
+  }
+  // 二次 drain 应为空
+  std::vector<std::string> empty;
+  BOOST_CHECK(!handle.queue->try_drain(empty));
+  // 无 drop
+  BOOST_CHECK_EQUAL(handle.queue->dropped_count(), 0u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 0u);
+}
+
+// TDD Step 1.2: push 超容量 -> drop oldest + dropped_count 递增，不阻塞。
+BOOST_AUTO_TEST_CASE(broadcaster_drop_oldest_on_full) {
+  // 容量 4 的小队列，push 8 个 -> 应 drop 前 4 个，保留后 4 个。
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe(/*capacity=*/4);
+  BOOST_REQUIRE(handle);
+
+  for (int i = 0; i < 8; ++i) {
+    bc.push("data: {\"i\": " + std::to_string(i) + "}\n\n");
+  }
+  // drain 后应只剩后 4 个（i=4,5,6,7）
+  std::vector<std::string> events;
+  bool got = handle.queue->try_drain(events);
+  BOOST_CHECK(got);
+  BOOST_CHECK_EQUAL(events.size(), 4u);
+  // 前 4 个被 drop
+  BOOST_CHECK_EQUAL(events[0], "data: {\"i\": 4}\n\n");
+  BOOST_CHECK_EQUAL(events[3], "data: {\"i\": 7}\n\n");
+  // dropped_count = 4（前 4 个被 drop）
+  BOOST_CHECK_EQUAL(handle.queue->dropped_count(), 4u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 4u);
+}
+
+// TDD Step 1.3: unsubscribe 后 push 不再入该队列。
+BOOST_AUTO_TEST_CASE(broadcaster_unsubscribe_stops_drain) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe();
+  BOOST_REQUIRE(handle);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 1u);
+
+  // 先 push 一个 + drain 确认队列工作
+  bc.push("data: first\n\n");
+  std::vector<std::string> e1;
+  BOOST_CHECK(handle.queue->try_drain(e1));
+  BOOST_CHECK_EQUAL(e1.size(), 1u);
+
+  // unsubscribe
+  BOOST_CHECK(bc.unsubscribe(handle.id));
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  // 再次 unsubscribe 应失败（已不存在）
+  BOOST_CHECK(!bc.unsubscribe(handle.id));
+
+  // push 后，旧 handle.queue 不再收到（unsubscribe 后 push 不投递到已注销队列）
+  bc.push("data: second\n\n");
+  std::vector<std::string> e2;
+  // handler 仍持 shared_ptr，可调 try_drain（队列对象仍存活），但应无事件
+  BOOST_CHECK(!handle.queue->try_drain(e2));
+  BOOST_CHECK_EQUAL(e2.size(), 0u);
+}
+
+// TDD Step 1.4: 多订阅者并发 - 各自独立 drain，互不串扰。
+BOOST_AUTO_TEST_CASE(broadcaster_multi_subscriber) {
+  noise::SseBroadcaster bc;
+  auto h1 = bc.subscribe();
+  auto h2 = bc.subscribe();
+  auto h3 = bc.subscribe();
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 3u);
+
+  // push 一个事件，三个队列都应收到
+  bc.push("data: broadcast\n\n");
+
+  for (auto* h : {&h1, &h2, &h3}) {
+    std::vector<std::string> events;
+    BOOST_CHECK(h->queue->try_drain(events));
+    BOOST_CHECK_EQUAL(events.size(), 1u);
+    BOOST_CHECK_EQUAL(events[0], "data: broadcast\n\n");
+  }
+  // unsubscribe 一个，其余仍工作
+  bc.unsubscribe(h2.id);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 2u);
+  bc.push("data: second\n\n");
+  std::vector<std::string> e1, e3;
+  BOOST_CHECK(h1.queue->try_drain(e1));
+  BOOST_CHECK_EQUAL(e1.size(), 1u);
+  // h2 已注销，不应收到
+  std::vector<std::string> e2;
+  BOOST_CHECK(!h2.queue->try_drain(e2));
+  BOOST_CHECK(h3.queue->try_drain(e3));
+  BOOST_CHECK_EQUAL(e3.size(), 1u);
+}
+
+// TDD Step 1.5: 无订阅者时 push 不 crash（零订阅者退化）。
+BOOST_AUTO_TEST_CASE(broadcaster_push_no_subscribers) {
+  noise::SseBroadcaster bc;
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  // 无订阅者 push 应 no-op，不 crash
+  bc.push("data: orphan\n\n");
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 0u);
+}
+
+// TDD Step 1.6: 并发 push/drain 不 crash + 不阻塞（RT 非阻塞压力）。
+// 一线程高速 push（模拟 capture on_period_end），另一线程 drain
+// （模拟 SSE handler）。验证 push 线程不被 drain 阻塞（try_lock 失败时
+// drop，不挂）。
+BOOST_AUTO_TEST_CASE(broadcaster_concurrent_push_drain_no_block) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe(/*capacity=*/16);
+  BOOST_REQUIRE(handle);
+
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> push_count{0};
+  std::atomic<size_t> drain_count{0};
+
+  // push 线程：高速 push（模拟 RT）
+  std::thread pusher([&]() {
+    int i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      bc.push("data: " + std::to_string(i++) + "\n\n");
+      push_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  // drain 线程：间歇 drain（模拟 SSE handler socket write 后取事件）
+  std::thread drainer([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::vector<std::string> events;
+      if (handle.queue->try_drain(events)) {
+        drain_count.fetch_add(events.size(), std::memory_order_relaxed);
+      }
+      // 模拟 socket write 耗时
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  });
+
+  // 运行 200ms
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  stop.store(true);
+
+  pusher.join();
+  drainer.join();
+
+  // push 线程应完成大量 push（证明非阻塞 - 若阻塞会很少）
+  BOOST_CHECK_GT(push_count.load(), 100u);
+  // drain 线程应取到部分事件（drain 速度慢于 push，可能有 drop）
+  BOOST_CHECK_GT(drain_count.load(), 0u);
+  BOOST_TEST_MESSAGE("concurrent: pushed="
+                     << push_count.load() << " drained=" << drain_count.load()
+                     << " dropped=" << bc.total_dropped());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec4 T3 Step 3：cpp-httplib chunked SSE API 验证（R-S4.2）──────────
+// 最小 echo 路由验证 chunked provider + 断连清理。不依赖 NoiseManager，
+// 仅验证 cpp-httplib 的 set_chunked_content_provider + DataSink API 行为。
+BOOST_AUTO_TEST_SUITE(sse_echo_api_tests)
+
+// 最小 echo 路由：push "data: hello\n\n" 每 50ms，客户端收到 >=1 事件后断连。
+// 验证：1) chunked provider 能持续推送；2) 客户端能收到 SSE 帧；
+//       3) 断连后 provider 检测 is_writable()=false -> sink.done() 退出。
+BOOST_AUTO_TEST_CASE(sse_echo_pushes_and_detects_disconnect) {
+  httplib::Server svr;
+  std::atomic<bool> provider_exited{false};
+  std::atomic<size_t> push_count{0};
+
+  svr.Get("/api/noise/sse_echo", [&provider_exited, &push_count](
+                                     const httplib::Request& /*req*/,
+                                     httplib::Response& res) {
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [&push_count](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+          // push "data: hello\n\n" 每 50ms
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          if (!sink.is_writable()) {
+            sink.done();
+            return true;
+          }
+          const char* msg = "data: hello\n\n";
+          if (!sink.write(msg, 12)) {
+            return false;  // write 失败
+          }
+          push_count.fetch_add(1, std::memory_order_relaxed);
+          return true;  // 继续 loop
+        },
+        [&provider_exited](bool /*success*/) {
+          provider_exited.store(true, std::memory_order_relaxed);
+        });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+
+  // 客户端：连上后读 N 字节即断连
+  httplib::Client cli("127.0.0.1", port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  std::atomic<bool> got_event{false};
+  std::string received;
+  auto res =
+      cli.Get("/api/noise/sse_echo",
+              [&got_event, &received](const char* data, size_t len) -> bool {
+                received.append(data, len);
+                if (received.find("data: hello") != std::string::npos) {
+                  got_event.store(true, std::memory_order_relaxed);
+                  return false;  // 断连（停止接收）
+                }
+                return true;  // 继续接收
+              });
+
+  // 客户端断连后，res 可能是 nullptr 或有 status
+  BOOST_CHECK(got_event.load());
+  BOOST_TEST_MESSAGE("echo: received=" << received.substr(0, 80)
+                                       << " push_count=" << push_count.load());
+
+  // 等待 provider 检测断连并退出（releaser 被调用）
+  // 注意：releaser 在 Response 析构时调用，可能在 svr 工作线程清理时
+  for (int i = 0; i < 50 && !provider_exited.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  BOOST_CHECK(provider_exited.load());
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// 验证 SseBroadcaster + chunked provider 集成：
+// 后台线程 push 事件 -> SSE handler drain -> 客户端收到。
+BOOST_AUTO_TEST_CASE(sse_broadcaster_with_chunked_provider) {
+  httplib::Server svr;
+  noise::SseBroadcaster bc;
+
+  svr.Get("/api/noise/sse_test",
+          [&bc](const httplib::Request& /*req*/, httplib::Response& res) {
+            auto handle = bc.subscribe();
+            // 捕获 queue（shared_ptr，可拷贝）+ id（uint64_t，可拷贝），
+            // handle 本身 move-only 不捕获。
+            auto queue = handle.queue;
+            uint64_t id = handle.id;
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [queue](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                  std::vector<std::string> events;
+                  if (queue->try_drain(events)) {
+                    for (const auto& e : events) {
+                      if (!sink.write(e.data(), e.size()))
+                        return false;
+                    }
+                  }
+                  if (!sink.is_writable()) {
+                    sink.done();
+                    return true;
+                  }
+                  // 无事件时短暂 sleep 避免 busy-loop（不调 sink.write ->
+                  // data_available 保持 true，loop 继续）
+                  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                  return true;
+                },
+                [&bc, id](bool /*success*/) { bc.unsubscribe(id); });
+          });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+
+  // 后台线程 push 事件
+  std::atomic<bool> stop_push{false};
+  std::thread pusher([&bc, &stop_push]() {
+    int i = 0;
+    while (!stop_push.load(std::memory_order_relaxed)) {
+      bc.push("data: {\"seq\": " + std::to_string(i++) + "}\n\n");
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+  });
+
+  // 客户端：连上后读若干事件
+  httplib::Client cli("127.0.0.1", port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  std::string received;
+  int events_received = 0;
+  auto res = cli.Get(
+      "/api/noise/sse_test",
+      [&received, &events_received](const char* data, size_t len) -> bool {
+        received.append(data, len);
+        // 统计 SSE 帧数（"data: " 开头的行）
+        size_t pos = 0;
+        while ((pos = received.find("data: ", pos)) != std::string::npos) {
+          ++events_received;
+          pos += 6;
+        }
+        return events_received < 3;  // 收到 3 个事件后断连
+      });
+
+  BOOST_CHECK_GE(events_received, 3);
+  BOOST_TEST_MESSAGE("broadcaster+chunked: events=" << events_received
+                                                    << " received="
+                                                    << received.substr(0, 120));
+
+  stop_push.store(true);
+  pusher.join();
+
+  svr.stop();
+  svr_thread.join();
+
+  // 断连后 broadcaster 应无残留订阅者（releaser 调 unsubscribe）
+  // 注意：releaser 在 Response 析构时调用，svr.stop() 后工作线程退出
+  // 时清理。给一点时间。
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

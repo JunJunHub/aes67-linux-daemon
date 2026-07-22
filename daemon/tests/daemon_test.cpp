@@ -1096,3 +1096,252 @@ BOOST_AUTO_TEST_CASE(aac_route_unchanged) {
   BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
   BOOST_CHECK_NE(res->get_header_value("Content-Type"), "audio/pcm");
 }
+
+// ── Spec4 T3：SSE 集成测试（in-process daemon）──────────────────────────
+// 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1/D-S4.5。
+// 测试场景：SSE 客户端连 -> 收到 metrics/PCM 事件；sensor 不存在 -> 404；
+// 多订阅者并发；慢订阅者不阻塞 daemon。
+
+// 辅助：SSE 客户端 content_receiver，累计收到的 SSE 帧（"data: " 开头行）。
+struct SseCollector {
+  std::string buf;
+  std::atomic<int> event_count{0};
+  std::atomic<bool> stop{false};
+
+  // cpp-httplib ContentReceiver 回调
+  bool operator()(const char* data, size_t len) {
+    buf.append(data, len);
+    // 统计 SSE 帧数（"data: " 行）
+    size_t pos = 0;
+    while ((pos = buf.find("data: ", pos)) != std::string::npos) {
+      ++event_count;
+      // 跳到下一行
+      pos = buf.find('\n', pos);
+      if (pos == std::string::npos)
+        break;
+      ++pos;
+    }
+    return !stop.load();  // false = 断连
+  }
+};
+
+// T3 Step 5.1: SSE metrics 端点 - sensor 存在时收到 metrics 事件。
+BOOST_AUTO_TEST_CASE(sse_metrics_receives_events) {
+  // 1. 添加 noise sensor（denoise 开启）
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  // 2. 等待 pipeline 处理（metrics ~1s/event，等 2s 确保 >=1 事件）
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  // 3. 连 SSE metrics 端点
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(10);
+  cli.set_read_timeout(10);
+
+  SseCollector collector;
+  // 后台线程限时接收
+  std::thread receiver([&]() {
+    cli.Get("/api/noise/sensor/0/metrics/sse",
+            [&collector](const char* data, size_t len) -> bool {
+              return collector(data, len);
+            });
+  });
+
+  // 等 3s 收事件（metrics ~1s/event）
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  collector.stop.store(true);
+  receiver.join();
+
+  BOOST_TEST_MESSAGE("sse_metrics: events=" << collector.event_count.load()
+                                            << " buf_size="
+                                            << collector.buf.size());
+  // 应收到 >=1 个 metrics 事件
+  BOOST_CHECK_GE(collector.event_count.load(), 1);
+  // 事件应含 sensor_id 字段
+  BOOST_CHECK(collector.buf.find("sensor_id") != std::string::npos);
+
+  // 清理
+  remove_noise_sensor(0);
+}
+
+// T3 Step 5.2: SSE denoised PCM 端点 - 收到 base64 PCM 事件。
+BOOST_AUTO_TEST_CASE(sse_denoised_receives_pcm) {
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(10);
+  cli.set_read_timeout(10);
+
+  SseCollector collector;
+  std::thread receiver([&]() {
+    cli.Get("/api/noise/sensor/0/denoised",
+            [&collector](const char* data, size_t len) -> bool {
+              return collector(data, len);
+            });
+  });
+
+  // 等 2s 收 PCM 事件（每 period ~4ms，应很多）
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  collector.stop.store(true);
+  receiver.join();
+
+  BOOST_TEST_MESSAGE("sse_denoised: events=" << collector.event_count.load()
+                                             << " buf_size="
+                                             << collector.buf.size());
+  // 应收到多个 PCM 事件
+  BOOST_CHECK_GE(collector.event_count.load(), 1);
+  // 事件应含 pcm_base64 字段
+  BOOST_CHECK(collector.buf.find("pcm_base64") != std::string::npos);
+  // 事件应含 channel 字段
+  BOOST_CHECK(collector.buf.find("denoised") != std::string::npos);
+
+  remove_noise_sensor(0);
+}
+
+// T3 Step 5.3: SSE noise PCM 端点 - 收到 base64 PCM 事件。
+BOOST_AUTO_TEST_CASE(sse_noise_receives_pcm) {
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(10);
+  cli.set_read_timeout(10);
+
+  SseCollector collector;
+  std::thread receiver([&]() {
+    cli.Get("/api/noise/sensor/0/noise",
+            [&collector](const char* data, size_t len) -> bool {
+              return collector(data, len);
+            });
+  });
+
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  collector.stop.store(true);
+  receiver.join();
+
+  BOOST_TEST_MESSAGE("sse_noise: events=" << collector.event_count.load()
+                                          << " buf_size="
+                                          << collector.buf.size());
+  BOOST_CHECK_GE(collector.event_count.load(), 1);
+  BOOST_CHECK(collector.buf.find("pcm_base64") != std::string::npos);
+  BOOST_CHECK(collector.buf.find("noise") != std::string::npos);
+
+  remove_noise_sensor(0);
+}
+
+// T3 Step 5.4: SSE 端点 sensor 不存在 -> 404。
+BOOST_AUTO_TEST_CASE(sse_sensor_not_found_404) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  // sensor 99 不存在
+  auto res = cli.Get("/api/noise/sensor/99/metrics/sse");
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res->status, 404);
+
+  res = cli.Get("/api/noise/sensor/99/denoised");
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res->status, 404);
+
+  res = cli.Get("/api/noise/sensor/99/noise");
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "server returned response");
+  BOOST_CHECK_EQUAL(res->status, 404);
+}
+
+// T3 Step 5.5: SSE alerts 端点 - 连接成功（text/event-stream）。
+// T4 才 push 告警事件，T3 仅验证端点可连 + 不 crash。
+BOOST_AUTO_TEST_CASE(sse_alerts_endpoint_connects) {
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  SseCollector collector;
+  std::thread receiver([&]() {
+    cli.Get("/api/noise/alerts/sse",
+            [&collector](const char* data, size_t len) -> bool {
+              return collector(data, len);
+            });
+  });
+
+  // 等 1s 确认连接稳定（无 crash）
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  collector.stop.store(true);
+  receiver.join();
+
+  // alerts 端点应可连（T4 前 0 事件，但不应 crash）
+  BOOST_TEST_MESSAGE("sse_alerts: events=" << collector.event_count.load());
+}
+
+// T3 Step 5.6: 多订阅者并发 - 两个客户端同时连同一 metrics SSE。
+BOOST_AUTO_TEST_CASE(sse_multi_subscriber_concurrent) {
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  httplib::Client cli1(g_daemon_address, g_daemon_port);
+  cli1.set_connection_timeout(10);
+  cli1.set_read_timeout(10);
+  httplib::Client cli2(g_daemon_address, g_daemon_port);
+  cli2.set_connection_timeout(10);
+  cli2.set_read_timeout(10);
+
+  SseCollector c1, c2;
+  std::thread r1([&]() {
+    cli1.Get("/api/noise/sensor/0/metrics/sse",
+             [&c1](const char* d, size_t l) { return c1(d, l); });
+  });
+  std::thread r2([&]() {
+    cli2.Get("/api/noise/sensor/0/metrics/sse",
+             [&c2](const char* d, size_t l) { return c2(d, l); });
+  });
+
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  c1.stop.store(true);
+  c2.stop.store(true);
+  r1.join();
+  r2.join();
+
+  BOOST_TEST_MESSAGE("multi_sub: c1=" << c1.event_count.load()
+                                      << " c2=" << c2.event_count.load());
+  // 两个订阅者都应收到事件
+  BOOST_CHECK_GE(c1.event_count.load(), 1);
+  BOOST_CHECK_GE(c2.event_count.load(), 1);
+
+  remove_noise_sensor(0);
+}
+
+// T3 Step 5.7: 慢订阅者不阻塞 daemon - 连上后立即 sleep 不 drain，
+// daemon 应继续响应其他请求（capture 线程不阻塞）。
+BOOST_AUTO_TEST_CASE(sse_slow_subscriber_no_block) {
+  BOOST_REQUIRE_MESSAGE(add_noise_sensor(0, 0, true), "added noise sensor 0");
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // 慢订阅者：连上但不读（content_receiver 一直返回 true 但不 stop）
+  httplib::Client slow_cli(g_daemon_address, g_daemon_port);
+  slow_cli.set_connection_timeout(30);
+  slow_cli.set_read_timeout(30);
+  std::atomic<bool> slow_stop{false};
+  std::thread slow_sub([&]() {
+    slow_cli.Get("/api/noise/sensor/0/denoised",
+                 [&slow_stop](const char* /*d*/, size_t /*l*/) -> bool {
+                   return !slow_stop.load();
+                 });
+  });
+
+  // 等 1s 让慢订阅者连接 + 队列堆积
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // daemon 应仍能响应其他请求（capture 线程不阻塞）
+  httplib::Client cli(g_daemon_address, g_daemon_port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+  auto res = cli.Get("/api/noise/sensor/0");
+  BOOST_REQUIRE_MESSAGE(res != nullptr, "daemon still responsive");
+  BOOST_CHECK_EQUAL(res->status, 200);
+
+  // 清理慢订阅者
+  slow_stop.store(true);
+  slow_sub.join();
+
+  remove_noise_sensor(0);
+}

@@ -226,6 +226,16 @@ int main(int argc, char* argv[]) {
             else if (status == "unlocked")
               noise_manager->on_ptp_unlocked();
           });
+      // Spec3 Task 8b（C2 修复）：装配 period 生命周期回调。
+      // NoiseSessionManagerBridge::on_pcm_frame（PcmCaptureService dispatch
+      // 每周期调）经此回调驱动 NoiseManager::on_period_begin/end（ONCE/period，
+      // 全局）。此前未装配 -> period_begin_cb_ 为 null -> on_period_begin 不
+      // 运行 -> pinned_table_ 永远 null -> on_frame 首行 `if (pinned_table_ ==
+      // nullptr) return;` 短路 -> pipeline 死，metrics 留默认(-100)，/denoised
+      // 404。须在 init() 前装配（init 启 fake_capture_loop 即开始 dispatch）。
+      noise_bridge->set_period_lifecycle_callbacks(
+          [noise_manager]() { noise_manager->on_period_begin(); },
+          [noise_manager]() { noise_manager->on_period_end(); });
       // init() 须在两个 forward callback 装配之后调用：init() 会直接调
       // on_ptp_status_change（用缓存的 status），此时 forward cb 须已就绪，
       // 否则 FAKE_DRIVER 下唯一的 ""->"unlocked" 触发时 cb 为 null ->

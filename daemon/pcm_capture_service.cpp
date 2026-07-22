@@ -63,8 +63,11 @@ bool PcmCaptureService::init() {
       SessionManager::SinkObserverType::remove_sink,
       std::bind(&PcmCaptureService::on_sink_remove, this,
                 std::placeholders::_1));
-  // 初始化空 provider 表（永不为空契约）
-  providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
+  // 注：不再此处 publish 空 provider 表。create() 已建立永不为空契约
+  // （L31）。load_status 在 init() 之前运行，会经 add_sensor ->
+  // register_frame_provider -> register_provider 注册 provider；若此处再
+  // publish 空表会清空已注册的 provider，致 dispatch 无 provider 可调，
+  // on_pcm_frame/on_frame 永不运行（Spec3 T8b C2 修复）。
   PTPStatus status;
   session_manager_->get_ptp_status(status);
   on_ptp_status_change(status.status);

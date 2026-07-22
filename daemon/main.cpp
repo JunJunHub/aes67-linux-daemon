@@ -353,6 +353,16 @@ int main(int argc, char* argv[]) {
       }
 #endif
 
+#ifdef _USE_NOISE_
+      /* stop pcm capture service (must precede shared_ptr destruction:
+         stop_capture joins the capture thread, preventing the
+         std::async future destructor from blocking on shutdown) */
+      if (!pcm_capture->terminate()) {
+        throw std::runtime_error(
+            std::string("PcmCaptureService:: terminate failed"));
+      }
+#endif
+
       /* stop rtsp server */
       if (!rtsp_server.terminate()) {
         throw std::runtime_error(std::string("RtspServer:: terminate failed"));

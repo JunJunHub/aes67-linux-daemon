@@ -183,6 +183,9 @@ class NoiseAudioBridgeStub : public noise::NoiseAudioBridge {
   uint8_t get_sink_channel_count(uint8_t) const override { return 1; }
   void set_ptp_status_callback(
       noise::NoiseAudioBridge::PtpStatusCallback) override {}
+  void set_period_lifecycle_callbacks(
+      noise::NoiseAudioBridge::PeriodBeginCallback,
+      noise::NoiseAudioBridge::PeriodEndCallback) override {}
   void set_sink_add_callback(
       noise::NoiseAudioBridge::SinkChangeCallback) override {}
   void set_sink_remove_callback(
@@ -219,6 +222,45 @@ BOOST_AUTO_TEST_CASE(noise_manager_routes_frames_to_sensors) {
   BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 3);
   // #3: 第二个 period 再次路由到 sensor 0，call_count 递增
   BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), count_before);
+}
+
+// Spec3 T8b（C2 回归测试）：验证 Bridge.register_frame_provider ->
+// PcmCaptureService::register_provider -> dispatch -> NoiseManager.on_frame
+// 生产路径（非 bypass）。此前 register_frame_provider 是 stub，生产 pipeline
+// 永不运行 on_frame -> metrics 留默认 -> /denoised 404。
+BOOST_AUTO_TEST_CASE(bridge_register_frame_provider_production_wiring) {
+  // 构造真实 Bridge + NoiseManager（非 stub bridge）
+  auto pcm_svc = PcmCaptureService::create_for_test();
+  auto bridge = std::make_shared<NoiseSessionManagerBridge>(pcm_svc);
+  noise::NoiseManager mgr(*bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+
+  // add_sensor -> bridge.register_frame_provider -> pcm_svc.register_provider
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;
+  cfg.plugin_name = "passthrough";
+  mgr.add_sensor(0, 0, cfg);
+
+  // 驱动 fake capture（静音帧，2ch）-> dispatch -> Bridge.on_pcm_frame ->
+  // period_begin -> demux ch0 -> on_frame -> period_end
+  pcm_svc->start_fake_for_test(48000, 2);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  pcm_svc->stop_for_test();
+
+  // 断言 on_frame 被调用（stub_call_count_for_test > 0）
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0u);
+
+  // 断言 metrics 被计算（noise_level_dbfs 非默认 -100）。
+  // 静音输入 -> NoiseAnalyzer 设 noise_level_dbfs = -120（rms <= 1e-10
+  // 时初始值），与默认 -100 不同 -> 证明 collect() 被调用。
+  auto snap = mgr.get_metrics_for_test(0);
+  BOOST_TEST_MESSAGE("C2 regression: noise_level_dbfs="
+                     << snap.noise_level_dbfs
+                     << " frame_count=" << mgr.stub_call_count_for_test(0));
+  BOOST_CHECK_NE(snap.noise_level_dbfs, -100.0f);
+
+  mgr.remove_sensor(0);
 }
 
 // PTP unlock 置 ptp_locked_=false 后 process 跳过

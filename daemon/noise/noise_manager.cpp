@@ -22,7 +22,14 @@
 
 namespace noise {
 
-NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {}
+NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {
+  // Spec3 T8b（C2 修复）：向 Bridge 注册 period 生命周期回调，使
+  // PcmCaptureService provider 回调能驱动 on_period_begin/on_period_end
+  // （每个 ALSA period 恰好一次，全局，非 per-sink）。
+  // 此前 register_frame_provider 是 stub，生产 pipeline 永不运行 on_frame。
+  bridge_.set_period_lifecycle_callbacks([this]() { on_period_begin(); },
+                                         [this]() { on_period_end(); });
+}
 
 NoiseManager::~NoiseManager() = default;
 
@@ -72,6 +79,17 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   retire_queue_.retire(std::move(old), sensor_table_.epoch());
   // 控制线程回收（勿在 RT 路径调，reclaim_older_than 持 mutex）
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
+  // Spec3 T8b（C2 修复）：向 Bridge 注册 FrameProvider，使 PcmCaptureService
+  // 分发的 ALSA period 帧经 Bridge 解复用后路由到 on_frame（arch §3.7 L791
+  // "向 Bridge 注册 FrameProvider"）。此前 add_sensor 不注册 frame provider，
+  // 生产 pipeline 永不运行 on_frame -> metrics 留默认 -> /denoised 404。
+  // channel_map 默认 {0}（Phase 1 单通道，arch §4.2 "channels 恒为 1"）。
+  // NoiseSensorConfig 无 map 字段，Phase 1 固定 channel 0。
+  bridge_.register_frame_provider(
+      sink_id, {0},
+      [this](uint8_t sid, const float* frames, size_t n, uint8_t /*ch*/) {
+        on_frame(sid, frames, n);
+      });
   // Spec3 Task 4：变更即保存（arch §7.6）。status_file_ 空时 no-op。
   save_status();
   return true;
@@ -102,8 +120,11 @@ bool NoiseManager::remove_sensor(uint8_t sensor_id) {
   // 同 add_sensor 的 COW 模式（arch §3.7 L860 读路径无锁约束）。
   std::lock_guard<std::mutex> lock(ctrl_mutex_);
   const SensorTable* current = sensor_table_.load();
-  if (current->find(sensor_id) == current->end())
+  auto it = current->find(sensor_id);
+  if (it == current->end())
     return false;  // 不存在
+  // Spec3 T8b（C2 修复）：注销 Bridge FrameProvider，停止向该 sink 分发帧。
+  bridge_.unregister_frame_provider(it->second.sink_id);
   auto new_table = std::make_shared<SensorTable>(*current);
   new_table->erase(sensor_id);
   auto old = sensor_table_.publish(std::move(new_table));

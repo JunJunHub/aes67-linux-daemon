@@ -23,8 +23,13 @@ constexpr uint32_t PcmCaptureService::kPeriodSamples;
 std::shared_ptr<PcmCaptureService> PcmCaptureService::create(
     std::shared_ptr<SessionManager> session_manager,
     std::shared_ptr<Config> config) {
-  return std::shared_ptr<PcmCaptureService>(
+  // Spec3 T8b（C2 修复）：publish 初始空 provider 表，使 register_provider
+  // 在 init() 前可用（load_status -> add_sensor -> register_frame_provider
+  // -> register_provider 发生在 init() 前）。与 create_for_test 同模式。
+  auto svc = std::shared_ptr<PcmCaptureService>(
       new PcmCaptureService(std::move(session_manager), std::move(config)));
+  svc->providers_.publish(std::make_shared<std::vector<ProviderEntry>>());
+  return svc;
 }
 
 std::shared_ptr<PcmCaptureService> PcmCaptureService::create_for_test() {

@@ -776,8 +776,13 @@ std::error_code Streamer::encode_denoise_aac(uint8_t sink_id,
   std::copy(s16.data(), s16.data() + copy_n, buf.data());
 
   std::vector<uint8_t> out_buf(out_buf_size);
-  int ret = faacEncEncode(enc, reinterpret_cast<int32_t*>(buf.data()),
-                          in_samples, out_buf.data(), out_buf_size);
+  // faac 首次 encode 可能返回 0（内部 look-ahead 缓冲未满）。
+  // 多次喂同一帧数据直到产出 AAC（最多 5 次，同 T8 E2E 测试模式）。
+  int ret = 0;
+  for (int i = 0; i < 5 && ret <= 0; ++i) {
+    ret = faacEncEncode(enc, reinterpret_cast<int32_t*>(buf.data()), in_samples,
+                        out_buf.data(), out_buf_size);
+  }
   faacEncClose(enc);
 
   if (ret < 0) {

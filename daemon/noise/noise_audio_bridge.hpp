@@ -29,6 +29,16 @@ class NoiseAudioBridge {
 
   using PtpStatusCallback = std::function<void(const std::string& status)>;
   virtual void set_ptp_status_callback(PtpStatusCallback cb) = 0;
+  // Spec3 T8b（C2 修复）：period 生命周期回调。Bridge 在 PcmCaptureService
+  // provider 回调内调用：begin（period 顶部，demux 前）+ end（period 结尾，
+  // demux 后）。NoiseManager 在构造时设置，使 Bridge 能驱动
+  // on_period_begin/on_period_end（每个 ALSA period 恰好一次，NoiseManager
+  // 全局，非 per-sink）。修复 C2：此前 register_frame_provider 是 stub，
+  // 生产 pipeline 永不运行 on_frame。
+  using PeriodBeginCallback = std::function<void()>;
+  using PeriodEndCallback = std::function<void()>;
+  virtual void set_period_lifecycle_callbacks(PeriodBeginCallback begin,
+                                              PeriodEndCallback end) = 0;
   using SinkChangeCallback = std::function<void(uint8_t sink_id)>;
   virtual void set_sink_add_callback(SinkChangeCallback cb) = 0;
   virtual void set_sink_remove_callback(SinkChangeCallback cb) = 0;

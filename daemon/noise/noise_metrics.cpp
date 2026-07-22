@@ -39,6 +39,16 @@ void NoiseMetrics::set_denoise_state(bool enabled, float dry_wet) {
                               std::memory_order_relaxed);
 }
 
+void NoiseMetrics::set_ref_result(float similarity,
+                                  float noise_db,
+                                  float delay_ms) {
+  // Spec4 T5：comparison 线程写入 ref_* 字段。持锁与 collect() 互斥。
+  std::lock_guard<std::mutex> lock(metrics_mutex_);
+  latest_.ref_similarity = similarity;
+  latest_.ref_noise_db = noise_db;
+  latest_.ref_delay_ms = delay_ms;
+}
+
 void NoiseMetrics::collect(const DenoiseResult& denoise,
                            const NoiseDetectionResult& detection,
                            const NoiseAnalysisResult& analysis,

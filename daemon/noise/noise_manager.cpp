@@ -2,6 +2,7 @@
 // 架构依据：docs/noise/architecture-design.md §3.7。
 #include "noise_manager.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -31,7 +32,12 @@ NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {
                                          [this]() { on_period_end(); });
 }
 
-NoiseManager::~NoiseManager() = default;
+NoiseManager::~NoiseManager() {
+  // Spec4 T5：析构时 join comparison 线程（R-S4.7）。
+  // 不依赖 PTP 联动（on_capture_thread_joined 只在 PTP unlock 路径触发），
+  // 析构是确定性的 shutdown 路径，必须保证线程退出。
+  stop_comparison_thread();
+}
 
 bool NoiseManager::add_sensor(uint8_t sensor_id,
                               uint8_t sink_id,
@@ -214,7 +220,7 @@ void NoiseManager::on_frame(uint8_t sink_id,
     if (ctx.sink_id != sink_id)
       continue;
     if (!ctx.denoise || !ctx.detector || !ctx.analyzer || !ctx.metrics)
-      return;
+      break;
     // 计数 on_frame 调用（#3 兼容：stub_call_count_for_test 用此字段）。
     // shared_ptr<atomic<size_t>>: 跨表共享（COW 复制后旧/新表同一计数器）。
     if (ctx.frame_count)
@@ -281,6 +287,14 @@ void NoiseManager::on_frame(uint8_t sink_id,
                          denoised_rms);
     break;
   }
+
+  // Spec4 T5：RefComparator 帧路由（arch §6.3.2 L1513）。
+  // on_frame 末尾，ADDITIVE 不改 ①②③④。若 sink_id 是某 RefComparator 的
+  // ref/cmp 源，调 write_ref/write_cmp（memcpy 快，不计 RT 重活，风险 9）。
+  // 查找用 ref_routing_ map（sink_id -> {comparator_id, role}）。
+  // 持 ref_mutex_（~0.5μs memcpy，与 NoiseMetrics::collect 同模式，不影响
+  // RT 预算）。一个 sink 可同时是多个 comparator 的输入，遍历所有匹配路由。
+  route_to_ref_comparators(sink_id, frames, frame_size);
 }
 
 void NoiseManager::on_period_end() {
@@ -305,6 +319,10 @@ void NoiseManager::on_ptp_unlocked() {
   // process 中途 致 epoch 不推进，path B 或 livelock 或与停滞 process 竞态）。
   ptp_locked_.store(false);
   reset_pending_.store(true);
+  // Spec4 T5（R-S4.7）：暂停 comparison 线程（capture 静止后不再访问 ring
+  // buffer，避免与 capture 线程竞争）。真实 join 由 on_capture_thread_joined
+  // 触发。仅置 running=false，不 join（避免在 PTP 回调线程中阻塞）。
+  comparison_running_.store(false, std::memory_order_relaxed);
 }
 
 void NoiseManager::on_ptp_locked() {
@@ -316,6 +334,14 @@ void NoiseManager::on_ptp_locked() {
   // set_ptp_locked_for_test 设置，生产 pipeline 永不运行（C1）。
   ptp_locked_.store(true);
   reset_pending_.store(false);
+  // Spec4 T5（R-S4.7）：恢复 comparison 线程（若有 comparator 注册）。
+  // on_capture_thread_joined 已 stop_comparison_thread（join 线程），
+  // 此处需 restart 若有 comparator。start_comparison_thread 检查 joinable，
+  // 若线程仍在运行（未被 stop）则 no-op；若已 stop 则重启。
+  if (!ref_comparators_.empty()) {
+    start_comparison_thread();
+    comparison_running_.store(true, std::memory_order_relaxed);
+  }
 }
 
 void NoiseManager::on_capture_thread_joined() {
@@ -329,6 +355,13 @@ void NoiseManager::on_capture_thread_joined() {
   // 路径的 stop_capture（如 terminate）误触发 reset，也避免重复 reset。
   if (!reset_pending_.load())
     return;
+  // Spec4 T5（R-S4.7）：capture 线程已静止，join comparison 线程（若有）。
+  // comparison 线程访问 ring buffer，capture 线程静止后无并发写入，
+  // 但 comparison 线程可能仍在 try_process 中读 ring。join 确保它退出。
+  // 注意：这里 stop 会让线程退出，on_ptp_locked 时需要 restart。
+  // 但 PTP unlock -> on_capture_thread_joined 是 shutdown 路径的前置，
+  // 若随后 on_ptp_locked 恢复，start_comparison_thread 会重启线程。
+  stop_comparison_thread();
   // 控制线程遍历当前 sensor 表（RCU load，安全）。每个 sensor 的 denoise
   // processor 经 RcuPtr<PluginSlot> load 当前 plugin -> reset()。
   // plugin->reset() 实现须仅清内部状态（不分配/不释放，RT-safe 契约），
@@ -636,6 +669,241 @@ bool NoiseManager::load_status(const std::string& noise_status_file) {
   // 文件不存在（首次启动）已在上文 return false。I/O 错误（cannot open）
   // 已在上文 return false。
   return true;
+}
+
+// ── Spec4 T5：RefComparator 参考音比对实现（arch §3.5 + §6.3.2）──────
+// 控制线程 API + comparison 线程。算法在 ref_comparator.cpp。
+
+uint8_t NoiseManager::add_ref_comparator(uint8_t ref_sink_id,
+                                         uint8_t cmp_sink_id) {
+  // D-S4.8：additive 新增方法。控制线程调用。
+  if (ref_sink_id == cmp_sink_id)
+    return 0;  // ref == cmp 无意义
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  // 创建 comparator 实例。
+  uint8_t id = next_comparator_id_++;
+  if (next_comparator_id_ == 0)  // 1-based 溢出回绕（理论极限 255）
+    next_comparator_id_ = 1;
+  RefComparatorEntry entry;
+  entry.id = id;
+  entry.comparator = std::make_shared<RefComparator>(ref_sink_id, cmp_sink_id);
+  ref_comparators_.push_back(std::move(entry));
+  // 注册路由：ref_sink -> {id, role=0}，cmp_sink -> {id, role=1}。
+  ref_routing_[ref_sink_id].push_back({id, 0});
+  ref_routing_[cmp_sink_id].push_back({id, 1});
+  // Lazy-start comparison 线程（首个 comparator 时）。
+  start_comparison_thread();
+  return id;
+}
+
+bool NoiseManager::remove_ref_comparator(uint8_t comparator_id) {
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                         [comparator_id](const RefComparatorEntry& e) {
+                           return e.id == comparator_id;
+                         });
+  if (it == ref_comparators_.end())
+    return false;
+  // 注销路由：从 ref_routing_ 中移除指向此 comparator 的条目。
+  for (auto& [sink_id, routes] : ref_routing_) {
+    routes.erase(std::remove_if(routes.begin(), routes.end(),
+                                [comparator_id](const RefRoute& r) {
+                                  return r.comparator_id == comparator_id;
+                                }),
+                 routes.end());
+  }
+  // 清理空 routes 的 sink 条目。
+  for (auto rit = ref_routing_.begin(); rit != ref_routing_.end();) {
+    if (rit->second.empty())
+      rit = ref_routing_.erase(rit);
+    else
+      ++rit;
+  }
+  ref_comparators_.erase(it);
+  // 若无 comparator 残留，comparison 线程在下个 loop 检测到空表后退出。
+  // 不主动 stop（避免在 remove 路径中 join 线程的复杂性；stop 在析构/
+  // on_capture_thread_joined 时统一处理）。
+  return true;
+}
+
+std::vector<NoiseManager::RefComparatorInfo>
+NoiseManager::list_ref_comparators() const {
+  std::vector<RefComparatorInfo> out;
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  out.reserve(ref_comparators_.size());
+  for (const auto& e : ref_comparators_) {
+    RefComparatorInfo info;
+    info.id = e.id;
+    if (e.comparator) {
+      info.ref_sink_id = e.comparator->ref_sink_id();
+      info.cmp_sink_id = e.comparator->cmp_sink_id();
+      info.delay_anomaly = e.comparator->delay_anomaly();
+    }
+    out.push_back(info);
+  }
+  return out;
+}
+
+bool NoiseManager::get_ref_result_for_test(uint8_t comparator_id,
+                                           RefCompareResult& out) const {
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                         [comparator_id](const RefComparatorEntry& e) {
+                           return e.id == comparator_id;
+                         });
+  if (it == ref_comparators_.end())
+    return false;
+  out = it->last_result;
+  return true;
+}
+
+bool NoiseManager::get_ref_overflow_for_test(uint8_t comparator_id,
+                                             size_t& ref_overflow,
+                                             size_t& cmp_overflow) const {
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                         [comparator_id](const RefComparatorEntry& e) {
+                           return e.id == comparator_id;
+                         });
+  if (it == ref_comparators_.end() || !it->comparator)
+    return false;
+  ref_overflow = it->comparator->ref_overflow_count();
+  cmp_overflow = it->comparator->cmp_overflow_count();
+  return true;
+}
+
+bool NoiseManager::wait_comparison_done_for_test(uint32_t timeout_ms) {
+  // 测试钩子：等待 comparison 线程完成一次处理。
+  comparison_done_.store(false, std::memory_order_relaxed);
+  trigger_comparison_for_test();
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (comparison_done_.load(std::memory_order_relaxed))
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+void NoiseManager::route_to_ref_comparators(uint8_t sink_id,
+                                            const float* frames,
+                                            size_t frame_size) {
+  // on_frame 末尾调用（arch §6.3.2 L1513）。ADDITIVE：不改 ①②③④。
+  // 持 ref_mutex_ 查路由表 + 调 comparator->write_ref/write_cmp（memcpy 快）。
+  // mutex 持有时间：map lookup (~0.1μs) + memcpy (~0.5μs for 480 floats)，
+  // 与 NoiseMetrics::collect 持 metrics_mutex_ 同模式，不影响 RT 预算。
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  auto it = ref_routing_.find(sink_id);
+  if (it == ref_routing_.end())
+    return;
+  for (const auto& route : it->second) {
+    // 查 comparator 实例。
+    auto cit = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                            [&route](const RefComparatorEntry& e) {
+                              return e.id == route.comparator_id;
+                            });
+    if (cit == ref_comparators_.end() || !cit->comparator)
+      continue;
+    if (route.role == 0) {
+      cit->comparator->write_ref(frames, frame_size);
+    } else {
+      cit->comparator->write_cmp(frames, frame_size);
+    }
+  }
+}
+
+void NoiseManager::comparison_loop() {
+  // SCHED_OTHER（非 RT，D-S4.3）。~每 100ms 轮询，遍历 ref_comparators 调
+  // try_process()，结果写 metrics->set_ref_result() + last_result。
+  // PTP 联动（R-S4.7）：comparison_running_=false 时跳过处理（不访问 ring，
+  // 避免 capture 静止后竞争），但线程仍在 loop（等待 running=true 恢复）。
+  while (!comparison_stop_.load(std::memory_order_relaxed)) {
+    bool triggered =
+        comparison_trigger_.exchange(false, std::memory_order_relaxed);
+    if (comparison_running_.load(std::memory_order_relaxed)) {
+      std::vector<std::pair<std::shared_ptr<RefComparator>, uint8_t>> snapshots;
+      uint8_t cmp_sink_to_metric = 0;
+      // 在锁内拷贝 comparator 列表 + 关联的 sink_id（用于写 metrics）。
+      // 锁外调 try_process（避免长时间持锁，NLMS 计算可能 ~ms 级）。
+      {
+        std::lock_guard<std::mutex> lock(ref_mutex_);
+        snapshots.reserve(ref_comparators_.size());
+        for (const auto& e : ref_comparators_) {
+          if (e.comparator) {
+            snapshots.emplace_back(e.comparator, e.id);
+          }
+        }
+      }
+      // 锁外处理每个 comparator。
+      // results 收集后在锁内写回 last_result。
+      struct ResultEntry {
+        uint8_t id;
+        RefCompareResult result;
+      };
+      std::vector<ResultEntry> results;
+      for (auto& [comp, id] : snapshots) {
+        auto r = comp->try_process();
+        if (r.has_value()) {
+          results.push_back({id, r.value()});
+        }
+      }
+      // 锁内写回 last_result + 写 metrics（cmp_sink 的 NoiseMetrics）。
+      if (!results.empty()) {
+        std::lock_guard<std::mutex> lock(ref_mutex_);
+        for (const auto& r : results) {
+          auto it = std::find_if(
+              ref_comparators_.begin(), ref_comparators_.end(),
+              [&r](const RefComparatorEntry& e) { return e.id == r.id; });
+          if (it != ref_comparators_.end()) {
+            it->last_result = r.result;
+            // 写 cmp_sink 的 metrics（备链路是比对结果的归属 sink）。
+            if (it->comparator) {
+              cmp_sink_to_metric = it->comparator->cmp_sink_id();
+              const SensorTable* tbl = sensor_table_.load();
+              if (tbl != nullptr) {
+                for (const auto& [sid, ctx] : *tbl) {
+                  (void)sid;
+                  if (ctx.sink_id == cmp_sink_to_metric && ctx.metrics) {
+                    ctx.metrics->set_ref_result(r.result.similarity,
+                                                r.result.noise_db,
+                                                r.result.delay_ms);
+                    break;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      comparison_done_.store(true, std::memory_order_relaxed);
+    }
+    if (!triggered) {
+      // 非触发模式：100ms 轮询间隔。
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+}
+
+void NoiseManager::start_comparison_thread() {
+  // 已持有 ref_mutex_（add_ref_comparator 调用），但线程启动不涉及共享
+  // 状态修改，仅检查 comparison_thread_ 是否已 joinable。
+  if (comparison_thread_.joinable())
+    return;
+  comparison_stop_.store(false, std::memory_order_relaxed);
+  // 若 PTP 已锁，立即启用处理；否则线程 loop 等待 running=true。
+  if (ptp_locked_.load(std::memory_order_relaxed)) {
+    comparison_running_.store(true, std::memory_order_relaxed);
+  }
+  comparison_thread_ = std::thread([this]() { comparison_loop(); });
+}
+
+void NoiseManager::stop_comparison_thread() {
+  comparison_stop_.store(true, std::memory_order_relaxed);
+  comparison_running_.store(false, std::memory_order_relaxed);
+  if (comparison_thread_.joinable()) {
+    comparison_thread_.join();
+  }
 }
 
 }  // namespace noise

@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,6 +21,7 @@
 #include "noise_detector.hpp"
 #include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
+#include "ref_comparator.hpp"
 
 namespace noise {
 
@@ -113,6 +115,42 @@ class NoiseManager {
   bool set_param(uint8_t sensor_id,
                  const std::string& key,
                  const std::string& value);
+
+  // ── Spec4 T5：RefComparator 参考音比对（arch §3.5 + §6.3.2）──
+  // add_ref_comparator：配置一对 (ref_sink, cmp_sink) 的参考比对。
+  //   控制线程调用。创建 RefComparator 实例 + 注册路由（ref_sink/cmp_sink ->
+  //   comparator_id），并 lazy-start comparison 线程（首个 comparator 时）。
+  //   返回 comparator_id（1-based，0 表示失败：ref_sink == cmp_sink 或满）。
+  uint8_t add_ref_comparator(uint8_t ref_sink_id, uint8_t cmp_sink_id);
+  // remove_ref_comparator：注销 comparator + 路由。控制线程调用。
+  //   若是最后一个 comparator，comparison 线程在下个循环检测到空表后退出。
+  bool remove_ref_comparator(uint8_t comparator_id);
+  // list_ref_comparators：返回所有已配置 comparator 的信息（HTTP GET 用）。
+  struct RefComparatorInfo {
+    uint8_t id{0};
+    uint8_t ref_sink_id{0};
+    uint8_t cmp_sink_id{0};
+    bool delay_anomaly{false};
+  };
+  std::vector<RefComparatorInfo> list_ref_comparators() const;
+  // 测试钩子：直接获取 comparator 的最新比对结果（不经 metrics 快照）。
+  //   未找到返回 false。
+  bool get_ref_result_for_test(uint8_t comparator_id,
+                               RefCompareResult& out) const;
+  // 测试钩子：获取 comparator 的溢出计数（ref/cmp 各一路）。
+  bool get_ref_overflow_for_test(uint8_t comparator_id,
+                                 size_t& ref_overflow,
+                                 size_t& cmp_overflow) const;
+  // 测试钩子：comparison 线程是否在运行。
+  bool is_comparison_thread_running_for_test() const {
+    return comparison_running_.load(std::memory_order_relaxed);
+  }
+  // 测试钩子：同步触发一次 comparison 线程的 try_process（绕过 100ms 轮询）。
+  //   用于测试中确定性验证结果进 metrics 快照。非阻塞：仅置标志，
+  //   comparison 线程下个循环检测到后处理。
+  void trigger_comparison_for_test() { comparison_trigger_.store(true); }
+  // 测试钩子：等待 comparison 线程完成一次处理（最多 timeout_ms）。
+  bool wait_comparison_done_for_test(uint32_t timeout_ms = 2000);
 
   // 帧回调入口（Bridge 的 capture 线程调用，按 sink_id 路由到对应 sensor）
   // frames 为单通道连续帧（Bridge 已按 channel_map 解复用，channels 恒为 1）。
@@ -262,8 +300,8 @@ class NoiseManager {
       ctrl_mutex_;  // 仅保护控制线程的建表/换表；帧回调走 RCU 读，绝不持此锁
   // arch §3.7 L855：安全默认 false（假设未锁，直到 PTP 回调确认锁定）。
   std::atomic<bool> ptp_locked_{false};
-  std::atomic<bool> reset_pending_{false};
-  // Spec3 Task 4：持久化文件路径（arch §7.6）。
+  std::atomic<bool> reset_pending_{
+      false};  // Spec3 Task 4：持久化文件路径（arch §7.6）。
   // 空字符串禁用 save_status（no-op）。由 Config::noise_status_file_ 注入
   // （T6 wiring）或 set_status_file_for_test 设置。
   // mutable: save_status() const 方法可读（不写，仅读路径）。
@@ -284,6 +322,49 @@ class NoiseManager {
   // 不影响 RT。lock order: ctrl_mutex_ -> save_mutex_（add_sensor 持
   // ctrl_mutex_ 后调 save_status），save_status 单独持 save_mutex_ 无死锁。
   mutable std::mutex save_mutex_;
+
+  // ── Spec4 T5：RefComparator 注册表 + comparison 线程 ──
+  // comparator_id -> RefComparator 实例。控制线程（add/remove）写，
+  // comparison 线程读。mutex 保护（低频控制平面，非 RT）。
+  // 一个 sink 可同时是多个 comparator 的输入（如主链路作为多个备链路的
+  // 参考），on_frame 按 sink_id 查路由表写入对应 ring buffer。
+  struct RefComparatorEntry {
+    uint8_t id{0};
+    std::shared_ptr<RefComparator> comparator;
+    RefCompareResult last_result{};
+  };
+  std::vector<RefComparatorEntry> ref_comparators_;
+  mutable std::mutex ref_mutex_;
+  // 路由表：sink_id -> {(comparator_id, role)}。on_frame 末尾查此表
+  // 决定是否写 ref/cmp ring。role: 0=ref, 1=cmp。
+  // 不用 RCU：ref_comparators 是低频控制平面对象（add/remove 罕见），
+  // on_frame 末尾的 ring 写入持 ref_mutex_ 的时间极短（~0.5μs memcpy），
+  // 与 NoiseMetrics::collect 持 metrics_mutex_ 同模式，不影响 RT 预算。
+  struct RefRoute {
+    uint8_t comparator_id{0};
+    uint8_t role{0};  // 0=ref, 1=cmp
+  };
+  std::map<uint8_t, std::vector<RefRoute>> ref_routing_;
+  uint8_t next_comparator_id_{1};  // 1-based，0 = 无效
+
+  // comparison 线程（D-S4.3）：SCHED_OTHER，~每 100ms 轮询，遍历
+  // ref_comparators 调 try_process()，结果写 metrics->set_ref_result()。
+  std::thread comparison_thread_;
+  std::atomic<bool> comparison_running_{false};
+  std::atomic<bool> comparison_stop_{false};
+  // 测试钩子：置位触发 comparison 线程立即处理（绕过 100ms 轮询）。
+  std::atomic<bool> comparison_trigger_{false};
+  // 测试钩子：comparison 线程完成一次处理后置位（wait_comparison_done 用）。
+  std::atomic<bool> comparison_done_{false};
+
+  void comparison_loop();
+  void start_comparison_thread();
+  void stop_comparison_thread();
+  // on_frame 末尾调用：查 ref_routing_ 表，将帧 memcpy 进对应 comparator 的
+  // ref/cmp ring buffer。ADDITIVE，不改 ①②③④。
+  void route_to_ref_comparators(uint8_t sink_id,
+                                const float* frames,
+                                size_t frame_size);
 };
 
 }  // namespace noise

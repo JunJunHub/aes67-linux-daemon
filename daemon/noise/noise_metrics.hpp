@@ -81,6 +81,14 @@ struct NoiseMetricsSnapshot {
   float output_level_dbfs{-100.0f};
   float noise_reduction_db{0.0f};
 
+  // Spec4 T5：参考比对结果（arch §3.6 L740-743 设计，Spec2/3 未实现）。
+  // 未配置 RefComparator 时保持默认（T4 告警引擎据此跳过 ref 规则）。
+  // 由 NoiseManager 的 comparison 线程经 metrics->set_ref_result() 写入
+  // （低频 ~2s 一次，持 metrics_mutex_ 与 collect() 互斥）。
+  float ref_similarity{0.0f};
+  float ref_noise_db{-100.0f};
+  float ref_delay_ms{0.0f};
+
   // 告警（D-S3.4：noise_level_dbfs > alert_threshold_dbfs
   // OR hum_strength_db > hum_alert_threshold_db）
   float alert_threshold_dbfs{-30.0f};
@@ -115,6 +123,13 @@ class NoiseMetrics {
   // 控制线程：设置降噪状态（denoise_enabled / dry_wet）。
   // add_sensor / set_dry_wet 调用。atomic 写，collect() atomic 读 -> 无竞争。
   void set_denoise_state(bool enabled, float dry_wet);
+
+  // Spec4 T5：comparison 线程写入参考比对结果到 latest_ 快照。
+  // 持 metrics_mutex_ 与 collect() (RT 写) 互斥。低频调用（~2s 一次）。
+  // 不写入 history_（history 由 collect() 在 RT 路径采样，避免 comparison
+  // 线程对 deque 的并发 push）。下次 collect() 会把当前 ref_* 值带入
+  // history 采样点。
+  void set_ref_result(float similarity, float noise_db, float delay_ms);
 
   // Spec3 Task 3 同步读路径（HTTP 控制线程调用）。
   // 持 metrics_mutex_ 读 latest_ / history_ 副本，与 collect() 写互斥。

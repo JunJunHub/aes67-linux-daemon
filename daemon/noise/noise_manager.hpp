@@ -278,6 +278,12 @@ class NoiseManager {
   // atomic: load_status (控制线程写) 与 save_status (控制线程读，由
   // add_sensor 内部调用) 跨函数但同线程，atomic 保证可见性。
   mutable std::atomic<bool> load_in_progress_{false};
+  // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
+  // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
+  // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，
+  // 不影响 RT。lock order: ctrl_mutex_ -> save_mutex_（add_sensor 持
+  // ctrl_mutex_ 后调 save_status），save_status 单独持 save_mutex_ 无死锁。
+  mutable std::mutex save_mutex_;
 };
 
 }  // namespace noise

@@ -146,8 +146,10 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
     return false;
   // 序列化 templates_ 为 JSON（arch §7.5 格式）：
   // { "templates": [ { "id": 1, "label": "test", "bark_spectrum": [...],
-  //                    "description": "...", "wav_file": "..." } ] }
+  //                    "description": "...", "wav_file": "...",
+  //                    "wav_available": true } ] }
   // Spec3 Task 5：新增 description + wav_file 字段（arch §7.5）。
+  // Spec4 T1（D-S4.8）：新增 wav_available 字段（additive，向后兼容）。
   std::ostringstream ss;
   ss << "{\n  \"templates\": [";
   for (size_t i = 0; i < templates_.size(); ++i) {
@@ -165,6 +167,7 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
     }
     ss << "],\n      \"description\": \"" << escape_json(t.description) << "\""
        << ",\n      \"wav_file\": \"" << escape_json(t.wav_file) << "\""
+       << ",\n      \"wav_available\": " << (t.wav_available ? "true" : "false")
        << "\n    }";
   }
   ss << "\n  ]\n}\n";
@@ -197,6 +200,8 @@ bool NoiseTemplateDB::load(const std::string& dir) {
       // Spec3 Task 5：description + wav_file 可缺省（向后兼容 T4 格式）。
       t.description = v.second.get<std::string>("description", "");
       t.wav_file = v.second.get<std::string>("wav_file", "");
+      // Spec4 T1（D-S4.8）：wav_available 缺省 = true（向后兼容旧 JSON）。
+      t.wav_available = v.second.get<bool>("wav_available", true);
       std::array<float, 32> feat{};
       size_t idx = 0;
       BOOST_FOREACH (const boost::property_tree::ptree::value_type& f,
@@ -205,6 +210,18 @@ bool NoiseTemplateDB::load(const std::string& dir) {
           feat[idx++] = f.second.get_value<float>();
       }
       t.bark_features = feat;
+      // Spec4 T1（D-S4.7 风险15）：逐条检查 WAV 文件是否存在。
+      // wav_file 非空但文件缺失 -> wav_available=false + 告警。
+      // bark_spectrum 特征向量保留，L2 匹配仍可用，仅回听不可用。
+      if (!t.wav_file.empty()) {
+        std::string wav_path = dir + "/" + t.wav_file;
+        if (!std::filesystem::exists(wav_path)) {
+          t.wav_available = false;
+          std::cerr << "NoiseTemplateDB::load: 模板 " << t.template_id << " ("
+                    << t.name << ") 的 WAV 缺失（" << t.wav_file
+                    << "），特征仍可用但回听不可用" << std::endl;
+        }
+      }
       templates_.push_back(std::move(t));
       if (t.template_id >= next_id_)
         next_id_ = t.template_id + 1;
@@ -218,6 +235,18 @@ bool NoiseTemplateDB::load(const std::string& dir) {
     std::cerr << "NoiseTemplateDB::load: error: " << e.what() << std::endl;
     return false;
   }
+}
+
+// Spec4 T1（D-S4.7）：返回模板 WAV 文件的完整路径。
+// wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
+// 否则返回 dir_ + "/" + wav_file。未找到模板 -> 返回空串。
+std::string NoiseTemplateDB::get_wav_path(uint32_t template_id) const {
+  const Template* t = get_template(template_id);
+  if (t == nullptr)
+    return "";
+  if (!t->wav_available || t->wav_file.empty())
+    return "";
+  return dir_ + "/" + t->wav_file;
 }
 
 // ── Spec3 Task 5：WAV 录入（arch §7.7）─────────────────────────────────

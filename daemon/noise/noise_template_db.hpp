@@ -32,12 +32,17 @@ bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
 // Spec3 Task 5:新增 description + wav_file 字段（arch §7.5）。
 //   wav_file 为相对于 template_dir 的文件名（如 "template-1.wav"），
 //   空字符串表示该模板无原始 WAV（如 JSON 导入的模板）。
+// Spec4 T1（D-S4.8）:新增 wav_available 字段（additive，向后兼容）。
+//   load 时检查 wav_file 对应文件是否存在，缺失则置 false（arch §11 风险15）。
+//   bark_spectrum 特征向量保留，L2 匹配仍可用。save 序列化该字段，
+//   load 时缺省 = true（向后兼容旧 templates.json）。
 struct Template {
   uint32_t template_id{0};
   std::string name;
   std::array<float, 32> bark_features{};
-  std::string description;  // Spec3 Task 5（arch §7.5）
-  std::string wav_file;     // Spec3 Task 5：相对 template_dir 的文件名
+  std::string description;   // Spec3 Task 5（arch §7.5）
+  std::string wav_file;      // Spec3 Task 5：相对 template_dir 的文件名
+  bool wav_available{true};  // Spec4 T1（D-S4.8）：WAV 文件是否存在
 };
 
 // L2 模板匹配库(arch §3.3.5)。
@@ -74,6 +79,12 @@ class NoiseTemplateDB {
 
   // Spec3 Task 5：按 id 查找模板详情。未找到返回 nullptr。
   const Template* get_template(uint32_t template_id) const;
+
+  // Spec4 T1（D-S4.7）：返回模板 WAV 文件的完整路径。
+  //   wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
+  //   否则返回 dir_ + "/" + wav_file。
+  //   未找到模板 -> 返回空串。
+  std::string get_wav_path(uint32_t template_id) const;
 
   // Spec3 Task 5：更新 label/description。未找到返回 false。
   bool update_template(uint32_t template_id,

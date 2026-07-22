@@ -1084,6 +1084,11 @@ BOOST_AUTO_TEST_SUITE_END()
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
+
+#include <boost/foreach.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include "config.hpp"
 #include "noise/noise_status.hpp"
@@ -1186,23 +1191,151 @@ BOOST_AUTO_TEST_CASE(atomic_write_no_halfwrite) {
   std::remove(f);
 }
 
-// review Minor #4：corrupt-JSON-load 测试。
-// 写垃圾到文件，load_status 返回 false（graceful，不 crash/不抛异常）。
-BOOST_AUTO_TEST_CASE(load_status_rejects_corrupt_json) {
-  const char* f = "test_corrupt_status.json";
+// D-S4.7（T1）：corrupt-JSON-load 降级测试。
+// 写垃圾到文件，load_status 返回 true（降级为空配置，不阻塞 daemon 启动）+
+// sensors 为空（mid-state 回滚）+ stderr 日志告警。
+// Case 1: 顶层 JSON 畸形（read_json 抛 json_parser_error -> 0 sensor 已加）。
+// Case 2: 中途字段错误（第 1 个 sensor 合法 -> add_sensor；第 2 个 sensor
+//   id 字段为字符串 -> get<unsigned> 抛 ptree_bad_data -> catch(std::exception)
+//   -> 回滚已加的 sensor 0 -> 降级为空配置）。
+BOOST_AUTO_TEST_CASE(load_status_degrades_on_corrupt) {
+  // Case 1: top-level corrupt JSON (read_json throws before any sensor added)
+  {
+    const char* f = "test_corrupt_status.json";
+    std::remove(f);
+    // 写畸形 JSON（缺 }）
+    std::ofstream out(f);
+    out << R"({"sensors":[{"id":0,"sink_id":0)";
+    out.close();
+    NoiseAudioBridgeStub bridge;
+    noise::NoiseManager mgr(bridge);
+    mgr.set_status_file_for_test(f);
+    // D-S4.7: 降级为空配置，返回 true（不阻塞 daemon 启动）
+    BOOST_CHECK(mgr.load_status(f));
+    // 不 crash、不抛异常即通过。sensor_count 应为 0（未加载任何传感器）。
+    BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+    std::remove(f);
+  }
+  // Case 2: mid-parse failure (first sensor valid, second bad -> rollback)
+  {
+    const char* f = "test_corrupt_mid_status.json";
+    std::remove(f);
+    std::ofstream out(f);
+    // First sensor is valid, second has bad id type (string instead of
+    // unsigned) -> get<unsigned>("id") throws ptree_bad_data -> catch.
+    // Without D-S4.7 rollback, sensor 0 would remain in the table.
+    out << R"({"sensors":[)"
+        << R"({"id":0,"sink_id":0,"enabled":true,"denoise_enabled":false,)"
+        << R"("denoise_plugin":"passthrough","denoise_dry_wet":1.0,)"
+        << R"("sensitivity":1.0},)" << R"({"id":"not_a_number","sink_id":1}]})"
+        << "}";
+    out.close();
+    NoiseAudioBridgeStub bridge;
+    noise::NoiseManager mgr(bridge);
+    mgr.set_status_file_for_test(f);
+    // D-S4.7: parse 中途失败 -> 清空 mid-state sensors + 降级为空配置
+    BOOST_CHECK(mgr.load_status(f));
+    // sensor_count 必须为 0（mid-state sensor 0 已回滚）
+    BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+    std::remove(f);
+  }
+}
+
+// D-S4.7（T1）：save_status 并发写安全测试。
+// 多线程并发 save_status + add_sensor/remove_sensor -> 最终文件可解析且无半写。
+// save_mutex_ 序列化持久化写路径，防止 tmp 文件竞争导致损坏。
+// ThreadSanitizer 可检测 save_mutex_ 缺失时的数据竞争（手动运行）。
+BOOST_AUTO_TEST_CASE(save_status_concurrent_no_corruption) {
+  const char* f = "test_concurrent_status.json";
   std::remove(f);
-  // 写畸形 JSON（缺 }）
-  std::ofstream out(f);
-  out << R"({"sensors":[{"id":0,"sink_id":0)";
-  out.close();
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   mgr.set_status_file_for_test(f);
-  // load_status 返回 false（JSON 解析失败 -> stderr 告警 -> false）
-  BOOST_CHECK(!mgr.load_status(f));
-  // 不 crash、不抛异常即通过。sensor_count 应为 0（未加载任何传感器）。
-  BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+  // 初始 sensor 0 使 save_status 有内容可序列化
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+
+  // Thread 1: 反复调 save_status（模拟并发"变更即写"）
+  std::thread t_save([&]() {
+    for (int i = 0; i < 200; ++i)
+      mgr.save_status();
+  });
+  // Thread 2: 反复 add/remove sensor 1（每次触发内部 save_status）
+  std::thread t_add([&]() {
+    for (int i = 0; i < 100; ++i) {
+      mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+      mgr.remove_sensor(1);
+    }
+  });
+
+  t_save.join();
+  t_add.join();
+
+  // 验证最终文件是合法 JSON（无半写损坏）
+  boost::property_tree::ptree pt;
+  std::ifstream in(f);
+  BOOST_REQUIRE(in.is_open());
+  BOOST_CHECK_NO_THROW(boost::property_tree::read_json(in, pt));
+  // 最终状态：sensor 0 保留（sensor 1 被 remove）
+  size_t sensor_count = 0;
+  for (const auto& v : pt.get_child("sensors")) {
+    (void)v;
+    ++sensor_count;
+  }
+  BOOST_CHECK_EQUAL(sensor_count, 1u);
   std::remove(f);
+}
+
+// D-S4.7（T1）：NoiseTemplateDB::load WAV 一致性检查。
+// templates.json 引用不存在的 WAV -> load 后该模板 wav_available == false +
+// bark 特征仍可 match + get_wav_path 返回空串。
+BOOST_AUTO_TEST_CASE(template_db_load_missing_wav) {
+  const char* d = "test_tpl_missing_wav";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+
+  // 构造 templates.json 引用不存在的 WAV 文件
+  std::ostringstream json_ss;
+  json_ss << R"({"templates": [{"id": 1, "label": "空调噪声", )"
+          << R"("bark_spectrum": [)";
+  for (int i = 0; i < 32; ++i) {
+    if (i > 0)
+      json_ss << ", ";
+    json_ss << (0.1f * static_cast<float>(i + 1));
+  }
+  json_ss << R"(], "description": "test", "wav_file": "nonexistent.wav"}]})";
+  std::ofstream out(std::string(d) + "/templates.json");
+  out << json_ss.str();
+  out.close();
+
+  noise::NoiseTemplateDB db;
+  BOOST_CHECK(db.load(d));
+
+  // 验证 wav_available == false（WAV 文件不存在）
+  const noise::Template* t = db.get_template(1);
+  BOOST_REQUIRE(t != nullptr);
+  BOOST_CHECK(!t->wav_available);
+
+  // 验证 bark 特征仍可 match（L2 匹配不受 WAV 缺失影响）
+  std::array<float, 32> feat{};
+  for (size_t i = 0; i < 32; ++i)
+    feat[i] = 0.1f * static_cast<float>(i + 1);
+  auto [matched_id, sim] = db.match(feat);
+  BOOST_CHECK_EQUAL(matched_id, 1u);
+  BOOST_CHECK_CLOSE(sim, 1.0f, 0.01);
+
+  // 验证 get_wav_path 返回空串（wav_available=false -> 无 WAV 路径）
+  BOOST_CHECK(db.get_wav_path(1u).empty());
+
+  // 验证 save 后 wav_available 字段持久化
+  noise::NoiseTemplateDB db2;
+  db2.set_dir_for_test(d);
+  BOOST_CHECK(db.save(d));
+  BOOST_CHECK(db2.load(d));
+  const noise::Template* t2 = db2.get_template(1);
+  BOOST_REQUIRE(t2 != nullptr);
+  BOOST_CHECK(!t2->wav_available);
+
+  std::filesystem::remove_all(d);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

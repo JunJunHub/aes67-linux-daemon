@@ -349,7 +349,15 @@ class NoiseManager {
 
   // comparison 线程（D-S4.3）：SCHED_OTHER，~每 100ms 轮询，遍历
   // ref_comparators 调 try_process()，结果写 metrics->set_ref_result()。
+  // comparison_thread_mutex_ 仅保护 comparison_thread_ 的
+  // joinable/assign/join，与 ref_mutex_ 完全不嵌套（任何线程永不同时持有两把
+  // 锁）。调用方（on_ptp_locked / add_ref_comparator）在释放 ref_mutex_ 后才调
+  // start_comparison_thread；stop_comparison_thread 仅持
+  // comparison_thread_mutex_（不持 ref_mutex_）。这避免 3 方死锁：
+  // start 持 ref_mutex_ 等 comparison_thread_mutex_、stop 持
+  // comparison_thread_mutex_ 等 join、loop 等 ref_mutex_ 退出。
   std::thread comparison_thread_;
+  std::mutex comparison_thread_mutex_;
   std::atomic<bool> comparison_running_{false};
   std::atomic<bool> comparison_stop_{false};
   // 测试钩子：置位触发 comparison 线程立即处理（绕过 100ms 轮询）。

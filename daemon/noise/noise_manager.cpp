@@ -338,7 +338,17 @@ void NoiseManager::on_ptp_locked() {
   // on_capture_thread_joined 已 stop_comparison_thread（join 线程），
   // 此处需 restart 若有 comparator。start_comparison_thread 检查 joinable，
   // 若线程仍在运行（未被 stop）则 no-op；若已 stop 则重启。
-  if (!ref_comparators_.empty()) {
+  // 必须持 ref_mutex_ 保护 ref_comparators_ 访问（与 HTTP 控制线程的
+  // add/remove_ref_comparator 并发）。但 start_comparison_thread 在 ref_mutex_
+  // 外调用：若在锁内调 start（持 ref_mutex_ 等
+  // comparison_thread_mutex_），与 stop（持 comparison_thread_mutex_ 等
+  // join -> loop 需 ref_mutex_ 退出）形成 3 方死锁。锁外调 start 使两锁不嵌套。
+  bool has_comparators = false;
+  {
+    std::lock_guard<std::mutex> lock(ref_mutex_);
+    has_comparators = !ref_comparators_.empty();
+  }
+  if (has_comparators) {
     start_comparison_thread();
     comparison_running_.store(true, std::memory_order_relaxed);
   }
@@ -679,19 +689,24 @@ uint8_t NoiseManager::add_ref_comparator(uint8_t ref_sink_id,
   // D-S4.8：additive 新增方法。控制线程调用。
   if (ref_sink_id == cmp_sink_id)
     return 0;  // ref == cmp 无意义
-  std::lock_guard<std::mutex> lock(ref_mutex_);
-  // 创建 comparator 实例。
-  uint8_t id = next_comparator_id_++;
-  if (next_comparator_id_ == 0)  // 1-based 溢出回绕（理论极限 255）
-    next_comparator_id_ = 1;
-  RefComparatorEntry entry;
-  entry.id = id;
-  entry.comparator = std::make_shared<RefComparator>(ref_sink_id, cmp_sink_id);
-  ref_comparators_.push_back(std::move(entry));
-  // 注册路由：ref_sink -> {id, role=0}，cmp_sink -> {id, role=1}。
-  ref_routing_[ref_sink_id].push_back({id, 0});
-  ref_routing_[cmp_sink_id].push_back({id, 1});
-  // Lazy-start comparison 线程（首个 comparator 时）。
+  uint8_t id = 0;
+  {
+    std::lock_guard<std::mutex> lock(ref_mutex_);
+    // 创建 comparator 实例。
+    id = next_comparator_id_++;
+    if (next_comparator_id_ == 0)  // 1-based 溢出回绕（理论极限 255）
+      next_comparator_id_ = 1;
+    RefComparatorEntry entry;
+    entry.id = id;
+    entry.comparator =
+        std::make_shared<RefComparator>(ref_sink_id, cmp_sink_id);
+    ref_comparators_.push_back(std::move(entry));
+    // 注册路由：ref_sink -> {id, role=0}，cmp_sink -> {id, role=1}。
+    ref_routing_[ref_sink_id].push_back({id, 0});
+    ref_routing_[cmp_sink_id].push_back({id, 1});
+  }
+  // Lazy-start comparison 线程（首个 comparator 时）。在 ref_mutex_ 外调用
+  // start_comparison_thread（同 on_ptp_locked，避免 3 方死锁）。
   start_comparison_thread();
   return id;
 }
@@ -886,8 +901,10 @@ void NoiseManager::comparison_loop() {
 }
 
 void NoiseManager::start_comparison_thread() {
-  // 已持有 ref_mutex_（add_ref_comparator 调用），但线程启动不涉及共享
-  // 状态修改，仅检查 comparison_thread_ 是否已 joinable。
+  // 调用方不再持有 ref_mutex_（on_ptp_locked / add_ref_comparator 均在释放
+  // ref_mutex_ 后调用本方法）。仅持 comparison_thread_mutex_ 保护
+  // comparison_thread_ 的 joinable/assign。与 ref_mutex_ 不嵌套 -> 无死锁。
+  std::lock_guard<std::mutex> lock(comparison_thread_mutex_);
   if (comparison_thread_.joinable())
     return;
   comparison_stop_.store(false, std::memory_order_relaxed);
@@ -899,8 +916,12 @@ void NoiseManager::start_comparison_thread() {
 }
 
 void NoiseManager::stop_comparison_thread() {
+  // comparison_stop_ / comparison_running_ 是 atomic，先置位让 loop 退出。
+  // 再持 comparison_thread_mutex_ 做 join。不持 ref_mutex_ -> loop 可获取
+  // ref_mutex_ 退出 -> join 返回 -> 无死锁。
   comparison_stop_.store(true, std::memory_order_relaxed);
   comparison_running_.store(false, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(comparison_thread_mutex_);
   if (comparison_thread_.joinable()) {
     comparison_thread_.join();
   }

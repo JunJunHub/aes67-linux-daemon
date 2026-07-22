@@ -2229,4 +2229,55 @@ BOOST_AUTO_TEST_CASE(ref_comparator_no_op_when_unconfigured) {
   BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
 }
 
+// T5 review fix: comparison_thread_ 数据竞争压力测试。
+// 并发 add/remove_ref_comparator（模拟 HTTP 控制线程，触发
+// start_comparison_thread）与 on_ptp_unlocked/on_capture_thread_joined/
+// on_ptp_locked（模拟 PTP 回调 + 控制线程，触发
+// stop/start_comparison_thread）。 验证不 crash / 不
+// std::terminate（std::thread 赋值 joinable 未 join 会 terminate）。reviewer
+// 指出现有测试用 set_ptp_locked_for_test（仅置标志）绕过
+// on_ptp_locked()，本测试走真实 on_ptp_locked() 路径。ThreadSanitizer 可检测
+// 残留竞争（手动 -DWITH_NOISE=ON -DCMAKE_CXX_FLAGS=-fsanitize=thread 运行）。
+BOOST_AUTO_TEST_CASE(ref_comparator_concurrent_start_stop_no_crash) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+
+  std::atomic<bool> stop{false};
+
+  // 线程 A：反复 add/remove ref_comparator（每次触发 start_comparison_thread）
+  std::thread t_add([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      uint8_t cid = mgr.add_ref_comparator(0, 1);
+      if (cid != 0)
+        mgr.remove_ref_comparator(cid);
+    }
+  });
+
+  // 线程 B：反复 PTP unlock -> capture join -> PTP lock
+  // （on_ptp_unlocked 置 reset_pending_ + 暂停 comparison；
+  //  on_capture_thread_joined_for_test 走真实 on_capture_thread_joined ->
+  //  stop_comparison_thread + plugin reset；
+  //  on_ptp_locked 走真实 on_ptp_locked -> start_comparison_thread）
+  std::thread t_ptp([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      mgr.on_ptp_unlocked();
+      mgr.on_capture_thread_joined_for_test();
+      mgr.on_ptp_locked();
+    }
+  });
+
+  // 运行 ~1s（100ms 轮询间隔下 ~10 轮 start/stop + ~数千轮 add/remove）
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  stop.store(true);
+
+  t_add.join();
+  t_ptp.join();
+
+  // 不 crash / 不 std::terminate 即通过
+  BOOST_CHECK(true);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

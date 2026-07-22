@@ -3066,3 +3066,214 @@ BOOST_AUTO_TEST_CASE(alert_event_pushed_to_sse) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec5 T1：Resampler 单测（直接验证原语，不经 NoiseManager）──────────────
+// 架构依据：docs/noise/architecture-design.md §3.1 + §11 风险1。
+// 4 个 case：48k 直通 / 44.1k->48k 正弦 SNR>60dB / 48k->16k 精度
+// (T2 复用验证) / 96k 含噪->48k 反混叠频谱合理。
+#include "resampler.hpp"
+#include <cmath>
+#include <vector>
+
+namespace {
+
+// 合成正弦（指定频率/采样率/幅度，相位 0 起）。
+void gen_sine(float* out,
+               size_t n,
+               float freq,
+               uint32_t rate,
+               float amp) {
+  for (size_t i = 0; i < n; ++i) {
+    double t = static_cast<double>(i) / rate;
+    out[i] = static_cast<float>(amp * std::sin(2.0 * synth::kPi * freq * t));
+  }
+}
+
+// 纯音最小二乘拟合 SNR：对输出拟合 A*cos + B*sin（freq@rate），残差 = 非纯
+// 音分量 = 重采样误差（数值噪声 / 非线性失真）。相位无关：A,B 吸收群延迟，
+// 含非整数采样率比的分数延迟（SpeexDSP 对 44.1k->48k 等非整数比存在分数群
+// 延迟，逐样本比对会因 0.5 样本相位差被限到 ~24dB；拟合法不受影响）。
+// amp 输出拟合幅度（≈ 输入幅度 = 重采样增益，应接近 1）。skip 首/尾各 skip
+// 样本排除滤波器 ramp 与未 flush 尾。
+double sine_fit_snr(const float* out,
+                    size_t n,
+                    float freq,
+                    uint32_t rate,
+                    size_t skip,
+                    float& amp) {
+  amp = 0.0f;
+  if (n <= 2 * skip)
+    return -1e9;
+  double scc = 0.0, sss = 0.0, scs = 0.0, scy = 0.0, ssy = 0.0;
+  for (size_t k = skip; k < n - skip; ++k) {
+    double c = std::cos(2.0 * synth::kPi * freq * k / rate);
+    double s = std::sin(2.0 * synth::kPi * freq * k / rate);
+    double y = out[k];
+    scc += c * c;
+    sss += s * s;
+    scs += c * s;
+    scy += c * y;
+    ssy += s * y;
+  }
+  double det = scc * sss - scs * scs;
+  if (std::abs(det) < 1e-12)
+    return -1e9;
+  double A = (sss * scy - scs * ssy) / det;
+  double B = (scc * ssy - scs * scy) / det;
+  amp = static_cast<float>(std::sqrt(A * A + B * B));
+  double sig = 0.0, err = 0.0;
+  for (size_t k = skip; k < n - skip; ++k) {
+    double c = std::cos(2.0 * synth::kPi * freq * k / rate);
+    double s = std::sin(2.0 * synth::kPi * freq * k / rate);
+    double fit = A * c + B * s;
+    sig += fit * fit;
+    double e = out[k] - fit;
+    err += e * e;
+  }
+  if (err <= 0.0)
+    return 1e9;
+  return 10.0 * std::log10(sig / err);
+}
+
+// Goertzel：单频点 |X|^2（未归一化），用于反混叠频谱检验。
+float goertzel_mag_sq(const float* x, size_t n, float freq, uint32_t rate) {
+  const double k = 2.0 * synth::kPi * freq / rate;
+  const double cos_k = std::cos(k);
+  const double coeff = 2.0 * cos_k;
+  double s1 = 0.0, s2 = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    double s0 = x[i] + coeff * s1 - s2;
+    s2 = s1;
+    s1 = s0;
+  }
+  return static_cast<float>(s1 * s1 + s2 * s2 - coeff * s1 * s2);
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_SUITE(resampler_tests)
+
+// 48k 直通：in_rate==out_rate -> 不实例化 SpeexDSP，输出逐样本 == 输入。
+BOOST_AUTO_TEST_CASE(resampler_48k_passthrough) {
+  noise::Resampler r(48000, 48000);
+  BOOST_CHECK(r.is_passthrough());
+  BOOST_CHECK_EQUAL(r.output_latency(), 0u);
+  float in[480];
+  synth::white_noise(in, 480, 7);
+  float out[480];
+  size_t n = r.process(in, 480, out, 480);
+  BOOST_CHECK_EQUAL(n, 480u);
+  for (size_t i = 0; i < 480; ++i)
+    BOOST_CHECK_EQUAL(out[i], in[i]);
+}
+
+// 44.1k 正弦 -> 48k：与理想 1kHz 纯音拟合后 SNR > 60dB（相位无关，抗分数延迟）。
+BOOST_AUTO_TEST_CASE(resampler_441_to_48k_sine) {
+  noise::Resampler r(44100, 48000);
+  BOOST_CHECK(!r.is_passthrough());
+  constexpr uint32_t in_rate = 44100, out_rate = 48000;
+  constexpr float freq = 1000.0f;  // 1kHz，远低于两路 Nyquist
+  constexpr size_t N = 44100;      // 1s 输入
+  std::vector<float> in(N);
+  gen_sine(in.data(), N, freq, in_rate, 0.5f);
+  std::vector<float> out(r.max_output_for_input(N) + 64);
+  size_t produced = r.process(in.data(), N, out.data(), out.size());
+  BOOST_CHECK_GT(produced, 0u);
+  float amp = 0.0f;
+  double snr = sine_fit_snr(out.data(), produced, freq, out_rate, 512, amp);
+  BOOST_TEST_MESSAGE("44.1k->48k sine SNR=" << snr << " dB amp=" << amp
+                     << " (latency=" << r.output_latency()
+                     << " produced=" << produced << ")");
+  BOOST_CHECK_GT(snr, 60.0);
+  BOOST_CHECK_CLOSE(amp, 0.5f, 5.0);  // 增益 ≈ 1（幅度保持）
+}
+
+// 48k -> 16k（T2 DTLN 复用验证）：与理想 500Hz@16k 纯音拟合后 SNR > 60dB。
+BOOST_AUTO_TEST_CASE(resampler_48k_to_16k) {
+  noise::Resampler r(48000, 16000);
+  BOOST_CHECK(!r.is_passthrough());
+  constexpr uint32_t in_rate = 48000, out_rate = 16000;
+  constexpr float freq = 500.0f;  // 500Hz，低于 16k Nyquist 8k
+  constexpr size_t N = 48000;     // 1s 输入
+  std::vector<float> in(N);
+  gen_sine(in.data(), N, freq, in_rate, 0.5f);
+  std::vector<float> out(r.max_output_for_input(N) + 64);
+  size_t produced = r.process(in.data(), N, out.data(), out.size());
+  BOOST_CHECK_GT(produced, 0u);
+  float amp = 0.0f;
+  double snr = sine_fit_snr(out.data(), produced, freq, out_rate, 256, amp);
+  BOOST_TEST_MESSAGE("48k->16k sine SNR=" << snr << " dB amp=" << amp);
+  BOOST_CHECK_GT(snr, 60.0);
+  BOOST_CHECK_CLOSE(amp, 0.5f, 5.0);
+}
+
+// 96k 含噪 -> 48k：5kHz 探针音存活，35kHz（>24k 输出 Nyquist）被反混叠滤除
+// （不滤则混叠到 48-35=13kHz）。频谱合理 = 反混叠工作。
+BOOST_AUTO_TEST_CASE(resampler_96k_to_48k_noise) {
+  noise::Resampler r(96000, 48000);
+  BOOST_CHECK(!r.is_passthrough());
+  constexpr uint32_t in_rate = 96000, out_rate = 48000;
+  constexpr size_t N = 96000;  // 1s 输入
+  // 输入 = 5kHz（存活）+ 35kHz（须滤除）+ 弱白噪（"含噪"）。
+  std::vector<float> in(N);
+  for (size_t i = 0; i < N; ++i) {
+    double t = static_cast<double>(i) / in_rate;
+    in[i] = static_cast<float>(0.4 * std::sin(2 * synth::kPi * 5000 * t) +
+                              0.4 * std::sin(2 * synth::kPi * 35000 * t));
+  }
+  uint32_t seed = 11;
+  for (size_t i = 0; i < N; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    in[i] += (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.1f;
+  }
+  std::vector<float> out(r.max_output_for_input(N) + 64);
+  size_t produced = r.process(in.data(), N, out.data(), out.size());
+  BOOST_CHECK_GT(produced, 0u);
+  float mag_5k = goertzel_mag_sq(out.data(), produced, 5000, out_rate);
+  float mag_13k = goertzel_mag_sq(out.data(), produced, 13000, out_rate);
+  // 5kHz 远强于 13kHz 混叠（SpeexDSP q5 阻带 >60dB -> 40dB 间距余量）。
+  BOOST_TEST_MESSAGE("96k->48k mag 5k=" << mag_5k
+                     << " 13k(alias)=" << mag_13k);
+  BOOST_CHECK_GT(mag_5k, 100.0f * mag_13k);
+  // 输出非静音、无溢出。
+  double rms = 0.0;
+  for (size_t i = 0; i < produced; ++i)
+    rms += out[i] * out[i];
+  rms = std::sqrt(rms / produced);
+  BOOST_CHECK_GT(rms, 1e-4);
+  BOOST_CHECK_LT(rms, 1.0);
+}
+
+// Spec5 T1 集成：native≠48k 时 on_frame 经入口重采样 + 流式 FIFO 仍正确产出
+// metrics。验证生产 wiring（add_sensor 创建 per-sensor Resampler、on_frame 顶部
+// resample -> FIFO -> 48k 480 chunk -> ①②③④），补 Resampler 单测未覆盖的流式
+// 边界（单次 process 全量输入 vs on_frame 逐 480 帧流式累积 emit）。
+BOOST_AUTO_TEST_CASE(noise_manager_resamples_non_48k_input) {
+  // bridge stub 返回 44100（native≠48k -> 非 passthrough）。
+  struct Bridge441 : NoiseAudioBridgeStub {
+    uint32_t get_sample_rate() const override { return 44100; }
+  };
+  Bridge441 bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  // 喂若干 44100Hz 480-样本帧（每帧 -> ~522@48k，FIFO 累积 emit 48k 480 chunk）。
+  float frame[480];
+  for (int p = 0; p < 20; ++p) {
+    mgr.on_period_begin();
+    synth::speech_like(frame, 480);
+    mgr.on_frame(0, frame, 480);
+    mgr.on_period_end();
+  }
+  // on_frame 被调用（frame_count > 0）；①②③④ 经重采样 chunk 运行（metrics 更新）。
+  BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0u);
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(0, snap));
+  // speech_like 非静音 -> noise_level_dbfs 高于默认 -100（已被 collect 更新）。
+  BOOST_CHECK_GT(snap.noise_level_dbfs, -100.0f);
+  BOOST_TEST_MESSAGE("44.1k native -> 48k pipeline metrics noise_level_dbfs="
+                     << snap.noise_level_dbfs << " frame_count="
+                     << mgr.stub_call_count_for_test(0));
+}
+
+BOOST_AUTO_TEST_SUITE_END()

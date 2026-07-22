@@ -18,10 +18,28 @@ set(NOISE_SOURCES
   noise_template_db.cpp
   ref_comparator.cpp
   sse_broadcaster.cpp
+  resampler.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})
 target_include_directories(noise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Spec5 T1：SpeexDSP 重采样依赖（native↔48k，resampler.cpp）。
+# 本文件仅在 daemon/CMakeLists.txt 的 if(WITH_NOISE) 内 add_subdirectory，
+# 故 WITH_NOISE=OFF 时此块不执行，不引入 SpeexDSP（--no-noise 零回归）。
+# libspeexdsp 无 CMake config（仅 .pc），用 find_path/find_library（与 daemon
+# 既有 ALSA/AVAHI/faac 同模式；不用 pkg_check_modules 以匹配本仓库风格）。
+# resampler.hpp 是 noise 的 PUBLIC 头（noise_manager.hpp 经它暴露 SpeexDSP
+# 类型），故 include + link 用 PUBLIC：noise-test / aes67-daemon 经 noise
+# 传递性获得 SpeexDSP 头与库。
+find_path(SPEEXDSP_INCLUDE_DIR speex/speex_resampler.h)
+find_library(SPEEXDSP_LIBRARY NAMES speexdsp)
+if(NOT SPEEXDSP_INCLUDE_DIR OR NOT SPEEXDSP_LIBRARY)
+  message(FATAL_ERROR
+    "SpeexDSP not found (install libspeexdsp-dev, e.g. debian-packages.sh)")
+endif()
+target_include_directories(noise PUBLIC ${SPEEXDSP_INCLUDE_DIR})
+target_link_libraries(noise PUBLIC ${SPEEXDSP_LIBRARY})
 
 # RNNoise 降噪插件（Spec2 1.6b）。
 # 整个 daemon/noise/CMakeLists.txt 由 daemon/CMakeLists.txt 的

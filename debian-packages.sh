@@ -21,4 +21,6 @@ sudo apt-get install -y libavahi-client-dev
 sudo apt install -y linux-headers-$(uname -r)
 sudo apt-get install -y libsystemd-dev
 sudo apt-get install -y libfaac-dev
+# noise 模块（fork 特性，WITH_NOISE）：入口重采样 native↔48k（Spec5 T1）。
+sudo apt-get install -y libspeexdsp-dev
 

@@ -795,20 +795,28 @@ BOOST_AUTO_TEST_CASE(metrics_aggregates_123_results) {
   BOOST_CHECK(snap.is_noisy);
   BOOST_CHECK_CLOSE(snap.estimated_snr_db, 15.0f, 0.01);
   BOOST_CHECK_GT(snap.noise_reduction_db, 10.0f);  // 20log10(0.1/0.01)=20dB
-  BOOST_CHECK(!snap.is_alerting);  // -35dBFS < -30 threshold -> not alerting
+  BOOST_CHECK(!snap.is_alerting);  // Spec4 T4: collect 不再设 is_alerting，
+                                   // evaluate_alerts 未调用 -> 默认 false
 }
 
 // 告警：noise_level_dbfs=-20dBFS > -30dBFS 阈值 -> is_alerting=true。
+// Spec4 T4：适配引擎语义（D-S4.2）。collect() 不再直接设 is_alerting；
+// evaluate_alerts() 在 collect 后调用。去抖默认 3 period，此处设 1
+// （单 period 即 raise）以保持原 Spec3 测试语义。
 // ar{} 值初始化：hum_strength_db=0（默认），不会触发 hum-alert 路径，
 // 确保 is_alerting 经由 noise_level_dbfs 路径触发（review Important #1）。
+// -20dBFS > alert_threshold_dbfs(-30) + 10 = -20 的边界，-20 不 > -20，
+// 故为 Warning 而非 Critical（边界条件：> 严格大于）。
 BOOST_AUTO_TEST_CASE(metrics_alerts_when_loud) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
   det.is_noisy = true;
   noise::NoiseAnalysisResult ar{};
-  ar.noise_level_dbfs = -20.0f;  // loud
+  ar.noise_level_dbfs = -20.0f;  // loud (> -30 threshold)
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(m.snapshot_for_test().is_alerting);  // -20 > -30 threshold
 }
 
@@ -846,27 +854,35 @@ BOOST_AUTO_TEST_CASE(metrics_history_populates_and_caps) {
 
 // Hum-alert 路径独立测试（review Minor #6）：
 // noise_level_dbfs 低于阈值但 hum_strength_db 高于阈值 -> 经 hum 路径告警。
+// Spec4 T4：适配引擎语义（去抖=1，collect + evaluate_alerts）。
 BOOST_AUTO_TEST_CASE(metrics_alerts_via_hum_path) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
   noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS 阈值（不经 noise_level 路径）
   ar.hum_strength_db = -20.0f;  // 高于 -40dB hum 阈值 -> 经 hum 路径告警
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(m.snapshot_for_test().is_alerting);
 }
 
 // Hum-alert 阴性对照（review Minor #6）：
 // noise_level_dbfs + hum_strength_db 均低于阈值 -> 不告警。
+// Spec4 T4：适配引擎语义（去抖=1，collect + evaluate_alerts）。
+// 注：det.estimated_snr_db 须设高值，否则默认 0.0 < 10 触发 SNR 规则。
 BOOST_AUTO_TEST_CASE(metrics_no_alert_when_both_below_threshold) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
   noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS
   ar.hum_strength_db = -70.0f;   // 低于 -40dB hum 阈值
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(!m.snapshot_for_test().is_alerting);
 }
 
@@ -2643,6 +2659,245 @@ BOOST_AUTO_TEST_CASE(sse_broadcaster_with_chunked_provider) {
   // 时清理。给一点时间。
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec4 T4：告警规则引擎测试（D-S4.2 + arch §3.6 规则表）──────────────
+// 5 条规则 + 三级 + 去抖 + 历史 ring + SSE push。
+BOOST_AUTO_TEST_SUITE(alert_engine_tests)
+
+// TDD Step 1.1: noise_level_dbfs=-18（> -20 Critical 阈值）持续
+// debounce_periods -> Critical + is_alerting true。
+BOOST_AUTO_TEST_CASE(alert_critical_on_loud) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/3);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -18.0f;  // > -20 -> Critical
+  ar.hum_strength_db = -70.0f;   // 低于 hum 阈值
+  // 前 2 period 不 raise（去抖未达 3）
+  for (int i = 0; i < 2; ++i) {
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    BOOST_CHECK(!ev.has_value());  // 未达去抖阈值
+    BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+  }
+  // 第 3 period -> raise Critical
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->is_active);
+  BOOST_CHECK(ev->level == noise::AlertLevel::Critical);
+  BOOST_CHECK(ev->rule == "noise_level_dbfs");
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+  BOOST_CHECK(m.snapshot_for_test().alert_level == noise::AlertLevel::Critical);
+}
+
+// TDD Step 1.2: noise_level_dbfs=-25（> -30 Warning，< -20 Critical）
+// -> Warning。
+BOOST_AUTO_TEST_CASE(alert_warning_on_moderate) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -25.0f;  // > -30 Warning, < -20 Critical
+  ar.hum_strength_db = -70.0f;
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->level == noise::AlertLevel::Warning);
+  BOOST_CHECK(m.snapshot_for_test().alert_level == noise::AlertLevel::Warning);
+}
+
+// TDD Step 1.3: hum_strength > -40 -> Info。
+BOOST_AUTO_TEST_CASE(alert_info_on_hum) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+  ar.hum_strength_db = -20.0f;   // > -40 -> Info
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->level == noise::AlertLevel::Info);
+  BOOST_CHECK(ev->rule == "hum_strength_db");
+}
+
+// TDD Step 1.4: 单 period 超阈值后回落 -> 不 raise（未持续 N period）。
+BOOST_AUTO_TEST_CASE(alert_debounce_suppresses_jitter) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/3);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // > -20 Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // 1 period loud -> raise_count=1 (< 3) -> 不 raise
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  auto ev1 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev1.has_value());
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+
+  // 1 period quiet -> raise_count 重置 -> 不 raise
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev2 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev2.has_value());
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+}
+
+// TDD Step 1.5: raise 后持续 N period 正常 -> clear + is_alerting false。
+BOOST_AUTO_TEST_CASE(alert_clear_after_sustained_recover) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/2);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // 2 period loud -> raise
+  for (int i = 0; i < 2; ++i) {
+    m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+    m.evaluate_alerts(0);
+  }
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 1 period quiet -> clear_count=1 (< 2) -> 仍告警
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev1 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev1.has_value());  // 未达 clear 去抖
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 2nd period quiet -> clear_count=2 (>= 2) -> clear
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev2 = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev2.has_value());
+  BOOST_CHECK(!ev2->is_active);  // clear event
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+}
+
+// TDD Step 1.6: 配置 RefComparator + ref_similarity=0.7 -> Warning；
+// 未配置 -> 跳过不误报。
+BOOST_AUTO_TEST_CASE(alert_ref_similarity_when_configured) {
+  // Case 1: 未配置 RefComparator -> ref_similarity 保持默认 0.0，
+  // 引擎跳过 ref 规则 -> 不误报。
+  {
+    noise::NoiseMetrics m;
+    m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+    noise::DenoiseResult dr{};
+    noise::NoiseDetectionResult det{};
+    det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+    noise::NoiseAnalysisResult ar{};
+    ar.noise_level_dbfs = -50.0f;  // 低于阈值
+    ar.hum_strength_db = -70.0f;
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    // ref_similarity=0.0 < 0.8 但未配置 -> 跳过 -> 不告警
+    BOOST_CHECK(!ev.has_value());
+    BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+  }
+  // Case 2: 配置 RefComparator（set_ref_result 置 ref_configured_=true）
+  // + ref_similarity=0.7 < 0.8 -> Warning。
+  {
+    noise::NoiseMetrics m;
+    m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+    m.set_ref_result(/*similarity=*/0.7f, /*noise_db=*/-30.0f,
+                     /*delay_ms=*/0.0f);
+    noise::DenoiseResult dr{};
+    noise::NoiseDetectionResult det{};
+    det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+    noise::NoiseAnalysisResult ar{};
+    ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+    ar.hum_strength_db = -70.0f;
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    BOOST_REQUIRE(ev.has_value());
+    BOOST_CHECK(ev->level == noise::AlertLevel::Warning);
+    BOOST_CHECK(ev->rule == "ref_similarity");
+  }
+}
+
+// TDD Step 1.7: raise/clear 多次 -> get_alert_history 返回历史。
+BOOST_AUTO_TEST_CASE(alert_history_ring_queryable) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // raise
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+  // clear
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+  // raise again
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+
+  auto hist = m.get_alert_history();
+  // 应有 3 个事件：raise, clear, raise
+  BOOST_CHECK_EQUAL(hist.size(), 3u);
+  BOOST_CHECK(hist[0].is_active);   // raise
+  BOOST_CHECK(!hist[1].is_active);  // clear
+  BOOST_CHECK(hist[2].is_active);   // raise
+}
+
+// TDD Step 1.8: raise -> alert_broadcaster 收到事件（集成测试）。
+// 通过 NoiseManager on_period_end 驱动 evaluate_alerts + push。
+BOOST_AUTO_TEST_CASE(alert_event_pushed_to_sse) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  mgr.add_sensor(0, 0, cfg);
+  // 订阅 alert broadcaster
+  auto bc = mgr.get_alert_broadcaster();
+  auto handle = bc->subscribe(64);
+  auto queue = handle.queue;
+
+  // 喂 loud 帧 -> on_period_end 触发 evaluate_alerts + push
+  float buf[480];
+  for (int i = 0; i < 480; ++i)
+    buf[i] = 0.5f;  // loud signal
+  mgr.on_period_begin();
+  mgr.on_frame(0, buf, 480);
+  mgr.on_period_end();
+
+  // drain 队列 -> 应收到告警事件
+  std::vector<std::string> events;
+  BOOST_CHECK(queue->try_drain(events));
+  bool found_alert = false;
+  for (const auto& e : events) {
+    if (e.find("\"level\":") != std::string::npos &&
+        e.find("\"is_active\": true") != std::string::npos) {
+      found_alert = true;
+      break;
+    }
+  }
+  BOOST_CHECK(found_alert);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

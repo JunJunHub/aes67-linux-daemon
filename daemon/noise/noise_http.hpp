@@ -98,6 +98,9 @@ void register_noise_routes(httplib::Server& svr,
 //   GET /api/noise/sensor/([0-9]+)/noise       - PCM base64 SSE（noise）
 //   GET /api/noise/alerts/sse                  - 告警事件 SSE（T4 push）
 //
+// Spec4 Task 4：新增告警查询路由。
+//   GET /api/noise/alerts - 查询告警历史 ring（所有 sensor，arch §C）
+//
 // SSE 使用 cpp-httplib set_chunked_content_provider + text/event-stream。
 // 每订阅者 SseBroadcaster SPSC 队列，capture 线程 on_period_end push，
 // handler 线程 drain + sink.write。客户端断连 -> sink.is_writable()=false

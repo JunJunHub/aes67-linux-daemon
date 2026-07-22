@@ -28,11 +28,18 @@ namespace noise {
 
 // 传感器降噪配置（arch §3.7 引用但未定义，此处补全）。
 // Task 7 的 switch_plugin/set_dry_wet 等使用这些字段。
+// Spec4 T4：新增告警配置字段（additive，D-S4.8）。
+// 这些字段在 add_sensor 时从 cfg 传入，写入 NoiseMetrics::latest_ 的对应
+// 字段（供告警引擎读取），同时序列化到 noise_status.json。
 struct NoiseSensorConfig {
   bool denoise_enabled{false};
   std::string plugin_name{"passthrough"};
   float dry_wet{1.0f};
   float sensitivity{1.0f};
+  // Spec4 T4 告警配置（additive，向后兼容：缺省时用默认值）。
+  float snr_alert_threshold_db{10.0f};
+  float ref_similarity_threshold{0.8f};
+  uint32_t alert_debounce_periods{3};
 };
 
 // Spec3 Task 3：HTTP 控制线程读取的 sensor 信息快照。
@@ -290,6 +297,17 @@ class NoiseManager {
   bool get_metrics_snapshot(uint8_t sensor_id, NoiseMetricsSnapshot& out) const;
   std::vector<NoiseMetricsSnapshot> get_history_snapshot(
       uint8_t sensor_id) const;
+
+  // ── Spec4 T4：告警历史访问器（HTTP GET /api/noise/alerts 用）──
+  // 返回所有 sensor 的告警历史事件列表（arch §C 告警事件 JSON）。
+  // 遍历 sensor 表，对每个 sensor 调 metrics->get_alert_history() 持锁读。
+  // struct AlertHistoryEntry：sensor_id + AlertEvent（flat 组合，JSON
+  // 序列化用）。
+  struct AlertHistoryEntry {
+    uint8_t sensor_id{0};
+    AlertEvent event;
+  };
+  std::vector<AlertHistoryEntry> get_alert_history() const;
 
   // ── Spec3 Task 4 持久化（arch §7.6）──
   // load_status(file)：启动时加载传感器配置。

@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <string>
 
 #include "denoise_plugin.hpp"  // DenoiseResult
 #include "noise_analyzer.hpp"  // NoiseAnalysisResult, NoiseType
@@ -48,6 +50,33 @@ struct NoiseTypeCandidateSnapshot {
 constexpr size_t kMaxHistorySize = 60;
 // 1s 采样间隔（@48kHz / 480 样本/帧 = 100 帧 = 1s）。
 constexpr size_t kHistorySampleIntervalFrames = 100;
+
+// Spec4 T4：告警级别（arch §3.6 规则表，三级 + None）。
+// 数字有序：Critical > Warning > Info > None，便于比较取最高级。
+enum class AlertLevel : uint8_t {
+  None = 0,
+  Info = 1,
+  Warning = 2,
+  Critical = 3,
+};
+
+// Spec4 T4：告警事件（arch §C 新增告警事件 JSON）。
+// raise/clear 时 push 到 alert_history_ + alert_broadcaster_。
+// raised_at_ms 用 NoiseMetrics::frame_counter_（与 snapshot.timestamp_ms
+// 同源，相对帧计数，非墙钟）。
+struct AlertEvent {
+  uint8_t sensor_id{0};
+  AlertLevel level{
+      AlertLevel::None};  // 本次事件的级别（raise=new level, clear=None）
+  std::string rule;       // 触发规则名（noise_level_dbfs/snr_db/
+                          // hum_strength_db/ref_similarity）
+  std::string message;       // 人可读描述
+  uint64_t raised_at_ms{0};  // 帧计数时间戳
+  bool is_active{true};      // true=raise, false=clear
+};
+
+// 告警历史 ring 容量（per-sensor in-memory，D-S4.2: Phase 2 不持久化）。
+constexpr size_t kMaxAlertHistorySize = 100;
 
 // per-sensor 指标快照（arch §3.6 + §5.4 响应字段）。
 // 字段名按 §5.4 响应示例（noise_type / noise_type_confidence /
@@ -91,9 +120,19 @@ struct NoiseMetricsSnapshot {
 
   // 告警（D-S3.4：noise_level_dbfs > alert_threshold_dbfs
   // OR hum_strength_db > hum_alert_threshold_db）
+  // Spec4 T4：升级为告警引擎评估结果（D-S4.2）。is_alerting bool 语义不变
+  // （"是否告警中"），调用方无需改。引擎用 5 条规则 + 三级 + 去抖。
   float alert_threshold_dbfs{-30.0f};
   float hum_alert_threshold_db{-40.0f};
+  // Spec4 T4 新增配置字段（additive，sensor 配置，D-S4.8）。
+  // 默认值与 arch §3.6 规则表一致。序列化进 noise_status.json sensors 项。
+  float snr_alert_threshold_db{10.0f};
+  float ref_similarity_threshold{0.8f};
+  uint32_t alert_debounce_periods{3};
   bool is_alerting{false};
+  // Spec4 T4：当前告警级别（引擎评估结果）。None=不告警。
+  // 与 is_alerting 语义对应（level != None <-> is_alerting=true）。
+  AlertLevel alert_level{AlertLevel::None};
 };
 
 // ④NoiseMetrics - 聚合 ①②③ 链路结果到 NoiseMetricsSnapshot。
@@ -129,7 +168,41 @@ class NoiseMetrics {
   // 不写入 history_（history 由 collect() 在 RT 路径采样，避免 comparison
   // 线程对 deque 的并发 push）。下次 collect() 会把当前 ref_* 值带入
   // history 采样点。
+  // set_ref_result 同时置 ref_configured_=true（首次调用后），T4 告警引擎
+  // 据此判断是否评估 ref_similarity 规则（避免未配置时误报）。
   void set_ref_result(float similarity, float noise_db, float delay_ms);
+
+  // Spec4 T4：控制线程设置告警配置（add_sensor 时调用）。
+  // 写入 latest_ 的 snr_alert_threshold_db / ref_similarity_threshold /
+  // alert_debounce_periods 字段。持 metrics_mutex_ 与 collect() 互斥。
+  void set_alert_config(float snr_threshold_db,
+                        float ref_similarity_threshold,
+                        uint32_t debounce_periods) {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    latest_.snr_alert_threshold_db = snr_threshold_db;
+    latest_.ref_similarity_threshold = ref_similarity_threshold;
+    latest_.alert_debounce_periods = debounce_periods;
+  }
+
+  // ── Spec4 T4：告警规则引擎（D-S4.2 + arch §3.6 规则表）──
+  // evaluate_alerts：在 on_period_end（collect 之后）调用，per-sensor 评估
+  //   5 条规则，产出当前 AlertLevel + 去抖计数。轻量（比较 + 计数），无 socket
+  //   I/O。返回 raise/clear 事件（若状态发生变化，供调用方 push 到
+  //   alert_broadcaster_）。
+  //   评估时机：on_period_end 内，collect() 写完 latest_ 后。持 metrics_mutex_
+  //   读 latest_（与 HTTP 读路径互斥，但同 collect 持锁点一致 -> 无嵌套锁）。
+  //   返回 std::optional<AlertEvent>：raise 事件（is_active=true）、clear 事件
+  //   （is_active=false）或 nullopt（无状态变化）。
+  //   sensor_id 参数：填入 AlertEvent.sensor_id（NoiseMetrics 不持有自己的
+  //   sensor_id，由调用方传入）。
+  std::optional<AlertEvent> evaluate_alerts(uint8_t sensor_id);
+
+  // Spec4 T4：告警历史 ring 访问器（HTTP GET /api/noise/alerts 用）。
+  // 返回拷贝（持 metrics_mutex_ 与 alert_history_ 互斥）。
+  std::deque<AlertEvent> get_alert_history() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    return alert_history_;
+  }
 
   // Spec3 Task 3 同步读路径（HTTP 控制线程调用）。
   // 持 metrics_mutex_ 读 latest_ / history_ 副本，与 collect() 写互斥。
@@ -170,6 +243,27 @@ class NoiseMetrics {
   // Spec3 Task 3：guards latest_ + history_。RT 写 (collect) vs HTTP 读
   // (get_snapshot/get_history) 互斥。mutable: const 方法 (get_snapshot) 可锁。
   mutable std::mutex metrics_mutex_;
+
+  // ── Spec4 T4：告警引擎状态（per-sensor，D-S4.2）──
+  // 去抖计数器：连续满足某级的 period 数（raise）/ 连续不满足的 period 数
+  // （clear）。达到 alert_debounce_periods 时才 raise/clear。
+  // raise_count_：当前级别连续满足的 period 数（重置为 0 当级别变化）。
+  // clear_count_：连续无告警的 period 数（仅当已告警时计数）。
+  size_t alert_raise_count_{0};
+  size_t alert_clear_count_{0};
+  // 当前已 raise 的告警级别（None 表示未告警）。用于检测状态变化。
+  AlertLevel raised_level_{AlertLevel::None};
+  // Spec4 T5/T4：RefComparator 是否已配置并写入过 ref_* 字段。
+  // set_ref_result 首次调用后置 true（持久，不重置）。T4 告警引擎据此判断
+  // 是否评估 ref_similarity 规则。未配置时 ref_similarity 保持默认 0.0
+  // （避免误报：0.0 < 0.8 阈值会触发告警）。
+  bool ref_configured_{false};
+  // 告警历史 ring（per-sensor in-memory，D-S4.2: Phase 2 不持久化）。
+  // evaluate_alerts 在 raise/clear 时 push 到此 deque（capped
+  // kMaxAlertHistorySize）。HTTP GET /api/noise/alerts 查询。
+  // 受 metrics_mutex_ 保护（与 latest_/history_ 同锁，evaluate_alerts 写 +
+  // get_alert_history 读互斥）。
+  std::deque<AlertEvent> alert_history_;
 };
 
 }  // namespace noise

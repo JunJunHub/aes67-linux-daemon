@@ -811,6 +811,48 @@ void register_noise_sse_routes(httplib::Server& svr, NoiseManager& mgr) {
             auto bc = mgr.get_alert_broadcaster();
             setup_sse_route(res, bc, /*capacity=*/64);
           });
+
+  // Spec4 T4：GET /api/noise/alerts - 查询告警历史 ring（所有 sensor）。
+  // 返回 JSON 数组（arch §C 告警事件 JSON 格式）：
+  //   { "alerts": [ {sensor_id, level, rule, message, raised_at_ms,
+  //   is_active} ] }
+  svr.Get("/api/noise/alerts", [&mgr](const Request& /*req*/, Response& res) {
+    auto entries = mgr.get_alert_history();
+    std::stringstream ss;
+    ss << "{\n  \"alerts\": [";
+    bool first = true;
+    for (const auto& e : entries) {
+      if (!first)
+        ss << ",";
+      first = false;
+      const char* level_str = "none";
+      switch (e.event.level) {
+        case AlertLevel::Info:
+          level_str = "info";
+          break;
+        case AlertLevel::Warning:
+          level_str = "warning";
+          break;
+        case AlertLevel::Critical:
+          level_str = "critical";
+          break;
+        case AlertLevel::None:
+        default:
+          level_str = "none";
+          break;
+      }
+      ss << "\n    {"
+         << "\n      \"sensor_id\": " << static_cast<unsigned>(e.sensor_id)
+         << ",\n      \"level\": \"" << level_str << "\""
+         << ",\n      \"rule\": \"" << escape_json(e.event.rule) << "\""
+         << ",\n      \"message\": \"" << escape_json(e.event.message) << "\""
+         << ",\n      \"raised_at_ms\": " << e.event.raised_at_ms
+         << ",\n      \"is_active\": " << (e.event.is_active ? "true" : "false")
+         << "\n    }";
+    }
+    ss << "\n  ]\n}\n";
+    res.set_content(ss.str(), "application/json");
+  });
 }
 
 }  // namespace noise

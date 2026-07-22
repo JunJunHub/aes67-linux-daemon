@@ -75,6 +75,11 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   // set_denoise_state 用 atomic 写，collect() RT 路径 atomic 读 -> 无竞争。
   ctx.metrics = std::make_shared<NoiseMetrics>();
   ctx.metrics->set_denoise_state(cfg.denoise_enabled, cfg.dry_wet);
+  // Spec4 T4：应用告警配置到 metrics 快照（供告警引擎读取阈值）。
+  // set_alert_config 持 metrics_mutex_ 写 latest_ 的告警配置字段。
+  ctx.metrics->set_alert_config(cfg.snr_alert_threshold_db,
+                                cfg.ref_similarity_threshold,
+                                cfg.alert_debounce_periods);
   // 共享观测状态：shared_ptr 使 COW 表复制时旧表/新表共享同一计数器/结果，
   // on_frame 在 pinned 旧表上递增会反映到新表（stub_call_count_for_test 读
   // 新表）。与 detector/analyzer 等 shared_ptr 成员同语义。
@@ -336,6 +341,54 @@ void NoiseManager::on_period_end() {
       if (ctx.metrics)
         ctx.metrics->on_period_end();
     }
+    // Spec4 T4：告警引擎评估（D-S4.2）。
+    // 在 denoise/metrics on_period_end（swap + collect 完成）后，
+    // push_sse_events 前。evaluate_alerts 轻量（比较 + 计数），无 socket I/O。
+    // 返回 raise/clear 事件 -> push 到全局 alert_broadcaster_（非阻塞
+    // try_push）。 仅当有订阅者时才 push（T3 review Important 2 模式：消除 idle
+    // 开销）。
+    if (alert_broadcaster_.has_subscribers()) {
+      for (auto& [id, ctx] : *pinned_table_) {
+        if (!ctx.metrics)
+          continue;
+        auto ev = ctx.metrics->evaluate_alerts(id);
+        if (ev.has_value()) {
+          // 组装 SSE 事件 JSON（arch §C 告警事件格式）。
+          // raise/clear 仅在状态转换时发生（罕见），JSON 组装可接受。
+          const char* level_str = "none";
+          switch (ev->level) {
+            case AlertLevel::Info:
+              level_str = "info";
+              break;
+            case AlertLevel::Warning:
+              level_str = "warning";
+              break;
+            case AlertLevel::Critical:
+              level_str = "critical";
+              break;
+            case AlertLevel::None:
+            default:
+              level_str = "none";
+              break;
+          }
+          std::ostringstream ss;
+          ss << "data: {\"sensor_id\": " << static_cast<unsigned>(id)
+             << ", \"level\": \"" << level_str << "\"" << ", \"rule\": \""
+             << ev->rule << "\"" << ", \"message\": \"" << ev->message << "\""
+             << ", \"raised_at_ms\": " << ev->raised_at_ms
+             << ", \"is_active\": " << (ev->is_active ? "true" : "false")
+             << "}\n\n";
+          alert_broadcaster_.push(ss.str());
+        }
+      }
+    } else {
+      // 无订阅者：仍需评估（更新 is_alerting + alert_level + history ring），
+      // 但不 push SSE 事件。evaluate_alerts 内部不组装 JSON，仅比较+计数。
+      for (auto& [id, ctx] : *pinned_table_) {
+        if (ctx.metrics)
+          (void)ctx.metrics->evaluate_alerts(id);
+      }
+    }
     // Spec4 Task 3：SSE push（D-S4.1，非阻塞）。
     // 在 denoise/metrics on_period_end（swap front/back + collect 完成）后，
     // advance_epoch 前调用 push_sse_events。此时 front 缓冲已是本 period
@@ -579,6 +632,27 @@ std::vector<NoiseMetricsSnapshot> NoiseManager::get_history_snapshot(
   return std::vector<NoiseMetricsSnapshot>(hist.begin(), hist.end());
 }
 
+// ── Spec4 T4：告警历史访问器实现 ─────────────────────────────────────────
+std::vector<NoiseManager::AlertHistoryEntry> NoiseManager::get_alert_history()
+    const {
+  std::vector<AlertHistoryEntry> result;
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return result;
+  for (const auto& [id, ctx] : *tbl) {
+    if (!ctx.metrics)
+      continue;
+    auto hist = ctx.metrics->get_alert_history();  // 持 metrics_mutex_
+    for (const auto& ev : hist) {
+      AlertHistoryEntry entry;
+      entry.sensor_id = id;
+      entry.event = ev;
+      result.push_back(std::move(entry));
+    }
+  }
+  return result;
+}
+
 // ── Spec3 Task 4 持久化实现（arch §7.6）────────────────────────────────
 // JSON 输出 = 手工拼接（与 daemon/json.cpp + noise_http.cpp 同一模式）：
 // 数字/bool 不加引号，字符串加引号 + escape_json（共享自 noise_status.hpp，
@@ -622,7 +696,15 @@ bool NoiseManager::save_status() const {
        << (ctx.cfg.denoise_enabled ? "true" : "false")
        << ",\n      \"denoise_plugin\": \"" << escape_json(ctx.cfg.plugin_name)
        << "\"" << ",\n      \"denoise_dry_wet\": " << ctx.cfg.dry_wet
-       << ",\n      \"sensitivity\": " << ctx.cfg.sensitivity << "\n    }";
+       << ",\n      \"sensitivity\": "
+       << ctx.cfg.sensitivity
+       // Spec4 T4：告警配置字段（additive，向后兼容：load 时缺省用默认）。
+       << ",\n      \"snr_alert_threshold_db\": "
+       << ctx.cfg.snr_alert_threshold_db
+       << ",\n      \"ref_similarity_threshold\": "
+       << ctx.cfg.ref_similarity_threshold
+       << ",\n      \"alert_debounce_periods\": "
+       << ctx.cfg.alert_debounce_periods << "\n    }";
   }
   ss << "\n  ],\n  \"global\": {\n    \"noise_max_sensors\": 16\n  }\n}\n";
   return write_atomic(status_file_, ss.str());
@@ -671,6 +753,13 @@ bool NoiseManager::load_status(const std::string& noise_status_file) {
           v.second.get<std::string>("denoise_plugin", "passthrough");
       cfg.dry_wet = v.second.get<float>("denoise_dry_wet", 1.0f);
       cfg.sensitivity = v.second.get<float>("sensitivity", 1.0f);
+      // Spec4 T4：告警配置字段（additive，向后兼容：缺省用默认值）。
+      cfg.snr_alert_threshold_db =
+          v.second.get<float>("snr_alert_threshold_db", 10.0f);
+      cfg.ref_similarity_threshold =
+          v.second.get<float>("ref_similarity_threshold", 0.8f);
+      cfg.alert_debounce_periods =
+          v.second.get<uint32_t>("alert_debounce_periods", 3);
       uint8_t sink_id = static_cast<uint8_t>(v.second.get<unsigned>("sink_id"));
       add_sensor(sensor_id, sink_id, cfg);
       // review Minor #6：add_sensor 默认 enabled=true，若 JSON 中

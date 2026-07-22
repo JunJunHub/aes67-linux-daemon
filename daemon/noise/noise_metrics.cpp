@@ -43,10 +43,13 @@ void NoiseMetrics::set_ref_result(float similarity,
                                   float noise_db,
                                   float delay_ms) {
   // Spec4 T5：comparison 线程写入 ref_* 字段。持锁与 collect() 互斥。
+  // Spec4 T4：置 ref_configured_=true（首次后持久），告警引擎据此评估
+  // ref_similarity 规则（避免未配置时 ref_similarity=0.0 误报 < 0.8）。
   std::lock_guard<std::mutex> lock(metrics_mutex_);
   latest_.ref_similarity = similarity;
   latest_.ref_noise_db = noise_db;
   latest_.ref_delay_ms = delay_ms;
+  ref_configured_ = true;
 }
 
 void NoiseMetrics::collect(const DenoiseResult& denoise,
@@ -100,10 +103,10 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
     latest_.noise_reduction_db = 0.0f;
   }
 
-  // 告警判定（D-S3.4）
-  latest_.is_alerting =
-      latest_.noise_level_dbfs > latest_.alert_threshold_dbfs ||
-      latest_.hum_strength_db > latest_.hum_alert_threshold_db;
+  // 告警判定：Spec4 T4 升级为告警引擎评估（D-S4.2）。
+  // collect() 不再直接设 is_alerting（Spec3 基础 OR 逻辑已移除）。
+  // evaluate_alerts() 在 on_period_end（collect 之后）调用，产出
+  // is_alerting + alert_level + 去抖状态。collect() 仅更新原始指标字段。
 
   // timestamp：用帧计数作为相对时间戳（非墙钟，足够 /history 序列化用）。
   latest_.timestamp_ms = frame_counter_;
@@ -117,6 +120,175 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
     if (history_.size() > kMaxHistorySize)
       history_.pop_front();
   }
+}
+
+// ── Spec4 T4：告警规则引擎实现（D-S4.2 + arch §3.6 规则表）──────────────
+// 5 条规则，取最高级别作为"期望级别"（desired_level）：
+//   1. noise_level_dbfs > alert_threshold_dbfs(-20 的 2/3 位置 = -20) ->
+//   Critical
+//      （arch §3.6：noise_level_dbfs > -20 -> Critical）
+//   2. noise_level_dbfs > alert_threshold_dbfs(-30) -> Warning
+//      （arch §3.6：noise_level_dbfs > -30 -> Warning）
+//   3. estimated_snr_db < snr_alert_threshold_db(10) -> Warning
+//   4. ref_similarity < ref_similarity_threshold(0.8) -> Warning
+//      （GUARDED: 仅当 ref_configured_=true 才评估）
+//   5. hum_strength_db > hum_alert_threshold_db(-40) -> Info
+//
+// 去抖（D-S4.2）：连续 N period（alert_debounce_periods）满足某级才 raise；
+//   连续 N period 不满足才 clear。避免单 period 抖动导致频繁 raise/clear。
+//   实现：desired_level 每次评估计算（瞬时）。raise_count_ 计数连续满足
+//   desired_level 的 period 数；clear_count_ 计数连续 None 的 period 数。
+//   状态转换：
+//     - 未告警 -> raise：desired != None 连续 N period（raise_count_ >= N）
+//     - 已告警 -> clear：desired == None 连续 N period（clear_count_ >= N）
+//     - 已告警且 desired 级别变化（如 Warning -> Critical）：立即切换
+//       （去抖已满足，级别变化是即时升级，不重新去抖 - 避免降级延迟）
+//     - 已告警且 desired 降级（Critical -> Warning）：保持当前高级别
+//       直到 clear（保守，不降级 - 避免抖动；UI 可看 alert_level 判断）
+//       注：实际取 max(raised, desired) 会更保守，但需求是"去抖 N period
+//       raise/clear"，级别变化用即时切换更合理。这里实现：
+//       desired 升级或同级 -> 保持 raise（计数 reset 到 N）
+//       desired 降级且 != None -> 保持 raised（不降级，直到 clear）
+//       desired == None -> clear_count_++，达到 N 才 clear
+std::optional<AlertEvent> NoiseMetrics::evaluate_alerts(uint8_t sensor_id) {
+  std::lock_guard<std::mutex> lock(metrics_mutex_);
+
+  // 计算当前 period 的期望告警级别（5 条规则取最高）。
+  AlertLevel desired = AlertLevel::None;
+  std::string rule;
+  std::string message;
+
+  // 规则 1+2：noise_level_dbfs（Critical > Warning）
+  // arch §3.6：> -20 Critical，> -30 Warning。
+  // 用 alert_threshold_dbfs 字段（默认 -30）作为 Warning 阈值；
+  // Critical 阈值 = alert_threshold_dbfs + 10（默认 -20，与 arch §3.6 一致）。
+  // 这样用户配置 alert_threshold_dbfs 时两级自动适配。
+  if (latest_.noise_level_dbfs > latest_.alert_threshold_dbfs + 10.0f) {
+    desired = AlertLevel::Critical;
+    rule = "noise_level_dbfs";
+    message = "noise level critical";
+  } else if (latest_.noise_level_dbfs > latest_.alert_threshold_dbfs) {
+    desired = AlertLevel::Warning;
+    rule = "noise_level_dbfs";
+    message = "noise level high";
+  }
+
+  // 规则 3：estimated_snr_db < snr_alert_threshold_db -> Warning
+  // 仅当 desired < Warning 时评估（Warning 不被更低级覆盖）。
+  if (desired < AlertLevel::Warning &&
+      latest_.estimated_snr_db < latest_.snr_alert_threshold_db) {
+    desired = AlertLevel::Warning;
+    rule = "estimated_snr_db";
+    message = "SNR low";
+  }
+
+  // 规则 4：ref_similarity < ref_similarity_threshold -> Warning
+  // GUARDED：仅当 ref_configured_=true（RefComparator 已配置并写入过 ref_*）
+  // 才评估。未配置时 ref_similarity 保持默认 0.0，0.0 < 0.8 会误报。
+  if (desired < AlertLevel::Warning && ref_configured_ &&
+      latest_.ref_similarity < latest_.ref_similarity_threshold) {
+    desired = AlertLevel::Warning;
+    rule = "ref_similarity";
+    message = "reference similarity low";
+  }
+
+  // 规则 5：hum_strength_db > hum_alert_threshold_db -> Info
+  // 仅当 desired < Info 时评估。
+  if (desired < AlertLevel::Info &&
+      latest_.hum_strength_db > latest_.hum_alert_threshold_db) {
+    desired = AlertLevel::Info;
+    rule = "hum_strength_db";
+    message = "hum detected";
+  }
+
+  const uint32_t N = latest_.alert_debounce_periods;
+  // 防御性：N=0 时去抖禁用，单 period 即 raise/clear（仍可用但无去抖）。
+  const uint32_t debounce = (N > 0) ? N : 1;
+
+  std::optional<AlertEvent> event;
+
+  if (raised_level_ == AlertLevel::None) {
+    // 当前未告警：检查是否达到 raise 条件。
+    if (desired != AlertLevel::None) {
+      ++alert_raise_count_;
+      alert_clear_count_ = 0;
+      if (alert_raise_count_ >= debounce) {
+        // 达到去抖阈值 -> raise。
+        raised_level_ = desired;
+        latest_.is_alerting = true;
+        latest_.alert_level = desired;
+        AlertEvent ev;
+        ev.sensor_id = sensor_id;
+        ev.level = desired;
+        ev.rule = rule;
+        ev.message = message;
+        ev.raised_at_ms = frame_counter_;
+        ev.is_active = true;
+        alert_history_.push_back(ev);
+        if (alert_history_.size() > kMaxAlertHistorySize)
+          alert_history_.pop_front();
+        event = ev;
+        // raise 后重置计数（下次 clear 需重新计数）。
+        alert_raise_count_ = 0;
+      }
+    } else {
+      // 持续无告警，重置 raise 计数。
+      alert_raise_count_ = 0;
+    }
+  } else {
+    // 当前已告警（raised_level_ != None）。
+    if (desired == AlertLevel::None) {
+      // 期望无告警 -> clear 计数。
+      ++alert_clear_count_;
+      alert_raise_count_ = 0;
+      if (alert_clear_count_ >= debounce) {
+        // 达到去抖阈值 -> clear。
+        AlertEvent ev;
+        ev.sensor_id = sensor_id;
+        ev.level = AlertLevel::None;
+        ev.rule = "recovered";
+        ev.message = "alert cleared";
+        ev.raised_at_ms = frame_counter_;
+        ev.is_active = false;
+        alert_history_.push_back(ev);
+        if (alert_history_.size() > kMaxAlertHistorySize)
+          alert_history_.pop_front();
+        event = ev;
+        raised_level_ = AlertLevel::None;
+        latest_.is_alerting = false;
+        latest_.alert_level = AlertLevel::None;
+        alert_clear_count_ = 0;
+      }
+    } else if (desired > raised_level_) {
+      // 期望级别升级（如 Warning -> Critical）：即时升级，不重新去抖。
+      // 升级是更严重状态，不应延迟（保守安全）。
+      raised_level_ = desired;
+      latest_.alert_level = desired;
+      AlertEvent ev;
+      ev.sensor_id = sensor_id;
+      ev.level = desired;
+      ev.rule = rule;
+      ev.message = message + " (escalated)";
+      ev.raised_at_ms = frame_counter_;
+      ev.is_active = true;
+      alert_history_.push_back(ev);
+      if (alert_history_.size() > kMaxAlertHistorySize)
+        alert_history_.pop_front();
+      event = ev;
+      alert_clear_count_ = 0;
+    } else {
+      // 期望同级或降级（desired <= raised_level_ 且 desired != None）：
+      // 保持当前 raised_level_（不降级，直到 clear）。
+      // 重置 clear 计数（仍有告警条件）。
+      alert_clear_count_ = 0;
+    }
+  }
+
+  // 同步 is_alerting + alert_level 到 latest_（确保 get_snapshot 返回一致）。
+  latest_.is_alerting = (raised_level_ != AlertLevel::None);
+  latest_.alert_level = raised_level_;
+
+  return event;
 }
 
 }  // namespace noise

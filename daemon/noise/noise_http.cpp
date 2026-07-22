@@ -681,14 +681,178 @@ void register_noise_template_routes(httplib::Server& svr,
       });
 }
 
-// register_noise_routes：聚合 sensor + template 路由（arch §5.1 + §5.3）。
-// T6 main.cpp 装配时调用一次，把全部 /api/noise/* 路由注册到同一
-// httplib::Server。 顺序无关（路由按 method+path 匹配，无重叠）。
+// register_noise_routes：聚合 sensor + template + SSE 路由（arch §5.1 +
+// §5.3 + Spec4 §5.1 SSE）。T6 main.cpp 装配时调用一次，把全部 /api/noise/*
+// 路由注册到同一 httplib::Server。 顺序无关（路由按 method+path
+// 匹配，无重叠）。
 void register_noise_routes(httplib::Server& svr,
                            NoiseManager& mgr,
                            NoiseTemplateDB& template_db) {
   register_noise_sensor_routes(svr, mgr);
   register_noise_template_routes(svr, mgr, template_db);
+  // Spec4 Task 3：SSE 路由（4 端点）。
+  register_noise_sse_routes(svr, mgr);
+}
+
+// ── Spec4 Task 3：SSE 路由（arch §5.1 + D-S4.5）──────────────────────
+// 4 SSE 端点使用 cpp-httplib set_chunked_content_provider。
+//
+// SSE handler 线程模型（D-S4.1）：
+// - handler 线程（cpp-httplib 工作线程）调 subscribe() 取队列 shared_ptr。
+// - chunked provider loop：try_drain 队列 -> sink.write SSE 帧。
+// - 无事件时 sleep 20ms 避免 busy-loop（不调 sink.write -> data_available
+//   保持 true，loop 继续；sleep 让出 CPU）。
+// - 客户端断连 -> sink.is_writable()=false -> sink.done() -> provider 返回
+//   true（正常退出 loop）-> releaser 调 unsubscribe。
+// - releaser 在 Response 析构时调用（cpp-httplib 工作线程清理时）。
+//
+// RT 非阻塞保证（风险 9）：
+// - capture 线程 on_period_end push 到 broadcaster（try_lock + drop-oldest）。
+// - SSE handler 线程 drain + sink.write（socket I/O 仅在 handler 线程）。
+// - 慢消费者（handler sleep 长）-> 队列满 -> drop oldest（dropped_count
+// 递增），
+//   capture 线程不阻塞。
+namespace {
+
+// SSE handler drain loop：通用 drain + write 逻辑，供 4 路由复用。
+// broadcaster：事件源（shared_ptr，延长生命周期至 handler 退出）。
+// res：设置 chunked provider 的 Response。
+// capacity：订阅队列容量（metrics/alerts 用 64，PCM 用 16 - 每帧较大）。
+void setup_sse_route(httplib::Response& res,
+                     std::shared_ptr<SseBroadcaster> broadcaster,
+                     size_t capacity = 64) {
+  if (!broadcaster) {
+    res.status = 404;
+    res.set_content("sensor not found or denoise disabled", "text/plain");
+    return;
+  }
+  auto handle = broadcaster->subscribe(capacity);
+  // 捕获 queue（shared_ptr 可拷贝）+ id，不捕获 handle（move-only）。
+  auto queue = handle.queue;
+  uint64_t sub_id = handle.id;
+  // broadcaster shared_ptr 捕获到 releaser：sensor 被 remove 后 broadcaster
+  // 仍存活（shared_ptr 延长生命周期），releaser 安全调 unsubscribe。
+  res.set_chunked_content_provider(
+      "text/event-stream",
+      [queue](size_t offset, httplib::DataSink& sink) -> bool {
+        // 首次调用时发送 SSE 注释行（": keepalive\n\n"）建立连接。
+        // SSE 注释以 ':' 开头，客户端忽略。这确保 chunked 响应立即发送
+        // 至少一个 chunk，客户端确认连接建立。
+        if (offset == 0) {
+          const char* hello = ": connected\n\n";
+          if (!sink.write(hello, 12))
+            return false;
+        }
+        std::vector<std::string> events;
+        if (queue->try_drain(events)) {
+          for (const auto& e : events) {
+            if (!sink.write(e.data(), e.size()))
+              return false;  // write 失败
+          }
+        }
+        if (!sink.is_writable()) {
+          sink.done();
+          return true;
+        }
+        // 无事件时短暂 sleep 避免 busy-loop
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        return true;
+      },
+      [broadcaster, sub_id](bool /*success*/) {
+        broadcaster->unsubscribe(sub_id);
+      });
+}
+
+}  // namespace
+
+void register_noise_sse_routes(httplib::Server& svr, NoiseManager& mgr) {
+  using httplib::Request;
+  using httplib::Response;
+
+  // GET /api/noise/sensor/([0-9]+)/metrics/sse - 指标快照 SSE（~1s/event）。
+  // 返回 text/event-stream，每 period 推送一个 metrics 快照事件。
+  svr.Get("/api/noise/sensor/([0-9]+)/metrics/sse",
+          [&mgr](const Request& req, Response& res) {
+            uint8_t id;
+            if (!parse_sensor_id(req, res, id))
+              return;
+            auto bc = mgr.get_metrics_broadcaster(id);
+            setup_sse_route(res, bc, /*capacity=*/64);
+          });
+
+  // GET /api/noise/sensor/([0-9]+)/denoised - PCM base64 SSE（denoised）。
+  // 每 period 推送一个 PCM chunk（base64 编码的 S16 LE）。
+  // denoise 关 -> broadcaster 不存在 -> 404（与 /api/streamer/.../denoised
+  // 语义一致）。
+  svr.Get("/api/noise/sensor/([0-9]+)/denoised",
+          [&mgr](const Request& req, Response& res) {
+            uint8_t id;
+            if (!parse_sensor_id(req, res, id))
+              return;
+            auto bc = mgr.get_pcm_broadcaster(id, /*denoised=*/true);
+            // PCM 帧较大，队列容量小一些（16 = ~64ms 缓冲 @4ms/period）
+            setup_sse_route(res, bc, /*capacity=*/16);
+          });
+
+  // GET /api/noise/sensor/([0-9]+)/noise - PCM base64 SSE（noise）。
+  svr.Get("/api/noise/sensor/([0-9]+)/noise",
+          [&mgr](const Request& req, Response& res) {
+            uint8_t id;
+            if (!parse_sensor_id(req, res, id))
+              return;
+            auto bc = mgr.get_pcm_broadcaster(id, /*denoised=*/false);
+            setup_sse_route(res, bc, /*capacity=*/16);
+          });
+
+  // GET /api/noise/alerts/sse - 告警事件 SSE（T4 push）。
+  // 全局 broadcaster（非 per-sensor），T4 告警引擎 push 事件。
+  svr.Get("/api/noise/alerts/sse",
+          [&mgr](const Request& /*req*/, Response& res) {
+            auto bc = mgr.get_alert_broadcaster();
+            setup_sse_route(res, bc, /*capacity=*/64);
+          });
+
+  // Spec4 T4：GET /api/noise/alerts - 查询告警历史 ring（所有 sensor）。
+  // 返回 JSON 数组（arch §C 告警事件 JSON 格式）：
+  //   { "alerts": [ {sensor_id, level, rule, message, raised_at_ms,
+  //   is_active} ] }
+  svr.Get("/api/noise/alerts", [&mgr](const Request& /*req*/, Response& res) {
+    auto entries = mgr.get_alert_history();
+    std::stringstream ss;
+    ss << "{\n  \"alerts\": [";
+    bool first = true;
+    for (const auto& e : entries) {
+      if (!first)
+        ss << ",";
+      first = false;
+      const char* level_str = "none";
+      switch (e.event.level) {
+        case AlertLevel::Info:
+          level_str = "info";
+          break;
+        case AlertLevel::Warning:
+          level_str = "warning";
+          break;
+        case AlertLevel::Critical:
+          level_str = "critical";
+          break;
+        case AlertLevel::None:
+        default:
+          level_str = "none";
+          break;
+      }
+      ss << "\n    {"
+         << "\n      \"sensor_id\": " << static_cast<unsigned>(e.sensor_id)
+         << ",\n      \"level\": \"" << level_str << "\""
+         << ",\n      \"rule\": \"" << escape_json(e.event.rule) << "\""
+         << ",\n      \"message\": \"" << escape_json(e.event.message) << "\""
+         << ",\n      \"raised_at_ms\": " << e.event.raised_at_ms
+         << ",\n      \"is_active\": " << (e.event.is_active ? "true" : "false")
+         << "\n    }";
+    }
+    ss << "\n  ]\n}\n";
+    res.set_content(ss.str(), "application/json");
+  });
 }
 
 }  // namespace noise

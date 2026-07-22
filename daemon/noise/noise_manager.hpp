@@ -11,6 +11,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -20,16 +21,25 @@
 #include "noise_detector.hpp"
 #include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
+#include "ref_comparator.hpp"
+#include "sse_broadcaster.hpp"
 
 namespace noise {
 
 // 传感器降噪配置（arch §3.7 引用但未定义，此处补全）。
 // Task 7 的 switch_plugin/set_dry_wet 等使用这些字段。
+// Spec4 T4：新增告警配置字段（additive，D-S4.8）。
+// 这些字段在 add_sensor 时从 cfg 传入，写入 NoiseMetrics::latest_ 的对应
+// 字段（供告警引擎读取），同时序列化到 noise_status.json。
 struct NoiseSensorConfig {
   bool denoise_enabled{false};
   std::string plugin_name{"passthrough"};
   float dry_wet{1.0f};
   float sensitivity{1.0f};
+  // Spec4 T4 告警配置（additive，向后兼容：缺省时用默认值）。
+  float snr_alert_threshold_db{10.0f};
+  float ref_similarity_threshold{0.8f};
+  uint32_t alert_debounce_periods{3};
 };
 
 // Spec3 Task 3：HTTP 控制线程读取的 sensor 信息快照。
@@ -114,6 +124,42 @@ class NoiseManager {
                  const std::string& key,
                  const std::string& value);
 
+  // ── Spec4 T5：RefComparator 参考音比对（arch §3.5 + §6.3.2）──
+  // add_ref_comparator：配置一对 (ref_sink, cmp_sink) 的参考比对。
+  //   控制线程调用。创建 RefComparator 实例 + 注册路由（ref_sink/cmp_sink ->
+  //   comparator_id），并 lazy-start comparison 线程（首个 comparator 时）。
+  //   返回 comparator_id（1-based，0 表示失败：ref_sink == cmp_sink 或满）。
+  uint8_t add_ref_comparator(uint8_t ref_sink_id, uint8_t cmp_sink_id);
+  // remove_ref_comparator：注销 comparator + 路由。控制线程调用。
+  //   若是最后一个 comparator，comparison 线程在下个循环检测到空表后退出。
+  bool remove_ref_comparator(uint8_t comparator_id);
+  // list_ref_comparators：返回所有已配置 comparator 的信息（HTTP GET 用）。
+  struct RefComparatorInfo {
+    uint8_t id{0};
+    uint8_t ref_sink_id{0};
+    uint8_t cmp_sink_id{0};
+    bool delay_anomaly{false};
+  };
+  std::vector<RefComparatorInfo> list_ref_comparators() const;
+  // 测试钩子：直接获取 comparator 的最新比对结果（不经 metrics 快照）。
+  //   未找到返回 false。
+  bool get_ref_result_for_test(uint8_t comparator_id,
+                               RefCompareResult& out) const;
+  // 测试钩子：获取 comparator 的溢出计数（ref/cmp 各一路）。
+  bool get_ref_overflow_for_test(uint8_t comparator_id,
+                                 size_t& ref_overflow,
+                                 size_t& cmp_overflow) const;
+  // 测试钩子：comparison 线程是否在运行。
+  bool is_comparison_thread_running_for_test() const {
+    return comparison_running_.load(std::memory_order_relaxed);
+  }
+  // 测试钩子：同步触发一次 comparison 线程的 try_process（绕过 100ms 轮询）。
+  //   用于测试中确定性验证结果进 metrics 快照。非阻塞：仅置标志，
+  //   comparison 线程下个循环检测到后处理。
+  void trigger_comparison_for_test() { comparison_trigger_.store(true); }
+  // 测试钩子：等待 comparison 线程完成一次处理（最多 timeout_ms）。
+  bool wait_comparison_done_for_test(uint32_t timeout_ms = 2000);
+
   // 帧回调入口（Bridge 的 capture 线程调用，按 sink_id 路由到对应 sensor）
   // frames 为单通道连续帧（Bridge 已按 channel_map 解复用，channels 恒为 1）。
   // Task 7 ①②③④ 链路（Phase 1 单线程，arch §6.2）：
@@ -170,6 +216,42 @@ class NoiseManager {
   //   风险23）。
   const DenoiseOutput* get_denoise_output(uint8_t sink_id) const;
 
+  // ── Spec4 Task 3：SSE broadcaster 访问器（HTTP SSE 路由用）──
+  // NoiseManager 持有 per-sensor 的 metrics_broadcaster_ + pcm_broadcaster_
+  // （denoised/noise PCM）+ 全局 alert_broadcaster_（T4 用）。
+  // on_period_end 时 capture 线程 push 事件到对应 broadcaster（非阻塞，
+  // D-S4.1/风险 9）。SSE handler 线程经 broadcaster.subscribe() 取队列 drain。
+  //
+  // get_metrics_broadcaster(sensor_id)：返回指定 sensor 的 metrics
+  //   broadcaster（shared_ptr）。若 sensor 不存在，返回空 shared_ptr
+  //   （HTTP 路由返回 404）。
+  //   返回 shared_ptr 而非裸指针：SSE handler 的 releaser lambda 需在
+  //   Response 析构时调 unsubscribe，此时 sensor 可能已被 remove_sensor
+  //   删除。shared_ptr 延长 broadcaster 生命周期直到最后一个 handler 退出，
+  //   避免 use-after-free（review Critical #1）。
+  // get_pcm_broadcaster(sensor_id, denoised)：返回指定 sensor 的 PCM
+  //   broadcaster。denoised=true -> denoised PCM；false -> noise PCM。
+  //   sensor 不存在或 denoise 关 -> nullptr。
+  // get_alert_broadcaster()：返回全局告警 broadcaster（T4 push）。
+  //   始终非 nullptr（NoiseManager 构造时创建）。
+  //
+  // broadcaster 访问器返回 shared_ptr，调用方（HTTP 路由）捕获到 SSE handler
+  // 的 releaser lambda 中。sensor 被 remove 后 broadcaster 仍存活（shared_ptr
+  // 延长生命周期），releaser 安全调 unsubscribe。queue 的 shared_ptr 也延长
+  // 队列生命周期，handler 退出后自然释放。
+  std::shared_ptr<SseBroadcaster> get_metrics_broadcaster(uint8_t sensor_id);
+  std::shared_ptr<SseBroadcaster> get_pcm_broadcaster(uint8_t sensor_id,
+                                                      bool denoised);
+  std::shared_ptr<SseBroadcaster> get_alert_broadcaster() {
+    return std::shared_ptr<SseBroadcaster>(&alert_broadcaster_,
+                                           [](SseBroadcaster*) {});
+  }
+
+  // 测试钩子：on_period_end 后检查 broadcaster 是否收到事件。
+  size_t metrics_broadcaster_count_for_test(uint8_t sensor_id) const;
+  size_t pcm_broadcaster_dropped_for_test(uint8_t sensor_id,
+                                          bool denoised) const;
+
   // 测试钩子（spec §D 接受此模式）
   size_t sensor_count_for_test() const;
   bool is_ptp_locked_for_test() const { return ptp_locked_.load(); }
@@ -215,6 +297,17 @@ class NoiseManager {
   bool get_metrics_snapshot(uint8_t sensor_id, NoiseMetricsSnapshot& out) const;
   std::vector<NoiseMetricsSnapshot> get_history_snapshot(
       uint8_t sensor_id) const;
+
+  // ── Spec4 T4：告警历史访问器（HTTP GET /api/noise/alerts 用）──
+  // 返回所有 sensor 的告警历史事件列表（arch §C 告警事件 JSON）。
+  // 遍历 sensor 表，对每个 sensor 调 metrics->get_alert_history() 持锁读。
+  // struct AlertHistoryEntry：sensor_id + AlertEvent（flat 组合，JSON
+  // 序列化用）。
+  struct AlertHistoryEntry {
+    uint8_t sensor_id{0};
+    AlertEvent event;
+  };
+  std::vector<AlertHistoryEntry> get_alert_history() const;
 
   // ── Spec3 Task 4 持久化（arch §7.6）──
   // load_status(file)：启动时加载传感器配置。
@@ -262,8 +355,8 @@ class NoiseManager {
       ctrl_mutex_;  // 仅保护控制线程的建表/换表；帧回调走 RCU 读，绝不持此锁
   // arch §3.7 L855：安全默认 false（假设未锁，直到 PTP 回调确认锁定）。
   std::atomic<bool> ptp_locked_{false};
-  std::atomic<bool> reset_pending_{false};
-  // Spec3 Task 4：持久化文件路径（arch §7.6）。
+  std::atomic<bool> reset_pending_{
+      false};  // Spec3 Task 4：持久化文件路径（arch §7.6）。
   // 空字符串禁用 save_status（no-op）。由 Config::noise_status_file_ 注入
   // （T6 wiring）或 set_status_file_for_test 设置。
   // mutable: save_status() const 方法可读（不写，仅读路径）。
@@ -278,6 +371,89 @@ class NoiseManager {
   // atomic: load_status (控制线程写) 与 save_status (控制线程读，由
   // add_sensor 内部调用) 跨函数但同线程，atomic 保证可见性。
   mutable std::atomic<bool> load_in_progress_{false};
+  // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
+  // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
+  // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，
+  // 不影响 RT。lock order: ctrl_mutex_ -> save_mutex_（add_sensor 持
+  // ctrl_mutex_ 后调 save_status），save_status 单独持 save_mutex_ 无死锁。
+  mutable std::mutex save_mutex_;
+
+  // ── Spec4 T5：RefComparator 注册表 + comparison 线程 ──
+  // comparator_id -> RefComparator 实例。控制线程（add/remove）写，
+  // comparison 线程读。mutex 保护（低频控制平面，非 RT）。
+  // 一个 sink 可同时是多个 comparator 的输入（如主链路作为多个备链路的
+  // 参考），on_frame 按 sink_id 查路由表写入对应 ring buffer。
+  struct RefComparatorEntry {
+    uint8_t id{0};
+    std::shared_ptr<RefComparator> comparator;
+    RefCompareResult last_result{};
+  };
+  std::vector<RefComparatorEntry> ref_comparators_;
+  mutable std::mutex ref_mutex_;
+  // 路由表：sink_id -> {(comparator_id, role)}。on_frame 末尾查此表
+  // 决定是否写 ref/cmp ring。role: 0=ref, 1=cmp。
+  // 不用 RCU：ref_comparators 是低频控制平面对象（add/remove 罕见），
+  // on_frame 末尾的 ring 写入持 ref_mutex_ 的时间极短（~0.5μs memcpy），
+  // 与 NoiseMetrics::collect 持 metrics_mutex_ 同模式，不影响 RT 预算。
+  struct RefRoute {
+    uint8_t comparator_id{0};
+    uint8_t role{0};  // 0=ref, 1=cmp
+  };
+  std::map<uint8_t, std::vector<RefRoute>> ref_routing_;
+  uint8_t next_comparator_id_{1};  // 1-based，0 = 无效
+
+  // comparison 线程（D-S4.3）：SCHED_OTHER，~每 100ms 轮询，遍历
+  // ref_comparators 调 try_process()，结果写 metrics->set_ref_result()。
+  // comparison_thread_mutex_ 仅保护 comparison_thread_ 的
+  // joinable/assign/join，与 ref_mutex_ 完全不嵌套（任何线程永不同时持有两把
+  // 锁）。调用方（on_ptp_locked / add_ref_comparator）在释放 ref_mutex_ 后才调
+  // start_comparison_thread；stop_comparison_thread 仅持
+  // comparison_thread_mutex_（不持 ref_mutex_）。这避免 3 方死锁：
+  // start 持 ref_mutex_ 等 comparison_thread_mutex_、stop 持
+  // comparison_thread_mutex_ 等 join、loop 等 ref_mutex_ 退出。
+  std::thread comparison_thread_;
+  std::mutex comparison_thread_mutex_;
+  std::atomic<bool> comparison_running_{false};
+  std::atomic<bool> comparison_stop_{false};
+  // 测试钩子：置位触发 comparison 线程立即处理（绕过 100ms 轮询）。
+  std::atomic<bool> comparison_trigger_{false};
+  // 测试钩子：comparison 线程完成一次处理后置位（wait_comparison_done 用）。
+  std::atomic<bool> comparison_done_{false};
+
+  void comparison_loop();
+  void start_comparison_thread();
+  void stop_comparison_thread();
+  // on_frame 末尾调用：查 ref_routing_ 表，将帧 memcpy 进对应 comparator 的
+  // ref/cmp ring buffer。ADDITIVE，不改 ①②③④。
+  void route_to_ref_comparators(uint8_t sink_id,
+                                const float* frames,
+                                size_t frame_size);
+
+  // ── Spec4 Task 3：SSE broadcaster 实例 + on_period_end push ──
+  // per-sensor broadcaster：sensor_id -> {metrics, pcm_denoised, pcm_noise}。
+  // 用 map 而非定长数组（sensor_id 范围 0-255，实际 sensor 数量少，map 按
+  // 需分配）。add_sensor 时创建，remove_sensor 时从 map 移除。
+  // on_period_end（capture 线程，RT）push 事件：非阻塞，drop-oldest 背压。
+  // shared_ptr：SSE handler 的 releaser 捕获 broadcaster shared_ptr，sensor
+  // 被移除后 broadcaster 仍存活直到 handler 退出（避免 use-after-free）。
+  struct SensorBroadcasters {
+    std::shared_ptr<SseBroadcaster> metrics;
+    std::shared_ptr<SseBroadcaster> pcm_denoised;
+    std::shared_ptr<SseBroadcaster> pcm_noise;
+  };
+  std::map<uint8_t, SensorBroadcasters> sse_broadcasters_;
+  // 保护 sse_broadcasters_ map 的并发访问：add_sensor/remove_sensor
+  // （控制线程写）vs push_sse_events（capture 线程读）vs get_*_broadcaster
+  // （HTTP 线程读）。与 ref_mutex_ 同模式：短临界区（map lookup + 指针
+  // 解引用），不影响 RT 预算。push 内部各队列 try_lock 非阻塞。
+  mutable std::mutex sse_mutex_;
+  // 全局告警 broadcaster（T4 push，T3 仅创建实例 + 提供 accessor）。
+  SseBroadcaster alert_broadcaster_;
+
+  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 前）：
+  // push metrics 快照 + PCM chunk（每 period）到对应 broadcaster。
+  // 非阻塞：SseBroadcaster::push 内部 try_lock + drop-oldest（风险 9/17）。
+  void push_sse_events(const SensorTable& table);
 };
 
 }  // namespace noise

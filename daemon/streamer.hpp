@@ -100,6 +100,16 @@ class Streamer {
   std::error_code encode_denoise_aac(uint8_t sink_id,
                                      bool denoised,
                                      std::string& out);
+  // Spec4 T2：PCM 直通 - 三路 ?format=pcm 分支（arch §5.2 + D-S4.6）。
+  // 跳过 faac，直接返回 16-bit signed LE interleaved PCM（float [-1,1] ->
+  // int16_t，与 encode_denoise_aac 的 float->S16 一致：v * 32767.0f + clamp）。
+  // encode_original_pcm 取 DenoiseOutput.original（统一三路接口，arch §3.4
+  // L649）。encode_denoise_pcm 取 denoised (true) 或 noise (false)。
+  // sensor 不存在 / denoise 关 -> error（同 encode_denoise_aac 规则）。
+  std::error_code encode_original_pcm(uint8_t sink_id, std::string& out);
+  std::error_code encode_denoise_pcm(uint8_t sink_id,
+                                     bool denoised,
+                                     std::string& out);
 #endif
 
  protected:

@@ -396,6 +396,23 @@ bool HttpServer::init() {
       set_error(400, "failed to convert id", res);
       return;
     }
+#ifdef _USE_NOISE_
+    // Spec4 T2：PCM 直通分支 - ?format=pcm 跳过 faac，返回 16-bit LE PCM
+    // （arch §5.2 + D-S4.6/D-S4.8）。原始路取 DenoiseOutput.original。
+    // 不改 AAC 默认路径（无 ?format=pcm 时 byte-for-byte 不变）。
+    if (req.has_param("format") && req.get_param_value("format") == "pcm") {
+      std::string pcm;
+      auto pcm_ret = streamer_->encode_original_pcm(sinkId, pcm);
+      if (pcm_ret) {
+        set_error(404, "PCM not available for sink " + std::to_string(sinkId),
+                  res);
+        return;
+      }
+      set_headers(res, "audio/pcm");
+      res.body = std::move(pcm);
+      return;
+    }
+#endif
     StreamSink sink;
     auto ret = session_manager_->get_sink(sinkId, sink);
     if (ret) {
@@ -479,6 +496,20 @@ bool HttpServer::init() {
       set_error(400, "failed to convert id", res);
       return;
     }
+    // Spec4 T2：PCM 直通分支 - ?format=pcm 跳过 faac（D-S4.6/D-S4.8）。
+    if (req.has_param("format") && req.get_param_value("format") == "pcm") {
+      std::string pcm;
+      auto pcm_ret = streamer_->encode_denoise_pcm(sinkId, true, pcm);
+      if (pcm_ret) {
+        set_error(404,
+                  "denoise not available for sink " + std::to_string(sinkId),
+                  res);
+        return;
+      }
+      set_headers(res, "audio/pcm");
+      res.body = std::move(pcm);
+      return;
+    }
     std::string aac;
     auto ret = streamer_->encode_denoise_aac(sinkId, true, aac);
     if (ret) {
@@ -501,6 +532,20 @@ bool HttpServer::init() {
       sinkId = std::stoi(req.matches[1]);
     } catch (...) {
       set_error(400, "failed to convert id", res);
+      return;
+    }
+    // Spec4 T2：PCM 直通分支 - ?format=pcm 跳过 faac（D-S4.6/D-S4.8）。
+    if (req.has_param("format") && req.get_param_value("format") == "pcm") {
+      std::string pcm;
+      auto pcm_ret = streamer_->encode_denoise_pcm(sinkId, false, pcm);
+      if (pcm_ret) {
+        set_error(404,
+                  "denoise not available for sink " + std::to_string(sinkId),
+                  res);
+        return;
+      }
+      set_headers(res, "audio/pcm");
+      res.body = std::move(pcm);
       return;
     }
     std::string aac;

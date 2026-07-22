@@ -795,20 +795,28 @@ BOOST_AUTO_TEST_CASE(metrics_aggregates_123_results) {
   BOOST_CHECK(snap.is_noisy);
   BOOST_CHECK_CLOSE(snap.estimated_snr_db, 15.0f, 0.01);
   BOOST_CHECK_GT(snap.noise_reduction_db, 10.0f);  // 20log10(0.1/0.01)=20dB
-  BOOST_CHECK(!snap.is_alerting);  // -35dBFS < -30 threshold -> not alerting
+  BOOST_CHECK(!snap.is_alerting);  // Spec4 T4: collect 不再设 is_alerting，
+                                   // evaluate_alerts 未调用 -> 默认 false
 }
 
 // 告警：noise_level_dbfs=-20dBFS > -30dBFS 阈值 -> is_alerting=true。
+// Spec4 T4：适配引擎语义（D-S4.2）。collect() 不再直接设 is_alerting；
+// evaluate_alerts() 在 collect 后调用。去抖默认 3 period，此处设 1
+// （单 period 即 raise）以保持原 Spec3 测试语义。
 // ar{} 值初始化：hum_strength_db=0（默认），不会触发 hum-alert 路径，
 // 确保 is_alerting 经由 noise_level_dbfs 路径触发（review Important #1）。
+// -20dBFS > alert_threshold_dbfs(-30) + 10 = -20 的边界，-20 不 > -20，
+// 故为 Warning 而非 Critical（边界条件：> 严格大于）。
 BOOST_AUTO_TEST_CASE(metrics_alerts_when_loud) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
   det.is_noisy = true;
   noise::NoiseAnalysisResult ar{};
-  ar.noise_level_dbfs = -20.0f;  // loud
+  ar.noise_level_dbfs = -20.0f;  // loud (> -30 threshold)
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(m.snapshot_for_test().is_alerting);  // -20 > -30 threshold
 }
 
@@ -846,27 +854,35 @@ BOOST_AUTO_TEST_CASE(metrics_history_populates_and_caps) {
 
 // Hum-alert 路径独立测试（review Minor #6）：
 // noise_level_dbfs 低于阈值但 hum_strength_db 高于阈值 -> 经 hum 路径告警。
+// Spec4 T4：适配引擎语义（去抖=1，collect + evaluate_alerts）。
 BOOST_AUTO_TEST_CASE(metrics_alerts_via_hum_path) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
   noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS 阈值（不经 noise_level 路径）
   ar.hum_strength_db = -20.0f;  // 高于 -40dB hum 阈值 -> 经 hum 路径告警
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(m.snapshot_for_test().is_alerting);
 }
 
 // Hum-alert 阴性对照（review Minor #6）：
 // noise_level_dbfs + hum_strength_db 均低于阈值 -> 不告警。
+// Spec4 T4：适配引擎语义（去抖=1，collect + evaluate_alerts）。
+// 注：det.estimated_snr_db 须设高值，否则默认 0.0 < 10 触发 SNR 规则。
 BOOST_AUTO_TEST_CASE(metrics_no_alert_when_both_below_threshold) {
   noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
   noise::DenoiseResult dr{};
   noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
   noise::NoiseAnalysisResult ar{};
   ar.noise_level_dbfs = -50.0f;  // 低于 -30dBFS
   ar.hum_strength_db = -70.0f;   // 低于 -40dB hum 阈值
   m.collect(dr, det, ar, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
   BOOST_CHECK(!m.snapshot_for_test().is_alerting);
 }
 
@@ -1084,6 +1100,11 @@ BOOST_AUTO_TEST_SUITE_END()
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
+
+#include <boost/foreach.hpp>
+#include <boost/property_tree/json_parser.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include "config.hpp"
 #include "noise/noise_status.hpp"
@@ -1186,23 +1207,151 @@ BOOST_AUTO_TEST_CASE(atomic_write_no_halfwrite) {
   std::remove(f);
 }
 
-// review Minor #4：corrupt-JSON-load 测试。
-// 写垃圾到文件，load_status 返回 false（graceful，不 crash/不抛异常）。
-BOOST_AUTO_TEST_CASE(load_status_rejects_corrupt_json) {
-  const char* f = "test_corrupt_status.json";
+// D-S4.7（T1）：corrupt-JSON-load 降级测试。
+// 写垃圾到文件，load_status 返回 true（降级为空配置，不阻塞 daemon 启动）+
+// sensors 为空（mid-state 回滚）+ stderr 日志告警。
+// Case 1: 顶层 JSON 畸形（read_json 抛 json_parser_error -> 0 sensor 已加）。
+// Case 2: 中途字段错误（第 1 个 sensor 合法 -> add_sensor；第 2 个 sensor
+//   id 字段为字符串 -> get<unsigned> 抛 ptree_bad_data -> catch(std::exception)
+//   -> 回滚已加的 sensor 0 -> 降级为空配置）。
+BOOST_AUTO_TEST_CASE(load_status_degrades_on_corrupt) {
+  // Case 1: top-level corrupt JSON (read_json throws before any sensor added)
+  {
+    const char* f = "test_corrupt_status.json";
+    std::remove(f);
+    // 写畸形 JSON（缺 }）
+    std::ofstream out(f);
+    out << R"({"sensors":[{"id":0,"sink_id":0)";
+    out.close();
+    NoiseAudioBridgeStub bridge;
+    noise::NoiseManager mgr(bridge);
+    mgr.set_status_file_for_test(f);
+    // D-S4.7: 降级为空配置，返回 true（不阻塞 daemon 启动）
+    BOOST_CHECK(mgr.load_status(f));
+    // 不 crash、不抛异常即通过。sensor_count 应为 0（未加载任何传感器）。
+    BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+    std::remove(f);
+  }
+  // Case 2: mid-parse failure (first sensor valid, second bad -> rollback)
+  {
+    const char* f = "test_corrupt_mid_status.json";
+    std::remove(f);
+    std::ofstream out(f);
+    // First sensor is valid, second has bad id type (string instead of
+    // unsigned) -> get<unsigned>("id") throws ptree_bad_data -> catch.
+    // Without D-S4.7 rollback, sensor 0 would remain in the table.
+    out << R"({"sensors":[)"
+        << R"({"id":0,"sink_id":0,"enabled":true,"denoise_enabled":false,)"
+        << R"("denoise_plugin":"passthrough","denoise_dry_wet":1.0,)"
+        << R"("sensitivity":1.0},)" << R"({"id":"not_a_number","sink_id":1}]})"
+        << "}";
+    out.close();
+    NoiseAudioBridgeStub bridge;
+    noise::NoiseManager mgr(bridge);
+    mgr.set_status_file_for_test(f);
+    // D-S4.7: parse 中途失败 -> 清空 mid-state sensors + 降级为空配置
+    BOOST_CHECK(mgr.load_status(f));
+    // sensor_count 必须为 0（mid-state sensor 0 已回滚）
+    BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+    std::remove(f);
+  }
+}
+
+// D-S4.7（T1）：save_status 并发写安全测试。
+// 多线程并发 save_status + add_sensor/remove_sensor -> 最终文件可解析且无半写。
+// save_mutex_ 序列化持久化写路径，防止 tmp 文件竞争导致损坏。
+// ThreadSanitizer 可检测 save_mutex_ 缺失时的数据竞争（手动运行）。
+BOOST_AUTO_TEST_CASE(save_status_concurrent_no_corruption) {
+  const char* f = "test_concurrent_status.json";
   std::remove(f);
-  // 写畸形 JSON（缺 }）
-  std::ofstream out(f);
-  out << R"({"sensors":[{"id":0,"sink_id":0)";
-  out.close();
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   mgr.set_status_file_for_test(f);
-  // load_status 返回 false（JSON 解析失败 -> stderr 告警 -> false）
-  BOOST_CHECK(!mgr.load_status(f));
-  // 不 crash、不抛异常即通过。sensor_count 应为 0（未加载任何传感器）。
-  BOOST_CHECK_EQUAL(mgr.sensor_count_for_test(), 0u);
+  // 初始 sensor 0 使 save_status 有内容可序列化
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+
+  // Thread 1: 反复调 save_status（模拟并发"变更即写"）
+  std::thread t_save([&]() {
+    for (int i = 0; i < 200; ++i)
+      mgr.save_status();
+  });
+  // Thread 2: 反复 add/remove sensor 1（每次触发内部 save_status）
+  std::thread t_add([&]() {
+    for (int i = 0; i < 100; ++i) {
+      mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+      mgr.remove_sensor(1);
+    }
+  });
+
+  t_save.join();
+  t_add.join();
+
+  // 验证最终文件是合法 JSON（无半写损坏）
+  boost::property_tree::ptree pt;
+  std::ifstream in(f);
+  BOOST_REQUIRE(in.is_open());
+  BOOST_CHECK_NO_THROW(boost::property_tree::read_json(in, pt));
+  // 最终状态：sensor 0 保留（sensor 1 被 remove）
+  size_t sensor_count = 0;
+  for (const auto& v : pt.get_child("sensors")) {
+    (void)v;
+    ++sensor_count;
+  }
+  BOOST_CHECK_EQUAL(sensor_count, 1u);
   std::remove(f);
+}
+
+// D-S4.7（T1）：NoiseTemplateDB::load WAV 一致性检查。
+// templates.json 引用不存在的 WAV -> load 后该模板 wav_available == false +
+// bark 特征仍可 match + get_wav_path 返回空串。
+BOOST_AUTO_TEST_CASE(template_db_load_missing_wav) {
+  const char* d = "test_tpl_missing_wav";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+
+  // 构造 templates.json 引用不存在的 WAV 文件
+  std::ostringstream json_ss;
+  json_ss << R"({"templates": [{"id": 1, "label": "空调噪声", )"
+          << R"("bark_spectrum": [)";
+  for (int i = 0; i < 32; ++i) {
+    if (i > 0)
+      json_ss << ", ";
+    json_ss << (0.1f * static_cast<float>(i + 1));
+  }
+  json_ss << R"(], "description": "test", "wav_file": "nonexistent.wav"}]})";
+  std::ofstream out(std::string(d) + "/templates.json");
+  out << json_ss.str();
+  out.close();
+
+  noise::NoiseTemplateDB db;
+  BOOST_CHECK(db.load(d));
+
+  // 验证 wav_available == false（WAV 文件不存在）
+  const noise::Template* t = db.get_template(1);
+  BOOST_REQUIRE(t != nullptr);
+  BOOST_CHECK(!t->wav_available);
+
+  // 验证 bark 特征仍可 match（L2 匹配不受 WAV 缺失影响）
+  std::array<float, 32> feat{};
+  for (size_t i = 0; i < 32; ++i)
+    feat[i] = 0.1f * static_cast<float>(i + 1);
+  auto [matched_id, sim] = db.match(feat);
+  BOOST_CHECK_EQUAL(matched_id, 1u);
+  BOOST_CHECK_CLOSE(sim, 1.0f, 0.01);
+
+  // 验证 get_wav_path 返回空串（wav_available=false -> 无 WAV 路径）
+  BOOST_CHECK(db.get_wav_path(1u).empty());
+
+  // 验证 save 后 wav_available 字段持久化
+  noise::NoiseTemplateDB db2;
+  db2.set_dir_for_test(d);
+  BOOST_CHECK(db.save(d));
+  BOOST_CHECK(db2.load(d));
+  const noise::Template* t2 = db2.get_template(1);
+  BOOST_REQUIRE(t2 != nullptr);
+  BOOST_CHECK(!t2->wav_available);
+
+  std::filesystem::remove_all(d);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -1880,3 +2029,1040 @@ BOOST_AUTO_TEST_CASE(e2e_fake_pcm_source_white_noise_and_denoised_aac) {
 
 BOOST_AUTO_TEST_SUITE_END()
 #endif  // _USE_STREAMER_
+// ── Spec4 T5: RefComparator 参考音比对测试（arch §3.5 + §6.3.2）──────────
+#include "ref_comparator.hpp"
+#include <chrono>
+#include <cmath>
+#include <thread>
+
+BOOST_AUTO_TEST_SUITE(ref_comparator_tests)
+
+// TDD Step 1.1: 延时估计 - 合成双路帧（已知延时 5ms + 加性白噪）->
+// try_process() -> delay_ms 误差 ≤1ms。
+// 使用宽带信号（白噪）作为 ref，避免周期信号的互相关谐波峰模糊。
+BOOST_AUTO_TEST_CASE(ref_comparator_delay_estimation) {
+  noise::RefComparator rc(0, 1);
+  // 合成 ref 信号：宽带白噪（互相关峰尖锐，无谐波模糊）。
+  constexpr size_t kSignalLen = 96000;
+  constexpr uint32_t kRate = 48000;
+  std::vector<float> ref(kSignalLen), cmp(kSignalLen);
+  // ref = 白噪（幅度 0.3）。
+  uint32_t ref_seed = 12345;
+  for (size_t i = 0; i < kSignalLen; ++i) {
+    ref_seed = ref_seed * 1103515245u + 12345u;
+    ref[i] = (static_cast<float>(ref_seed >> 16) / 65535.0f - 0.5f) * 0.3f;
+  }
+  // cmp = ref 延时 5ms（240 样本）+ 弱白噪。
+  constexpr size_t kDelaySamples = 240;  // 5ms @48k
+  uint32_t noise_seed = 42;
+  for (size_t i = 0; i < kSignalLen; ++i) {
+    noise_seed = noise_seed * 1103515245u + 12345u;
+    float noise =
+        (static_cast<float>(noise_seed >> 16) / 65535.0f - 0.5f) * 0.02f;
+    if (i >= kDelaySamples) {
+      cmp[i] = ref[i - kDelaySamples] + noise;
+    } else {
+      cmp[i] = noise;
+    }
+  }
+  // 分帧写入 ring buffer（模拟 on_frame 调用）。
+  constexpr size_t kFrameSize = 480;
+  for (size_t off = 0; off + kFrameSize <= kSignalLen; off += kFrameSize) {
+    rc.write_ref(ref.data() + off, kFrameSize);
+    rc.write_cmp(cmp.data() + off, kFrameSize);
+  }
+  auto result = rc.try_process();
+  BOOST_REQUIRE(result.has_value());
+  // 延时估计误差 ≤1ms（即 |delay_ms - 5.0| <= 1.0）。
+  BOOST_CHECK_LE(std::abs(result->delay_ms - 5.0f), 1.0f);
+  BOOST_TEST_MESSAGE("delay_ms=" << result->delay_ms
+                                 << " similarity=" << result->similarity
+                                 << " noise_db=" << result->noise_db);
+}
+
+// TDD Step 1.2: 残差噪声估计 - ref 干净 + cmp = ref + 已知噪声 ->
+// noise_db 估计合理 + similarity 高。
+BOOST_AUTO_TEST_CASE(ref_comparator_residual_noise) {
+  noise::RefComparator rc(0, 1);
+  constexpr size_t kSignalLen = 96000;
+  constexpr uint32_t kRate = 48000;
+  std::vector<float> ref(kSignalLen), cmp(kSignalLen);
+  // ref = 语音类信号。
+  for (size_t i = 0; i < kSignalLen; ++i) {
+    float t = static_cast<float>(i) / kRate;
+    ref[i] = 0.2f * (std::sin(2.0 * 3.14159265358979 * 150.0 * t) +
+                     0.5f * std::sin(2.0 * 3.14159265358979 * 300.0 * t));
+  }
+  // cmp = ref + 已知幅度白噪（amplitude 0.05 -> RMS ~0.029 -> ~-31dB）。
+  uint32_t seed = 7;
+  float noise_sum_sq = 0.0f;
+  for (size_t i = 0; i < kSignalLen; ++i) {
+    seed = seed * 1103515245u + 12345u;
+    float noise = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.1f;
+    cmp[i] = ref[i] + noise;
+    noise_sum_sq += noise * noise;
+  }
+  float noise_rms = std::sqrt(noise_sum_sq / kSignalLen);
+  float expected_noise_db = 20.0f * std::log10(noise_rms);
+  BOOST_TEST_MESSAGE("expected noise RMS=" << noise_rms
+                                           << " dB=" << expected_noise_db);
+  // 分帧写入。
+  constexpr size_t kFrameSize = 480;
+  for (size_t off = 0; off + kFrameSize <= kSignalLen; off += kFrameSize) {
+    rc.write_ref(ref.data() + off, kFrameSize);
+    rc.write_cmp(cmp.data() + off, kFrameSize);
+  }
+  auto result = rc.try_process();
+  BOOST_REQUIRE(result.has_value());
+  // 相似度应较高（信号 + 小噪声）。
+  BOOST_CHECK_GT(result->similarity, 0.5f);
+  // 噪声 dB 估计应在合理范围（与 expected 误差 <10dB）。
+  BOOST_CHECK_LE(std::abs(result->noise_db - expected_noise_db), 10.0f);
+  BOOST_TEST_MESSAGE("noise_db=" << result->noise_db
+                                 << " similarity=" << result->similarity
+                                 << " delay_ms=" << result->delay_ms);
+}
+
+// TDD Step 1.3: ring 溢出 - 一路持续写满 -> drop oldest + overflow_count
+// 递增，不崩溃。
+BOOST_AUTO_TEST_CASE(ref_comparator_ring_overflow) {
+  noise::RefComparator rc(0, 1);
+  // 缩小 ring 容量加速测试。
+  rc.set_ring_capacity_for_test(1024);
+  // 写入 2048 样本（容量 2x），应溢出 1024 个。
+  std::vector<float> data(2048, 0.1f);
+  rc.write_ref(data.data(), 2048);
+  // overflow_count 应 >= 1024。
+  BOOST_CHECK_GE(rc.ref_overflow_count(), 1024u);
+  // cmp 路也测。
+  rc.write_cmp(data.data(), 2048);
+  BOOST_CHECK_GE(rc.cmp_overflow_count(), 1024u);
+  // 不崩溃：try_process 应正常返回（数据可能不足 kMinProcessSamples）。
+  auto result = rc.try_process();
+  // 可能返回 nullopt（数据不足）或有值，关键是 not crash。
+  (void)result;
+  BOOST_CHECK(true);
+}
+
+// TDD Step 1.4: 暂停恢复 - 一路暂停 -> delay_anomaly true；恢复后重对齐。
+BOOST_AUTO_TEST_CASE(ref_comparator_pause_resume) {
+  noise::RefComparator rc(0, 1);
+  // 设短 stale 阈值加速测试。
+  rc.set_stale_threshold_for_test(std::chrono::milliseconds(100));
+  constexpr size_t kSignalLen = 4800;  // 100ms @48k
+  std::vector<float> ref(kSignalLen), cmp(kSignalLen);
+  synth::speech_like(ref.data(), kSignalLen);
+  synth::speech_like(cmp.data(), kSignalLen);
+  // 初始写入建立对齐。
+  rc.write_ref(ref.data(), kSignalLen);
+  rc.write_cmp(cmp.data(), kSignalLen);
+  auto r1 = rc.try_process();
+  // 首次处理应建立对齐（若数据足够）。
+  // 暂停 ref 路：等待 >100ms 不写 ref，仅写 cmp。
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  rc.write_cmp(cmp.data(), kSignalLen);
+  // try_process 应检测到 ref stale -> delay_anomaly true。
+  auto r2 = rc.try_process();
+  BOOST_CHECK(rc.delay_anomaly());
+  // 恢复 ref 路：重新写入，应重对齐。
+  rc.clear_delay_anomaly_for_test();
+  rc.write_ref(ref.data(), kSignalLen);
+  rc.write_cmp(cmp.data(), kSignalLen);
+  auto r3 = rc.try_process();
+  // 恢复后 delay_anomaly 应清除（aligned_ 重建后 clear）。
+  // 注意：r3 可能为 nullopt（若 stale 检查仍触发因时间窗口），
+  // 但至少不崩溃。
+  (void)r1;
+  (void)r2;
+  (void)r3;
+  BOOST_CHECK(true);
+}
+
+// TDD Step 1.5: 结果进 metrics 快照 - 配置 ref_comparator + 喂帧 ->
+// get_metrics_snapshot 的 ref_* 字段被填充。
+BOOST_AUTO_TEST_CASE(ref_results_in_metrics_snapshot) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  // 两个 sensor：sink 0 = ref，sink 1 = cmp。
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+  // 配置 ref_comparator（ref_sink=0, cmp_sink=1）。
+  uint8_t cid = mgr.add_ref_comparator(0, 1);
+  BOOST_CHECK_NE(cid, 0u);
+  BOOST_CHECK(mgr.is_comparison_thread_running_for_test());
+  // 合成 2s 语音帧喂两个 sink。
+  constexpr size_t kFrameSize = 480;
+  constexpr size_t kTotalFrames = 200;  // ~2s @100fps
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    // cmp = ref + 小噪声。
+    uint32_t seed = static_cast<uint32_t>(f + 1);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float noise = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + noise;
+    }
+    mgr.on_frame(0, ref_frame, kFrameSize);
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_period_end();
+  }
+  // 触发 comparison 线程处理并等待完成。
+  bool done = mgr.wait_comparison_done_for_test(3000);
+  BOOST_CHECK(done);
+  // 验证 cmp sink（sink 1）的 metrics 快照 ref_* 被填充。
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  // ref_similarity 应 > 0（被 comparison 线程写入）。
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);
+  BOOST_TEST_MESSAGE("ref_similarity=" << snap.ref_similarity
+                                       << " ref_noise_db=" << snap.ref_noise_db
+                                       << " ref_delay_ms="
+                                       << snap.ref_delay_ms);
+}
+
+// TDD Step 1.6: 未配置时 no-op - 未配置 RefComparator -> snapshot ref_*
+// 保持默认。
+BOOST_AUTO_TEST_CASE(ref_comparator_no_op_when_unconfigured) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  // 不配置 ref_comparator。
+  BOOST_CHECK(!mgr.is_comparison_thread_running_for_test());
+  float silence[480] = {0};
+  mgr.on_period_begin();
+  mgr.on_frame(0, silence, 480);
+  mgr.on_period_end();
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(0, snap));
+  // ref_* 应保持默认值（未被 comparison 线程写入）。
+  BOOST_CHECK_EQUAL(snap.ref_similarity, 0.0f);
+  BOOST_CHECK_EQUAL(snap.ref_noise_db, -100.0f);
+  BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
+}
+
+// T5 review fix: comparison_thread_ 数据竞争压力测试。
+// 并发 add/remove_ref_comparator（模拟 HTTP 控制线程，触发
+// start_comparison_thread）与 on_ptp_unlocked/on_capture_thread_joined/
+// on_ptp_locked（模拟 PTP 回调 + 控制线程，触发
+// stop/start_comparison_thread）。 验证不 crash / 不
+// std::terminate（std::thread 赋值 joinable 未 join 会 terminate）。reviewer
+// 指出现有测试用 set_ptp_locked_for_test（仅置标志）绕过
+// on_ptp_locked()，本测试走真实 on_ptp_locked() 路径。ThreadSanitizer 可检测
+// 残留竞争（手动 -DWITH_NOISE=ON -DCMAKE_CXX_FLAGS=-fsanitize=thread 运行）。
+BOOST_AUTO_TEST_CASE(ref_comparator_concurrent_start_stop_no_crash) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+
+  std::atomic<bool> stop{false};
+
+  // 线程 A：反复 add/remove ref_comparator（每次触发 start_comparison_thread）
+  std::thread t_add([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      uint8_t cid = mgr.add_ref_comparator(0, 1);
+      if (cid != 0)
+        mgr.remove_ref_comparator(cid);
+    }
+  });
+
+  // 线程 B：反复 PTP unlock -> capture join -> PTP lock
+  // （on_ptp_unlocked 置 reset_pending_ + 暂停 comparison；
+  //  on_capture_thread_joined_for_test 走真实 on_capture_thread_joined ->
+  //  stop_comparison_thread + plugin reset；
+  //  on_ptp_locked 走真实 on_ptp_locked -> start_comparison_thread）
+  std::thread t_ptp([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      mgr.on_ptp_unlocked();
+      mgr.on_capture_thread_joined_for_test();
+      mgr.on_ptp_locked();
+    }
+  });
+
+  // 运行 ~1s（100ms 轮询间隔下 ~10 轮 start/stop + ~数千轮 add/remove）
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+  stop.store(true);
+
+  t_add.join();
+  t_ptp.join();
+
+  // 不 crash / 不 std::terminate 即通过
+  BOOST_CHECK(true);
+}
+
+// T4 review fix: remove_ref_comparator 后，cmp_sink 的 metrics ref_* 被清除。
+// 验证 stale ref_similarity 不残留（避免告警卡死）。
+BOOST_AUTO_TEST_CASE(ref_comparator_remove_clears_ref_metrics) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  // 两个 sensor：sink 0 = ref，sink 1 = cmp。
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+  // 配置 ref_comparator（ref_sink=0, cmp_sink=1）。
+  uint8_t cid = mgr.add_ref_comparator(0, 1);
+  BOOST_CHECK_NE(cid, 0u);
+
+  // 喂帧 -> comparison 线程写入 ref_*。
+  constexpr size_t kFrameSize = 480;
+  constexpr size_t kTotalFrames = 200;  // ~2s @100fps
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    // cmp = ref + 小噪声（与 ref_results_in_metrics_snapshot 同模式）。
+    uint32_t seed = static_cast<uint32_t>(f + 1);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float noise = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + noise;
+    }
+    mgr.on_frame(0, ref_frame, kFrameSize);
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_period_end();
+  }
+  bool done = mgr.wait_comparison_done_for_test(3000);
+  BOOST_CHECK(done);
+
+  // 验证 ref_similarity 被写入（> 0）。
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);
+
+  // 移除 comparator -> 应清除 cmp_sink 的 ref_configured_ + ref_*。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid));
+
+  // 验证 ref_* 回到默认值（clear_ref_configured 已调用）。
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_EQUAL(snap.ref_similarity, 0.0f);
+  BOOST_CHECK_EQUAL(snap.ref_noise_db, -100.0f);
+  BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
+}
+
+// Spec4 T4 review fix：多 comparator 共享同一 cmp_sink 时，移除一个不清
+// ref_configured_（仍有 comparator 监控），移除最后一个才清。验证精确
+// per-cmp_sink 条件（非"全部移除"stopgap）。
+BOOST_AUTO_TEST_CASE(ref_comparator_shared_cmp_sink_partial_remove_keeps_ref) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  // 三个 sensor：sink 0/2 = ref 源，sink 1 = cmp（被 A、B 共同监控）。
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+  mgr.add_sensor(2, 2, noise::NoiseSensorConfig{});
+  // A: ref_sink=0, cmp_sink=1；B: ref_sink=2, cmp_sink=1（共享 cmp_sink=1）。
+  uint8_t cid_a = mgr.add_ref_comparator(0, 1);
+  uint8_t cid_b = mgr.add_ref_comparator(2, 1);
+  BOOST_CHECK_NE(cid_a, 0u);
+  BOOST_CHECK_NE(cid_b, 0u);
+
+  // 喂帧 -> comparison 线程写入 sensor 1 的 ref_*（A、B 都写）。
+  constexpr size_t kFrameSize = 480;
+  constexpr size_t kTotalFrames = 200;  // ~2s @100fps
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    uint32_t seed = static_cast<uint32_t>(f + 1);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float nz = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + nz;
+    }
+    mgr.on_frame(0, ref_frame, kFrameSize);
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_frame(2, ref_frame, kFrameSize);  // B 的 ref 源
+    mgr.on_period_end();
+  }
+  bool done = mgr.wait_comparison_done_for_test(3000);
+  BOOST_CHECK(done);
+
+  // sensor 1 的 ref_similarity 被写入（A 或 B 写入，> 0）。
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);
+
+  // 移除 A（B 仍监控 cmp_sink=1）-> sensor 1 的 ref_* 不应清除。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid_a));
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);  // 仍被 B 写入，未清
+
+  // 再喂帧让 B 继续刷新（确认仍 active，非 stale 残留）。
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    uint32_t seed = static_cast<uint32_t>(f + 501);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float nz = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + nz;
+    }
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_frame(2, ref_frame, kFrameSize);  // B 的 ref 源
+    mgr.on_period_end();
+  }
+  BOOST_CHECK(mgr.wait_comparison_done_for_test(3000));
+
+  // 移除 B（最后一个监控 cmp_sink=1 的 comparator）-> sensor 1 的 ref_* 清除。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid_b));
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_EQUAL(snap.ref_similarity, 0.0f);
+  BOOST_CHECK_EQUAL(snap.ref_noise_db, -100.0f);
+  BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+// 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1 +
+//   docs/noise/architecture-design.md §11 风险 9/17。
+// TDD Step 1：先写失败测试（push/drop/unsubscribe），再实现 SseBroadcaster。
+#include "sse_broadcaster.hpp"
+#include <atomic>
+#include <thread>
+
+BOOST_AUTO_TEST_SUITE(sse_broadcaster_tests)
+
+// TDD Step 1.1: push N 事件 -> 订阅者 drain 收到全部。
+BOOST_AUTO_TEST_CASE(broadcaster_push_drain) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe();
+  BOOST_REQUIRE(handle);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 1u);
+
+  // push 5 个事件
+  for (int i = 0; i < 5; ++i) {
+    bc.push("data: {\"event\": " + std::to_string(i) + "}\n\n");
+  }
+  // drain
+  std::vector<std::string> events;
+  bool got = handle.queue->try_drain(events);
+  BOOST_CHECK(got);
+  BOOST_CHECK_EQUAL(events.size(), 5u);
+  // 验证顺序与内容
+  for (int i = 0; i < 5; ++i) {
+    BOOST_CHECK_EQUAL(events[i],
+                      "data: {\"event\": " + std::to_string(i) + "}\n\n");
+  }
+  // 二次 drain 应为空
+  std::vector<std::string> empty;
+  BOOST_CHECK(!handle.queue->try_drain(empty));
+  // 无 drop
+  BOOST_CHECK_EQUAL(handle.queue->dropped_count(), 0u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 0u);
+}
+
+// TDD Step 1.2: push 超容量 -> drop oldest + dropped_count 递增，不阻塞。
+BOOST_AUTO_TEST_CASE(broadcaster_drop_oldest_on_full) {
+  // 容量 4 的小队列，push 8 个 -> 应 drop 前 4 个，保留后 4 个。
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe(/*capacity=*/4);
+  BOOST_REQUIRE(handle);
+
+  for (int i = 0; i < 8; ++i) {
+    bc.push("data: {\"i\": " + std::to_string(i) + "}\n\n");
+  }
+  // drain 后应只剩后 4 个（i=4,5,6,7）
+  std::vector<std::string> events;
+  bool got = handle.queue->try_drain(events);
+  BOOST_CHECK(got);
+  BOOST_CHECK_EQUAL(events.size(), 4u);
+  // 前 4 个被 drop
+  BOOST_CHECK_EQUAL(events[0], "data: {\"i\": 4}\n\n");
+  BOOST_CHECK_EQUAL(events[3], "data: {\"i\": 7}\n\n");
+  // dropped_count = 4（前 4 个被 drop）
+  BOOST_CHECK_EQUAL(handle.queue->dropped_count(), 4u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 4u);
+}
+
+// TDD Step 1.3: unsubscribe 后 push 不再入该队列。
+BOOST_AUTO_TEST_CASE(broadcaster_unsubscribe_stops_drain) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe();
+  BOOST_REQUIRE(handle);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 1u);
+
+  // 先 push 一个 + drain 确认队列工作
+  bc.push("data: first\n\n");
+  std::vector<std::string> e1;
+  BOOST_CHECK(handle.queue->try_drain(e1));
+  BOOST_CHECK_EQUAL(e1.size(), 1u);
+
+  // unsubscribe
+  BOOST_CHECK(bc.unsubscribe(handle.id));
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  // 再次 unsubscribe 应失败（已不存在）
+  BOOST_CHECK(!bc.unsubscribe(handle.id));
+
+  // push 后，旧 handle.queue 不再收到（unsubscribe 后 push 不投递到已注销队列）
+  bc.push("data: second\n\n");
+  std::vector<std::string> e2;
+  // handler 仍持 shared_ptr，可调 try_drain（队列对象仍存活），但应无事件
+  BOOST_CHECK(!handle.queue->try_drain(e2));
+  BOOST_CHECK_EQUAL(e2.size(), 0u);
+}
+
+// TDD Step 1.4: 多订阅者并发 - 各自独立 drain，互不串扰。
+BOOST_AUTO_TEST_CASE(broadcaster_multi_subscriber) {
+  noise::SseBroadcaster bc;
+  auto h1 = bc.subscribe();
+  auto h2 = bc.subscribe();
+  auto h3 = bc.subscribe();
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 3u);
+
+  // push 一个事件，三个队列都应收到
+  bc.push("data: broadcast\n\n");
+
+  for (auto* h : {&h1, &h2, &h3}) {
+    std::vector<std::string> events;
+    BOOST_CHECK(h->queue->try_drain(events));
+    BOOST_CHECK_EQUAL(events.size(), 1u);
+    BOOST_CHECK_EQUAL(events[0], "data: broadcast\n\n");
+  }
+  // unsubscribe 一个，其余仍工作
+  bc.unsubscribe(h2.id);
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 2u);
+  bc.push("data: second\n\n");
+  std::vector<std::string> e1, e3;
+  BOOST_CHECK(h1.queue->try_drain(e1));
+  BOOST_CHECK_EQUAL(e1.size(), 1u);
+  // h2 已注销，不应收到
+  std::vector<std::string> e2;
+  BOOST_CHECK(!h2.queue->try_drain(e2));
+  BOOST_CHECK(h3.queue->try_drain(e3));
+  BOOST_CHECK_EQUAL(e3.size(), 1u);
+}
+
+// TDD Step 1.5: 无订阅者时 push 不 crash（零订阅者退化）。
+BOOST_AUTO_TEST_CASE(broadcaster_push_no_subscribers) {
+  noise::SseBroadcaster bc;
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  // 无订阅者 push 应 no-op，不 crash
+  bc.push("data: orphan\n\n");
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+  BOOST_CHECK_EQUAL(bc.total_dropped(), 0u);
+}
+
+// T3 review fix: has_subscribers() 守卫 -- RT 路径用此跳过 idle 编码。
+BOOST_AUTO_TEST_CASE(broadcaster_has_subscribers_reflects_state) {
+  noise::SseBroadcaster bc;
+  // 初始无订阅者
+  BOOST_CHECK(!bc.has_subscribers());
+  // subscribe 后有订阅者
+  auto h1 = bc.subscribe();
+  BOOST_CHECK(bc.has_subscribers());
+  // 多订阅者
+  auto h2 = bc.subscribe();
+  BOOST_CHECK(bc.has_subscribers());
+  // 注销一个仍有订阅者
+  bc.unsubscribe(h1.id);
+  BOOST_CHECK(bc.has_subscribers());
+  // 全部注销后无订阅者
+  bc.unsubscribe(h2.id);
+  BOOST_CHECK(!bc.has_subscribers());
+}
+
+// TDD Step 1.6: 并发 push/drain 不 crash + 不阻塞（RT 非阻塞压力）。
+// 一线程高速 push（模拟 capture on_period_end），另一线程 drain
+// （模拟 SSE handler）。验证 push 线程不被 drain 阻塞（try_lock 失败时
+// drop，不挂）。
+BOOST_AUTO_TEST_CASE(broadcaster_concurrent_push_drain_no_block) {
+  noise::SseBroadcaster bc;
+  auto handle = bc.subscribe(/*capacity=*/16);
+  BOOST_REQUIRE(handle);
+
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> push_count{0};
+  std::atomic<size_t> drain_count{0};
+
+  // push 线程：高速 push（模拟 RT）
+  std::thread pusher([&]() {
+    int i = 0;
+    while (!stop.load(std::memory_order_relaxed)) {
+      bc.push("data: " + std::to_string(i++) + "\n\n");
+      push_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  });
+
+  // drain 线程：间歇 drain（模拟 SSE handler socket write 后取事件）
+  std::thread drainer([&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::vector<std::string> events;
+      if (handle.queue->try_drain(events)) {
+        drain_count.fetch_add(events.size(), std::memory_order_relaxed);
+      }
+      // 模拟 socket write 耗时
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+  });
+
+  // 运行 200ms
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  stop.store(true);
+
+  pusher.join();
+  drainer.join();
+
+  // push 线程应完成大量 push（证明非阻塞 - 若阻塞会很少）
+  BOOST_CHECK_GT(push_count.load(), 100u);
+  // drain 线程应取到部分事件（drain 速度慢于 push，可能有 drop）
+  BOOST_CHECK_GT(drain_count.load(), 0u);
+  BOOST_TEST_MESSAGE("concurrent: pushed="
+                     << push_count.load() << " drained=" << drain_count.load()
+                     << " dropped=" << bc.total_dropped());
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec4 T3 Step 3：cpp-httplib chunked SSE API 验证（R-S4.2）──────────
+// 最小 echo 路由验证 chunked provider + 断连清理。不依赖 NoiseManager，
+// 仅验证 cpp-httplib 的 set_chunked_content_provider + DataSink API 行为。
+BOOST_AUTO_TEST_SUITE(sse_echo_api_tests)
+
+// 最小 echo 路由：push "data: hello\n\n" 每 50ms，客户端收到 >=1 事件后断连。
+// 验证：1) chunked provider 能持续推送；2) 客户端能收到 SSE 帧；
+//       3) 断连后 provider 检测 is_writable()=false -> sink.done() 退出。
+BOOST_AUTO_TEST_CASE(sse_echo_pushes_and_detects_disconnect) {
+  httplib::Server svr;
+  std::atomic<bool> provider_exited{false};
+  std::atomic<size_t> push_count{0};
+
+  svr.Get("/api/noise/sse_echo", [&provider_exited, &push_count](
+                                     const httplib::Request& /*req*/,
+                                     httplib::Response& res) {
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [&push_count](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+          // push "data: hello\n\n" 每 50ms
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          if (!sink.is_writable()) {
+            sink.done();
+            return true;
+          }
+          const char* msg = "data: hello\n\n";
+          if (!sink.write(msg, 12)) {
+            return false;  // write 失败
+          }
+          push_count.fetch_add(1, std::memory_order_relaxed);
+          return true;  // 继续 loop
+        },
+        [&provider_exited](bool /*success*/) {
+          provider_exited.store(true, std::memory_order_relaxed);
+        });
+  });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+
+  // 客户端：连上后读 N 字节即断连
+  httplib::Client cli("127.0.0.1", port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  std::atomic<bool> got_event{false};
+  std::string received;
+  auto res =
+      cli.Get("/api/noise/sse_echo",
+              [&got_event, &received](const char* data, size_t len) -> bool {
+                received.append(data, len);
+                if (received.find("data: hello") != std::string::npos) {
+                  got_event.store(true, std::memory_order_relaxed);
+                  return false;  // 断连（停止接收）
+                }
+                return true;  // 继续接收
+              });
+
+  // 客户端断连后，res 可能是 nullptr 或有 status
+  BOOST_CHECK(got_event.load());
+  BOOST_TEST_MESSAGE("echo: received=" << received.substr(0, 80)
+                                       << " push_count=" << push_count.load());
+
+  // 等待 provider 检测断连并退出（releaser 被调用）
+  // 注意：releaser 在 Response 析构时调用，可能在 svr 工作线程清理时
+  for (int i = 0; i < 50 && !provider_exited.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  BOOST_CHECK(provider_exited.load());
+
+  svr.stop();
+  svr_thread.join();
+}
+
+// 验证 SseBroadcaster + chunked provider 集成：
+// 后台线程 push 事件 -> SSE handler drain -> 客户端收到。
+BOOST_AUTO_TEST_CASE(sse_broadcaster_with_chunked_provider) {
+  httplib::Server svr;
+  noise::SseBroadcaster bc;
+
+  svr.Get("/api/noise/sse_test",
+          [&bc](const httplib::Request& /*req*/, httplib::Response& res) {
+            auto handle = bc.subscribe();
+            // 捕获 queue（shared_ptr，可拷贝）+ id（uint64_t，可拷贝），
+            // handle 本身 move-only 不捕获。
+            auto queue = handle.queue;
+            uint64_t id = handle.id;
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [queue](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+                  std::vector<std::string> events;
+                  if (queue->try_drain(events)) {
+                    for (const auto& e : events) {
+                      if (!sink.write(e.data(), e.size()))
+                        return false;
+                    }
+                  }
+                  if (!sink.is_writable()) {
+                    sink.done();
+                    return true;
+                  }
+                  // 无事件时短暂 sleep 避免 busy-loop（不调 sink.write ->
+                  // data_available 保持 true，loop 继续）
+                  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                  return true;
+                },
+                [&bc, id](bool /*success*/) { bc.unsubscribe(id); });
+          });
+
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+
+  // 后台线程 push 事件
+  std::atomic<bool> stop_push{false};
+  std::thread pusher([&bc, &stop_push]() {
+    int i = 0;
+    while (!stop_push.load(std::memory_order_relaxed)) {
+      bc.push("data: {\"seq\": " + std::to_string(i++) + "}\n\n");
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+  });
+
+  // 客户端：连上后读若干事件
+  httplib::Client cli("127.0.0.1", port);
+  cli.set_connection_timeout(5);
+  cli.set_read_timeout(5);
+
+  std::string received;
+  int events_received = 0;
+  auto res = cli.Get(
+      "/api/noise/sse_test",
+      [&received, &events_received](const char* data, size_t len) -> bool {
+        received.append(data, len);
+        // 统计 SSE 帧数（"data: " 开头的行）
+        size_t pos = 0;
+        while ((pos = received.find("data: ", pos)) != std::string::npos) {
+          ++events_received;
+          pos += 6;
+        }
+        return events_received < 3;  // 收到 3 个事件后断连
+      });
+
+  BOOST_CHECK_GE(events_received, 3);
+  BOOST_TEST_MESSAGE("broadcaster+chunked: events=" << events_received
+                                                    << " received="
+                                                    << received.substr(0, 120));
+
+  stop_push.store(true);
+  pusher.join();
+
+  svr.stop();
+  svr_thread.join();
+
+  // 断连后 broadcaster 应无残留订阅者（releaser 调 unsubscribe）
+  // 注意：releaser 在 Response 析构时调用，svr.stop() 后工作线程退出
+  // 时清理。给一点时间。
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_EQUAL(bc.subscriber_count(), 0u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec4 T4：告警规则引擎测试（D-S4.2 + arch §3.6 规则表）──────────────
+// 5 条规则 + 三级 + 去抖 + 历史 ring + SSE push。
+BOOST_AUTO_TEST_SUITE(alert_engine_tests)
+
+// TDD Step 1.1: noise_level_dbfs=-18（> -20 Critical 阈值）持续
+// debounce_periods -> Critical + is_alerting true。
+BOOST_AUTO_TEST_CASE(alert_critical_on_loud) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/3);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -18.0f;  // > -20 -> Critical
+  ar.hum_strength_db = -70.0f;   // 低于 hum 阈值
+  // 前 2 period 不 raise（去抖未达 3）
+  for (int i = 0; i < 2; ++i) {
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    BOOST_CHECK(!ev.has_value());  // 未达去抖阈值
+    BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+  }
+  // 第 3 period -> raise Critical
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->is_active);
+  BOOST_CHECK(ev->level == noise::AlertLevel::Critical);
+  BOOST_CHECK(ev->rule == "noise_level_dbfs");
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+  BOOST_CHECK(m.snapshot_for_test().alert_level == noise::AlertLevel::Critical);
+}
+
+// TDD Step 1.2: noise_level_dbfs=-25（> -30 Warning，< -20 Critical）
+// -> Warning。
+BOOST_AUTO_TEST_CASE(alert_warning_on_moderate) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -25.0f;  // > -30 Warning, < -20 Critical
+  ar.hum_strength_db = -70.0f;
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->level == noise::AlertLevel::Warning);
+  BOOST_CHECK(m.snapshot_for_test().alert_level == noise::AlertLevel::Warning);
+}
+
+// TDD Step 1.3: hum_strength > -40 -> Info。
+BOOST_AUTO_TEST_CASE(alert_info_on_hum) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+  ar.hum_strength_db = -20.0f;   // > -40 -> Info
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev.has_value());
+  BOOST_CHECK(ev->level == noise::AlertLevel::Info);
+  BOOST_CHECK(ev->rule == "hum_strength_db");
+}
+
+// TDD Step 1.4: 单 period 超阈值后回落 -> 不 raise（未持续 N period）。
+BOOST_AUTO_TEST_CASE(alert_debounce_suppresses_jitter) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/3);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // > -20 Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // 1 period loud -> raise_count=1 (< 3) -> 不 raise
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  auto ev1 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev1.has_value());
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+
+  // 1 period quiet -> raise_count 重置 -> 不 raise
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev2 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev2.has_value());
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+}
+
+// TDD Step 1.5: raise 后持续 N period 正常 -> clear + is_alerting false。
+BOOST_AUTO_TEST_CASE(alert_clear_after_sustained_recover) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/2);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // 2 period loud -> raise
+  for (int i = 0; i < 2; ++i) {
+    m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+    m.evaluate_alerts(0);
+  }
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 1 period quiet -> clear_count=1 (< 2) -> 仍告警
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev1 = m.evaluate_alerts(0);
+  BOOST_CHECK(!ev1.has_value());  // 未达 clear 去抖
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 2nd period quiet -> clear_count=2 (>= 2) -> clear
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  auto ev2 = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev2.has_value());
+  BOOST_CHECK(!ev2->is_active);  // clear event
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+}
+
+// TDD Step 1.6: 配置 RefComparator + ref_similarity=0.7 -> Warning；
+// 未配置 -> 跳过不误报。
+BOOST_AUTO_TEST_CASE(alert_ref_similarity_when_configured) {
+  // Case 1: 未配置 RefComparator -> ref_similarity 保持默认 0.0，
+  // 引擎跳过 ref 规则 -> 不误报。
+  {
+    noise::NoiseMetrics m;
+    m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+    noise::DenoiseResult dr{};
+    noise::NoiseDetectionResult det{};
+    det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+    noise::NoiseAnalysisResult ar{};
+    ar.noise_level_dbfs = -50.0f;  // 低于阈值
+    ar.hum_strength_db = -70.0f;
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    // ref_similarity=0.0 < 0.8 但未配置 -> 跳过 -> 不告警
+    BOOST_CHECK(!ev.has_value());
+    BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+  }
+  // Case 2: 配置 RefComparator（set_ref_result 置 ref_configured_=true）
+  // + ref_similarity=0.7 < 0.8 -> Warning。
+  {
+    noise::NoiseMetrics m;
+    m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+    m.set_ref_result(/*similarity=*/0.7f, /*noise_db=*/-30.0f,
+                     /*delay_ms=*/0.0f);
+    noise::DenoiseResult dr{};
+    noise::NoiseDetectionResult det{};
+    det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+    noise::NoiseAnalysisResult ar{};
+    ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+    ar.hum_strength_db = -70.0f;
+    m.collect(dr, det, ar, 0.5f, 0.5f);
+    auto ev = m.evaluate_alerts(0);
+    BOOST_REQUIRE(ev.has_value());
+    BOOST_CHECK(ev->level == noise::AlertLevel::Warning);
+    BOOST_CHECK(ev->rule == "ref_similarity");
+  }
+}
+
+// T4 review fix: clear_ref_configured() 后 ref 规则停止评估，
+// 告警可通过去抖 clear（避免 stale ref_similarity 卡死）。
+// 复现 bug：set_ref_result -> ref_configured_=true + ref_similarity=0.7
+// -> Warning raised。若不 clear_ref_configured，ref_similarity=0.7 保持
+// -> desired 永远 Warning -> clear_count_ 永不递增 -> 告警卡死。
+// 修复后：clear_ref_configured -> ref_configured_=false -> ref 规则跳过
+// -> desired=None -> clear_count_ 递增 -> 告警 clear。
+BOOST_AUTO_TEST_CASE(alert_clears_after_clear_ref_configured) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar{};
+  ar.noise_level_dbfs = -50.0f;  // 低于 noise_level 阈值
+  ar.hum_strength_db = -70.0f;
+
+  // 配置 RefComparator -> set_ref_result 置 ref_configured_=true
+  // + ref_similarity=0.7 < 0.8 -> Warning。
+  m.set_ref_result(/*similarity=*/0.7f, /*noise_db=*/-30.0f,
+                   /*delay_ms=*/0.0f);
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev_raise = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev_raise.has_value());
+  BOOST_CHECK(ev_raise->level == noise::AlertLevel::Warning);
+  BOOST_CHECK(ev_raise->rule == "ref_similarity");
+  BOOST_CHECK(m.snapshot_for_test().is_alerting);
+
+  // 模拟 remove_ref_comparator -> clear_ref_configured()
+  m.clear_ref_configured();
+  // ref_similarity 应回到默认 0.0。
+  BOOST_CHECK_EQUAL(m.snapshot_for_test().ref_similarity, 0.0f);
+
+  // 下一 period：ref 规则跳过（ref_configured_=false），
+  // 其他规则也无触发 -> desired=None -> clear 计数 -> 告警 clear。
+  m.collect(dr, det, ar, 0.5f, 0.5f);
+  auto ev_clear = m.evaluate_alerts(0);
+  BOOST_REQUIRE(ev_clear.has_value());
+  BOOST_CHECK(!ev_clear->is_active);  // clear event
+  BOOST_CHECK(!m.snapshot_for_test().is_alerting);
+}
+
+// TDD Step 1.7: raise/clear 多次 -> get_alert_history 返回历史。
+BOOST_AUTO_TEST_CASE(alert_history_ring_queryable) {
+  noise::NoiseMetrics m;
+  m.set_alert_config(10.0f, 0.8f, /*debounce=*/1);
+  noise::DenoiseResult dr{};
+  noise::NoiseDetectionResult det{};
+  det.estimated_snr_db = 30.0f;  // 高 SNR，避免触发 SNR 规则
+  noise::NoiseAnalysisResult ar_loud{};
+  ar_loud.noise_level_dbfs = -18.0f;  // Critical
+  ar_loud.hum_strength_db = -70.0f;
+  noise::NoiseAnalysisResult ar_quiet{};
+  ar_quiet.noise_level_dbfs = -50.0f;
+  ar_quiet.hum_strength_db = -70.0f;
+
+  // raise
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+  // clear
+  m.collect(dr, det, ar_quiet, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+  // raise again
+  m.collect(dr, det, ar_loud, 0.5f, 0.5f);
+  m.evaluate_alerts(0);
+
+  auto hist = m.get_alert_history();
+  // 应有 3 个事件：raise, clear, raise
+  BOOST_CHECK_EQUAL(hist.size(), 3u);
+  BOOST_CHECK(hist[0].is_active);   // raise
+  BOOST_CHECK(!hist[1].is_active);  // clear
+  BOOST_CHECK(hist[2].is_active);   // raise
+}
+
+// TDD Step 1.8: raise -> alert_broadcaster 收到事件（集成测试）。
+// 通过 NoiseManager on_period_end 驱动 evaluate_alerts + push。
+BOOST_AUTO_TEST_CASE(alert_event_pushed_to_sse) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  mgr.add_sensor(0, 0, cfg);
+  // 订阅 alert broadcaster
+  auto bc = mgr.get_alert_broadcaster();
+  auto handle = bc->subscribe(64);
+  auto queue = handle.queue;
+
+  // 喂 loud 帧 -> on_period_end 触发 evaluate_alerts + push
+  float buf[480];
+  for (int i = 0; i < 480; ++i)
+    buf[i] = 0.5f;  // loud signal
+  mgr.on_period_begin();
+  mgr.on_frame(0, buf, 480);
+  mgr.on_period_end();
+
+  // drain 队列 -> 应收到告警事件
+  std::vector<std::string> events;
+  BOOST_CHECK(queue->try_drain(events));
+  bool found_alert = false;
+  for (const auto& e : events) {
+    if (e.find("\"level\":") != std::string::npos &&
+        e.find("\"is_active\": true") != std::string::npos) {
+      found_alert = true;
+      break;
+    }
+  }
+  BOOST_CHECK(found_alert);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

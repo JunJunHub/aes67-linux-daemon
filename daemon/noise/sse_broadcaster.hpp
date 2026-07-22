@@ -124,6 +124,12 @@ class SseBroadcaster {
   // 锁外遍历各队列 try_push（满或锁竞争则 drop，不阻塞）。
   void push(const std::string& event);
 
+  // capture 线程（RT）：快速判断是否有订阅者。无订阅者时调用方跳过编码
+  // （Spec4 T3 review Important 2：消除 idle RT 编码开销）。
+  // 非阻塞：持 subscribers_mutex_ 检查 vector empty（与 subscriber_count 同
+  // 短临界区，~ns 级）。不分配、不阻塞。
+  bool has_subscribers() const;
+
   // 监控/测试：当前订阅者数量。
   size_t subscriber_count() const;
 

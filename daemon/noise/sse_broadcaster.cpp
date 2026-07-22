@@ -110,6 +110,13 @@ void SseBroadcaster::push(const std::string& event) {
   }
 }
 
+bool SseBroadcaster::has_subscribers() const {
+  // 短临界区：仅检查 vector empty，不分配不阻塞（RT 安全）。
+  // 与 subscriber_count() 同模式，但省去返回 size 的开销（虽然差异可忽略）。
+  std::lock_guard<std::mutex> lock(subscribers_mutex_);
+  return !subscribers_.empty();
+}
+
 size_t SseBroadcaster::subscriber_count() const {
   std::lock_guard<std::mutex> lock(subscribers_mutex_);
   return subscribers_.size();

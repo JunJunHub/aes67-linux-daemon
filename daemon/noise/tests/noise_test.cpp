@@ -2412,6 +2412,25 @@ BOOST_AUTO_TEST_CASE(broadcaster_push_no_subscribers) {
   BOOST_CHECK_EQUAL(bc.total_dropped(), 0u);
 }
 
+// T3 review fix: has_subscribers() 守卫 -- RT 路径用此跳过 idle 编码。
+BOOST_AUTO_TEST_CASE(broadcaster_has_subscribers_reflects_state) {
+  noise::SseBroadcaster bc;
+  // 初始无订阅者
+  BOOST_CHECK(!bc.has_subscribers());
+  // subscribe 后有订阅者
+  auto h1 = bc.subscribe();
+  BOOST_CHECK(bc.has_subscribers());
+  // 多订阅者
+  auto h2 = bc.subscribe();
+  BOOST_CHECK(bc.has_subscribers());
+  // 注销一个仍有订阅者
+  bc.unsubscribe(h1.id);
+  BOOST_CHECK(bc.has_subscribers());
+  // 全部注销后无订阅者
+  bc.unsubscribe(h2.id);
+  BOOST_CHECK(!bc.has_subscribers());
+}
+
 // TDD Step 1.6: 并发 push/drain 不 crash + 不阻塞（RT 非阻塞压力）。
 // 一线程高速 push（模拟 capture on_period_end），另一线程 drain
 // （模拟 SSE handler）。验证 push 线程不被 drain 阻塞（try_lock 失败时

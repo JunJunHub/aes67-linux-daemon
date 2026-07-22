@@ -431,12 +431,9 @@ class NoiseManager {
   mutable std::mutex sse_mutex_;
   // 全局告警 broadcaster（T4 push，T3 仅创建实例 + 提供 accessor）。
   SseBroadcaster alert_broadcaster_;
-  // metrics push 节拍控制：复用 kHistorySampleIntervalFrames（~1s）。
-  // on_period_end 递增 metrics_push_counter_，每 N 次 push 一次 metrics 快照。
-  size_t metrics_push_counter_{0};
 
-  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 后）：
-  // push metrics 快照（~1s 节拍）+ PCM chunk（每 period）到对应 broadcaster。
+  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 前）：
+  // push metrics 快照 + PCM chunk（每 period）到对应 broadcaster。
   // 非阻塞：SseBroadcaster::push 内部 try_lock + drop-oldest（风险 9/17）。
   void push_sse_events(const SensorTable& table);
 };

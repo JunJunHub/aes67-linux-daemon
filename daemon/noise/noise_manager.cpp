@@ -1117,7 +1117,9 @@ void NoiseManager::push_sse_events(const SensorTable& table) {
       continue;
 
     // metrics push（每 period，~128ms 间隔）
-    if (bc->metrics && ctx.metrics) {
+    // Spec4 T3 review Important 2：has_subscribers() 守卫消除 idle RT 编码。
+    // 无 SSE 订阅者时跳过 get_snapshot + JSON 组装 + push（零堆分配）。
+    if (bc->metrics && ctx.metrics && bc->metrics->has_subscribers()) {
       NoiseMetricsSnapshot snap = ctx.metrics->get_snapshot();
       // 组装 SSE 事件 JSON（与 metrics_to_json 同字段，外加 sensor_id）。
       // 手工拼接（reuse noise_http.cpp escape_json 模式，但此处字段值
@@ -1151,7 +1153,8 @@ void NoiseManager::push_sse_events(const SensorTable& table) {
       const DenoiseOutput* out = ctx.denoise->get_output();
       if (out != nullptr && out->frame_count > 0) {
         // denoised PCM
-        if (bc->pcm_denoised && out->denoised != nullptr) {
+        if (bc->pcm_denoised && out->denoised != nullptr &&
+            bc->pcm_denoised->has_subscribers()) {
           std::string s16 =
               float_to_s16_le_bytes(out->denoised, out->frame_count);
           std::string b64 = base64_encode(s16.data(), s16.size());
@@ -1163,7 +1166,8 @@ void NoiseManager::push_sse_events(const SensorTable& table) {
           bc->pcm_denoised->push(event);
         }
         // noise PCM
-        if (bc->pcm_noise && out->noise != nullptr) {
+        if (bc->pcm_noise && out->noise != nullptr &&
+            bc->pcm_noise->has_subscribers()) {
           std::string s16 = float_to_s16_le_bytes(out->noise, out->frame_count);
           std::string b64 = base64_encode(s16.data(), s16.size());
           std::string event = "data: {\"sensor_id\": " +

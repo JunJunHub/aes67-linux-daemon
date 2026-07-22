@@ -1257,11 +1257,22 @@ BOOST_AUTO_TEST_CASE(sse_alerts_endpoint_connects) {
   cli.set_read_timeout(5);
 
   SseCollector collector;
+  // response_handler 在 content_receiver 之前被调用，此时 Response 已含
+  // status + headers（含 Content-Type）。capture 后即使 content_receiver
+  // 返回 false 导致 Result 为 nullptr，status/Content-Type 仍可断言。
+  int status_code = 0;
+  std::string content_type;
   std::thread receiver([&]() {
-    cli.Get("/api/noise/alerts/sse",
-            [&collector](const char* data, size_t len) -> bool {
-              return collector(data, len);
-            });
+    cli.Get(
+        "/api/noise/alerts/sse",
+        [&status_code, &content_type](const httplib::Response& res) {
+          status_code = res.status;
+          content_type = res.get_header_value("Content-Type");
+          return true;  // 继续到 content_receiver
+        },
+        [&collector](const char* data, size_t len) -> bool {
+          return collector(data, len);
+        });
   });
 
   // 等 1s 确认连接稳定（无 crash）
@@ -1269,8 +1280,15 @@ BOOST_AUTO_TEST_CASE(sse_alerts_endpoint_connects) {
   collector.stop.store(true);
   receiver.join();
 
-  // alerts 端点应可连（T4 前 0 事件，但不应 crash）
-  BOOST_TEST_MESSAGE("sse_alerts: events=" << collector.event_count.load());
+  // alerts 端点应返回 200 + text/event-stream（T4 前 0 事件，但握手成功）
+  BOOST_REQUIRE_MESSAGE(status_code != 0, "server returned response headers");
+  BOOST_CHECK_EQUAL(status_code, 200);
+  BOOST_CHECK_MESSAGE(
+      content_type.find("text/event-stream") != std::string::npos,
+      "Content-Type: " << content_type);
+  BOOST_TEST_MESSAGE("sse_alerts: events=" << collector.event_count.load()
+                                           << " status=" << status_code
+                                           << " Content-Type=" << content_type);
 }
 
 // T3 Step 5.6: 多订阅者并发 - 两个客户端同时连同一 metrics SSE。

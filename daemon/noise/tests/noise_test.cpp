@@ -2346,6 +2346,81 @@ BOOST_AUTO_TEST_CASE(ref_comparator_remove_clears_ref_metrics) {
   BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
 }
 
+// Spec4 T4 review fix：多 comparator 共享同一 cmp_sink 时，移除一个不清
+// ref_configured_（仍有 comparator 监控），移除最后一个才清。验证精确
+// per-cmp_sink 条件（非"全部移除"stopgap）。
+BOOST_AUTO_TEST_CASE(ref_comparator_shared_cmp_sink_partial_remove_keeps_ref) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  // 三个 sensor：sink 0/2 = ref 源，sink 1 = cmp（被 A、B 共同监控）。
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  mgr.add_sensor(1, 1, noise::NoiseSensorConfig{});
+  mgr.add_sensor(2, 2, noise::NoiseSensorConfig{});
+  // A: ref_sink=0, cmp_sink=1；B: ref_sink=2, cmp_sink=1（共享 cmp_sink=1）。
+  uint8_t cid_a = mgr.add_ref_comparator(0, 1);
+  uint8_t cid_b = mgr.add_ref_comparator(2, 1);
+  BOOST_CHECK_NE(cid_a, 0u);
+  BOOST_CHECK_NE(cid_b, 0u);
+
+  // 喂帧 -> comparison 线程写入 sensor 1 的 ref_*（A、B 都写）。
+  constexpr size_t kFrameSize = 480;
+  constexpr size_t kTotalFrames = 200;  // ~2s @100fps
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    uint32_t seed = static_cast<uint32_t>(f + 1);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float nz = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + nz;
+    }
+    mgr.on_frame(0, ref_frame, kFrameSize);
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_frame(2, ref_frame, kFrameSize);  // B 的 ref 源
+    mgr.on_period_end();
+  }
+  bool done = mgr.wait_comparison_done_for_test(3000);
+  BOOST_CHECK(done);
+
+  // sensor 1 的 ref_similarity 被写入（A 或 B 写入，> 0）。
+  noise::NoiseMetricsSnapshot snap;
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);
+
+  // 移除 A（B 仍监控 cmp_sink=1）-> sensor 1 的 ref_* 不应清除。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid_a));
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_GT(snap.ref_similarity, 0.0f);  // 仍被 B 写入，未清
+
+  // 再喂帧让 B 继续刷新（确认仍 active，非 stale 残留）。
+  for (size_t f = 0; f < kTotalFrames; ++f) {
+    mgr.on_period_begin();
+    float ref_frame[kFrameSize];
+    float cmp_frame[kFrameSize];
+    synth::speech_like(ref_frame, kFrameSize);
+    uint32_t seed = static_cast<uint32_t>(f + 501);
+    for (size_t i = 0; i < kFrameSize; ++i) {
+      seed = seed * 1103515245u + 12345u;
+      float nz = (static_cast<float>(seed >> 16) / 65535.0f - 0.5f) * 0.05f;
+      cmp_frame[i] = ref_frame[i] + nz;
+    }
+    mgr.on_frame(1, cmp_frame, kFrameSize);
+    mgr.on_frame(2, ref_frame, kFrameSize);  // B 的 ref 源
+    mgr.on_period_end();
+  }
+  BOOST_CHECK(mgr.wait_comparison_done_for_test(3000));
+
+  // 移除 B（最后一个监控 cmp_sink=1 的 comparator）-> sensor 1 的 ref_* 清除。
+  BOOST_CHECK(mgr.remove_ref_comparator(cid_b));
+  BOOST_CHECK(mgr.get_metrics_snapshot(1, snap));
+  BOOST_CHECK_EQUAL(snap.ref_similarity, 0.0f);
+  BOOST_CHECK_EQUAL(snap.ref_noise_db, -100.0f);
+  BOOST_CHECK_EQUAL(snap.ref_delay_ms, 0.0f);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 // 架构依据：docs/superpowers/specs/noise-spec4-design.md D-S4.1 +
 //   docs/noise/architecture-design.md §11 风险 9/17。

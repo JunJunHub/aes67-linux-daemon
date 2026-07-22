@@ -79,7 +79,7 @@
   - float [-1,1] -> int16_t：`s16 = clamp(f * 32767, -32768, 32767)`（与 Bridge S16->float demux 的逆，scaling *32768 一致，见 Spec2 RNNoise scaling）。
 - 降噪/噪声路仅在该 Sink 已启用 noise sensor 且 denoise 开启时可用，否则 404（既有 AAC 路同规则，PCM 分支复用）。
 - 48k-only（D-S4.6）：Phase 1 48kHz 限制延续；非原生 48kHz 回采留 Phase 3.1。原始路若取原生帧则按原生采样率，但 Phase 1 原生即 48k。
-- `#ifdef _USE_NOISE_` 守卫：PCM 分支中降噪/噪声路在守卫内；原始路 PCM 分支 WITH_NOISE=OFF 也可用（与既有原始 AAC 路一致）。
+- `#ifdef _USE_NOISE_` 守卫：三路 PCM 分支统一在 `#ifdef _USE_NOISE_` 内（PCM 直通经 `DenoiseOutput` 统一三路接口，D-S4.6，WITH_NOISE=ON-only 噪声特性）。WITH_NOISE=OFF 时原始路 `?format=pcm` 走既有 AAC 默认路径（query 被忽略，不回归）；AAC 默认路径（无 `?format=pcm`）byte-for-byte 不变（D-S4.8）。
 
 - [ ] **Step 1: 写失败测试** - 追加 `daemon_test.cpp`（需 in-process daemon，FAKE_DRIVER）：
   - `pcm_passthrough_original`：curl `/api/streamer/stream/0?format=pcm` -> `Content-Type: audio/pcm` + 解码 int16 回 float 等价原始帧。

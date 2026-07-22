@@ -38,7 +38,7 @@
 
 - **D-S4.5 SSE 端点集**（arch §5.1 + 新增）：`/denoised`、`/noise` PCM base64 SSE 是 arch §5.1 已定义端点（Spec3 未实现，本 T3 落地）；新增 `/api/noise/sensor/:id/metrics/sse`（指标快照）+ `/api/noise/alerts/sse`（告警事件，T4 用）。metrics SSE ~1s/event（复用 `kHistorySampleIntervalFrames` 节拍）；PCM SSE 每 period 一 chunk。
 
-- **D-S4.6 PCM 直通 = 48k-only**（arch §5.2 + 风险 1）：三路 `?format=pcm` 取 `DenoiseOutput`（48k）。Phase 1 的 48kHz 限制延续至 PCM 直通；非原生 48kHz 的回采留 Phase 3.1（resampler.hpp）。原始路 PCM 可从 `PcmCaptureService` 原生帧或 `DenoiseOutput.original` 取（后者统一三路接口，arch §3.4 L649）。
+- **D-S4.6 PCM 直通 = 48k-only，统一三路（WITH_NOISE=ON-only）**（arch §5.2 + 风险 1）：三路 `?format=pcm` 统一经 `DenoiseOutput`（48k）取帧--原始路取 `DenoiseOutput.original`、降噪路取 `denoised`、噪声路取 `noise`（arch §3.4 L649 统一三路接口）。Phase 1 的 48kHz 限制延续至 PCM 直通；非原生 48kHz 的回采留 Phase 3.1（resampler.hpp）。因统一经 `DenoiseOutput`（依赖 `noise_manager_` 与已注册 sensor），**三路 PCM 直通均为 WITH_NOISE=ON-only**（PCM 直通作为 noise 特性）；WITH_NOISE=OFF 时原始路 `?format=pcm` 走既有 AAC 默认路径（query 被忽略，不回归），denoised/noise 路 WITH_NOISE=OFF 时不编译。AAC 默认路径（无 `?format=pcm`）byte-for-byte 不变（D-S4.8）。
 
 - **D-S4.7 持久化健壮性 = 补全既有降级 + 新增一致性**：`load_status` 已有 `json_parser_error`/`std::exception` catch（noise_manager.cpp:601-606）并日志，T1 补全"parse 失败后以空配置继续启动不阻塞"的显式语义 + 单测覆盖；`save_status` 加 mutex（control 写 + HTTP 经 `get_metrics_snapshot` 读已 RCU/mutex，持久化写需独立锁防与变更即写并发）；`NoiseTemplateDB::load` 逐条检查 WAV 文件存在（风险 15），缺失标记 `wav_available=false` + 告警，bark 特征向量保留可匹配，仅回听不可用。
 

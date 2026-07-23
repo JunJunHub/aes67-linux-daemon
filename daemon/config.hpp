@@ -71,6 +71,10 @@ class Config {
   const std::string& get_noise_template_dir() const {
     return noise_template_dir_;
   };
+  // Spec5 T2：ONNX 模型目录（dtln/deepfilternet 推导模型路径）。
+  const std::string& get_onnx_model_dir() const {
+    return onnx_model_dir_;
+  };
   const std::string& get_fake_pcm_source() const { return fake_pcm_source_; };
   const std::string& get_interface_name() const { return interface_name_; };
   const std::string& get_interface_name(uint8_t idx) const {
@@ -164,6 +168,10 @@ class Config {
   void set_noise_template_dir(std::string_view noise_template_dir) {
     noise_template_dir_ = noise_template_dir;
   };
+  // Spec5 T2：ONNX 模型目录 setter。
+  void set_onnx_model_dir(std::string_view onnx_model_dir) {
+    onnx_model_dir_ = onnx_model_dir;
+  };
   void set_fake_pcm_source(std::string_view fake_pcm_source) {
     fake_pcm_source_ = fake_pcm_source;
   };
@@ -219,6 +227,7 @@ class Config {
            lhs.get_status_file() != rhs.get_status_file() ||
            lhs.get_noise_status_file() != rhs.get_noise_status_file() ||
            lhs.get_noise_template_dir() != rhs.get_noise_template_dir() ||
+           lhs.get_onnx_model_dir() != rhs.get_onnx_model_dir() ||
            lhs.get_fake_pcm_source() != rhs.get_fake_pcm_source() ||
            lhs.get_interface_name() != rhs.get_interface_name() ||
            lhs.get_mdns_enabled() != rhs.get_mdns_enabled() ||
@@ -260,6 +269,8 @@ class Config {
   // 空字符串禁用对应持久化（save_status / TemplateDB::save 为 no-op）。
   std::string noise_status_file_{"./noise_status.json"};
   std::string noise_template_dir_{"./noise_templates"};
+  // Spec5 T2：ONNX 模型目录（默认 ./noise_models，与 download_models.sh 目标一致）。
+  std::string onnx_model_dir_{"./noise_models"};
   // FAKE_DRIVER 专用：PcmCaptureService::fake_capture_loop 替代 PCM 数据源。
   // 空字符串=内置静音帧。仅 FAKE_DRIVER 生效，真实模式忽略。
   std::string fake_pcm_source_{""};

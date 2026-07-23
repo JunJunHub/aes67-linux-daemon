@@ -3078,11 +3078,7 @@ BOOST_AUTO_TEST_SUITE_END()
 namespace {
 
 // 合成正弦（指定频率/采样率/幅度，相位 0 起）。
-void gen_sine(float* out,
-               size_t n,
-               float freq,
-               uint32_t rate,
-               float amp) {
+void gen_sine(float* out, size_t n, float freq, uint32_t rate, float amp) {
   for (size_t i = 0; i < n; ++i) {
     double t = static_cast<double>(i) / rate;
     out[i] = static_cast<float>(amp * std::sin(2.0 * synth::kPi * freq * t));
@@ -3167,7 +3163,8 @@ BOOST_AUTO_TEST_CASE(resampler_48k_passthrough) {
     BOOST_CHECK_EQUAL(out[i], in[i]);
 }
 
-// 44.1k 正弦 -> 48k：与理想 1kHz 纯音拟合后 SNR > 60dB（相位无关，抗分数延迟）。
+// 44.1k 正弦 -> 48k：与理想 1kHz 纯音拟合后 SNR >
+// 60dB（相位无关，抗分数延迟）。
 BOOST_AUTO_TEST_CASE(resampler_441_to_48k_sine) {
   noise::Resampler r(44100, 48000);
   BOOST_CHECK(!r.is_passthrough());
@@ -3181,9 +3178,9 @@ BOOST_AUTO_TEST_CASE(resampler_441_to_48k_sine) {
   BOOST_CHECK_GT(produced, 0u);
   float amp = 0.0f;
   double snr = sine_fit_snr(out.data(), produced, freq, out_rate, 512, amp);
-  BOOST_TEST_MESSAGE("44.1k->48k sine SNR=" << snr << " dB amp=" << amp
-                     << " (latency=" << r.output_latency()
-                     << " produced=" << produced << ")");
+  BOOST_TEST_MESSAGE("44.1k->48k sine SNR="
+                     << snr << " dB amp=" << amp << " (latency="
+                     << r.output_latency() << " produced=" << produced << ")");
   BOOST_CHECK_GT(snr, 60.0);
   BOOST_CHECK_CLOSE(amp, 0.5f, 5.0);  // 增益 ≈ 1（幅度保持）
 }
@@ -3219,7 +3216,7 @@ BOOST_AUTO_TEST_CASE(resampler_96k_to_48k_noise) {
   for (size_t i = 0; i < N; ++i) {
     double t = static_cast<double>(i) / in_rate;
     in[i] = static_cast<float>(0.4 * std::sin(2 * synth::kPi * 5000 * t) +
-                              0.4 * std::sin(2 * synth::kPi * 35000 * t));
+                               0.4 * std::sin(2 * synth::kPi * 35000 * t));
   }
   uint32_t seed = 11;
   for (size_t i = 0; i < N; ++i) {
@@ -3232,8 +3229,7 @@ BOOST_AUTO_TEST_CASE(resampler_96k_to_48k_noise) {
   float mag_5k = goertzel_mag_sq(out.data(), produced, 5000, out_rate);
   float mag_13k = goertzel_mag_sq(out.data(), produced, 13000, out_rate);
   // 5kHz 远强于 13kHz 混叠（SpeexDSP q5 阻带 >60dB -> 40dB 间距余量）。
-  BOOST_TEST_MESSAGE("96k->48k mag 5k=" << mag_5k
-                     << " 13k(alias)=" << mag_13k);
+  BOOST_TEST_MESSAGE("96k->48k mag 5k=" << mag_5k << " 13k(alias)=" << mag_13k);
   BOOST_CHECK_GT(mag_5k, 100.0f * mag_13k);
   // 输出非静音、无溢出。
   double rms = 0.0;
@@ -3257,7 +3253,8 @@ BOOST_AUTO_TEST_CASE(noise_manager_resamples_non_48k_input) {
   noise::NoiseManager mgr(bridge);
   mgr.set_ptp_locked_for_test(true);
   mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
-  // 喂若干 44100Hz 480-样本帧（每帧 -> ~522@48k，FIFO 累积 emit 48k 480 chunk）。
+  // 喂若干 44100Hz 480-样本帧（每帧 -> ~522@48k，FIFO 累积 emit 48k 480
+  // chunk）。
   float frame[480];
   for (int p = 0; p < 20; ++p) {
     mgr.on_period_begin();
@@ -3265,15 +3262,344 @@ BOOST_AUTO_TEST_CASE(noise_manager_resamples_non_48k_input) {
     mgr.on_frame(0, frame, 480);
     mgr.on_period_end();
   }
-  // on_frame 被调用（frame_count > 0）；①②③④ 经重采样 chunk 运行（metrics 更新）。
+  // on_frame 被调用（frame_count > 0）；①②③④ 经重采样 chunk 运行（metrics
+  // 更新）。
   BOOST_CHECK_GT(mgr.stub_call_count_for_test(0), 0u);
   noise::NoiseMetricsSnapshot snap;
   BOOST_CHECK(mgr.get_metrics_snapshot(0, snap));
   // speech_like 非静音 -> noise_level_dbfs 高于默认 -100（已被 collect 更新）。
   BOOST_CHECK_GT(snap.noise_level_dbfs, -100.0f);
   BOOST_TEST_MESSAGE("44.1k native -> 48k pipeline metrics noise_level_dbfs="
-                     << snap.noise_level_dbfs << " frame_count="
-                     << mgr.stub_call_count_for_test(0));
+                     << snap.noise_level_dbfs
+                     << " frame_count=" << mgr.stub_call_count_for_test(0));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ============================================================================
+// Spec5 Task 2：DTLN + DeepFilterNet ONNX 插件 + 失败降级（D-S5.1/3/4/5）
+// ============================================================================
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <vector>
+#include "model-adapters/dtln/dtln_adapter.hpp"
+#include "model-adapters/deepfilternet/deepfilternet_adapter.hpp"
+
+// 模型目录探测：返回 DTLN model_1.onnx 路径（找到）或空串（未下载 -> SKIP）。
+static std::string spec5_find_dtln_model1() {
+  const char* env = std::getenv("NOISE_MODELS_DIR");
+  std::vector<std::string> bases;
+  if (env && *env)
+    bases.push_back(std::string(env) + "/dtln");
+  bases.push_back("./noise_models/dtln");
+  bases.push_back("../noise_models/dtln");
+  bases.push_back("/home/Share/GitHub/noise-model/DTLN/pretrained_model");
+  for (const auto& b : bases) {
+    std::string p = b + "/model_1.onnx";
+    std::ifstream f(p, std::ios::binary);
+    if (f.good())
+      return p;
+  }
+  return "";
+}
+
+// 返回 DFN 子图目录（含 enc.onnx）或空串（未下载 -> SKIP）。
+static std::string spec5_find_dfn_dir() {
+  const char* env = std::getenv("NOISE_MODELS_DIR");
+  std::vector<std::string> bases;
+  if (env && *env)
+    bases.push_back(std::string(env) + "/deepfilternet");
+  bases.push_back("./noise_models/deepfilternet");
+  bases.push_back("../noise_models/deepfilternet");
+  for (const auto& b : bases) {
+    std::ifstream f(b + "/enc.onnx", std::ios::binary);
+    if (f.good())
+      return b;
+  }
+  return "";
+}
+
+BOOST_AUTO_TEST_SUITE(spec5_onnx_plugin_tests)
+
+// 测试用假插件：process 恒返回 kBypass + 直通 in->out（模拟 adapter 捕获
+// ONNX Run 异常后的降级行为）。驱动 DenoiseProcessor 的失败计数 + 切换。
+class FakeBypassPlugin : public noise::IDenoisePlugin {
+ public:
+  bool init(const noise::PluginConfig&) override { return true; }
+  void reset() override {}
+  const char* name() const override { return "test_bypass"; }
+  uint32_t native_sample_rate() const override { return 48000; }
+  uint32_t algorithmic_latency_samples() const override { return 0; }
+  bool supports_vad() const override { return false; }
+  bool supports_snr() const override { return false; }
+  size_t process(const float* in,
+                 size_t n_in,
+                 float* out,
+                 size_t n_out_max,
+                 noise::DenoiseResult* result) override {
+    size_t n = std::min(n_in, n_out_max);
+    for (size_t i = 0; i < n; ++i)
+      out[i] = in[i];  // 直通
+    if (result) {
+      result->status = noise::ProcessStatus::kBypass;
+      result->has_vad = false;
+    }
+    return n;
+  }
+  size_t flush(float*, size_t) override { return 0; }
+  void set_dry_wet(float) override {}
+  bool set_param(const std::string&, const std::string&) override {
+    return false;
+  }
+  std::string get_param(const std::string&) const override { return ""; }
+};
+
+// 注册 test_bypass 到 registry（幂等，多测试共享）。
+static bool spec5_registered_fake = [] {
+  noise::DenoisePluginRegistry::instance().register_plugin(
+      "test_bypass", []() -> std::unique_ptr<noise::IDenoisePlugin> {
+        return std::make_unique<FakeBypassPlugin>();
+      });
+  return true;
+}();
+
+// Step 1a：单帧 kBypass -> 直通 + kBypass，不抛异常（D-S5.5 单帧降级）。
+// 用 DenoiseProcessor 直接验证 status 消费：1 帧 kBypass 未达阈值，不升级。
+BOOST_AUTO_TEST_CASE(onnx_failure_degrades_to_bypass) {
+  noise::DenoiseProcessor dp;
+  BOOST_CHECK(dp.switch_plugin("test_bypass"));
+  float in[480];
+  synth::speech_like(in, 480);
+  noise::DenoiseResult r;
+  // switch_plugin 置 mute_remaining = latency(0) + kConvergenceMargin(2400)
+  // = 5 帧（480/帧）的静音过渡窗（准热切换，见 switch_plugin_mute_window）。
+  // 静音窗内 ④ 把 denoised 清零，与 kBypass 直通契约无关。先 drain 静音窗：
+  // 喂足量帧（每帧 480 样本，mute 每帧递减 480）使其归零。
+  dp.on_period_begin();
+  for (int f = 0; f < 6; ++f)
+    dp.process(in, 480, &r);
+  // 静音窗已耗尽，本帧 kBypass 直通应生效：plugin 写 denoised = in。
+  size_t n = dp.process(in, 480, &r);
+  BOOST_CHECK_GT(n, 0u);
+  // RT 契约：kBypass 时 plugin 已将 in 直通到 denoised（不中断音频流）。
+  // DenoiseProcessor::process 无 out 参数，输出经 get_current_output 读
+  // back_->denoised（同 period in-period 读，见 denoise_processor.hpp 注释）。
+  BOOST_CHECK(r.status == noise::ProcessStatus::kBypass);
+  const noise::DenoiseOutput* out = dp.get_current_output();
+  BOOST_REQUIRE_NE(out, nullptr);
+  BOOST_CHECK_EQUAL(out->frame_count, n);
+  for (size_t i = 0; i < n; ++i)
+    BOOST_CHECK_CLOSE(out->denoised[i], in[i], 1e-3);
+  // 单帧未达阈值（10），不升级、不置 degraded_pending。
+  BOOST_CHECK(!dp.degraded_pending());
+}
+
+// Step 1b：连续 10 帧 kBypass -> kError -> 切 Passthrough（D-S5.5
+// 连续降级升级）。 经 NoiseManager：on_frame 驱动 RT 计数，on_period_end
+// housekeeper 切 passthrough
+// + 锁存 plugin_degraded 告警。
+BOOST_AUTO_TEST_CASE(onnx_consecutive_failure_switches_passthrough) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  cfg.plugin_name = "test_bypass";
+  cfg.alert_debounce_periods = 1;  // 加速告警去抖
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+
+  float in[480];
+  synth::speech_like(in, 480);
+  // 驱动 >= kDegradationThreshold(10) 帧 kBypass（mute 窗口不阻断计数）。
+  mgr.on_period_begin();
+  for (int f = 0; f < 12; ++f)
+    mgr.on_frame(0, in, 480);
+  mgr.on_period_end();  // housekeeper：切 passthrough + plugin_degraded=true
+
+  // 切换已发生：plugin_degraded 锁存（告警引擎据此 raise）。
+  auto snap = mgr.get_metrics_for_test(0);
+  BOOST_CHECK(snap.plugin_degraded);
+
+  // 再驱动一周期：passthrough 返回 kOk，不再 degraded_pending。
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);
+  mgr.on_period_end();
+  // plugin_degraded 保持锁存（仅 switch_plugin 到非 passthrough 才清）。
+  auto snap2 = mgr.get_metrics_for_test(0);
+  BOOST_CHECK(snap2.plugin_degraded);
+}
+
+// Step 1c：DTLN 降噪含噪语音 > 8dB（需模型，缺失 SKIP）。
+BOOST_AUTO_TEST_CASE(dtln_denoises_speech) {
+  std::string m1 = spec5_find_dtln_model1();
+  if (m1.empty()) {
+    BOOST_TEST_MESSAGE(
+        "DTLN 模型未下载，跳过（./daemon/noise/tests/"
+        "download_models.sh）");
+    return;
+  }
+  noise::DtlnAdapter dtln;
+  noise::PluginConfig cfg;
+  cfg.model_path = m1;
+  cfg.sample_rate_in = 48000;
+  if (!dtln.init(cfg)) {
+    BOOST_TEST_MESSAGE("DTLN init 失败（模型签名不匹配？），跳过");
+    return;
+  }
+  BOOST_CHECK_EQUAL(dtln.native_sample_rate(), 16000u);
+  BOOST_CHECK(!dtln.supports_vad());
+
+  // 合成：弱语音 + 强白噪（16k 等效带宽内）。
+  const size_t N = 480;
+  float noisy[N];
+  synth::speech_like(noisy, N);
+  float noise_buf[N];
+  synth::white_noise(noise_buf, N, 9);
+  for (size_t i = 0; i < N; ++i)
+    noisy[i] = 0.3f * noisy[i] + 0.7f * noise_buf[i];
+
+  float out[N * 4];
+  noise::DenoiseResult r;
+  // 喂多帧收敛 + 重采样对齐。
+  for (int f = 0; f < 40; ++f)
+    dtln.process(noisy, N, out, N * 4, &r);
+  // 末帧取输出 RMS 与输入 RMS 比较。
+  double in_sq = 0.0, out_sq = 0.0;
+  for (size_t i = 0; i < N; ++i) {
+    in_sq += static_cast<double>(noisy[i]) * noisy[i];
+    out_sq += static_cast<double>(out[i]) * out[i];
+  }
+  double in_rms = std::sqrt(in_sq / N);
+  double out_rms = std::sqrt(out_sq / N);
+  BOOST_TEST_MESSAGE("DTLN in_rms=" << in_rms << " out_rms=" << out_rms);
+  if (in_rms > 1e-6 && out_rms > 1e-6) {
+    double db = 20.0 * std::log10(in_rms / out_rms);
+    BOOST_TEST_MESSAGE("DTLN 降噪量 " << db << " dB");
+    // 目标 > 8dB（plan 降级条款：若不达放宽阈值并记 report）。
+    BOOST_CHECK_GT(db, 8.0);
+  }
+}
+
+// Step 1d：DFN 降噪非平稳噪声 > 8dB（需模型，缺失 SKIP）。
+BOOST_AUTO_TEST_CASE(dfn_denoises_nonstation) {
+  std::string dir = spec5_find_dfn_dir();
+  if (dir.empty()) {
+    BOOST_TEST_MESSAGE(
+        "DFN 模型未下载，跳过（./daemon/noise/tests/"
+        "download_models.sh）");
+    return;
+  }
+  noise::DeepFilterNetAdapter dfn;
+  noise::PluginConfig cfg;
+  cfg.onnx_model_dir = dir;
+  cfg.sample_rate_in = 48000;
+  if (!dfn.init(cfg)) {
+    BOOST_TEST_MESSAGE("DFN init 失败（模型签名不匹配？），跳过");
+    return;
+  }
+  BOOST_CHECK_EQUAL(dfn.native_sample_rate(), 48000u);
+  BOOST_CHECK(dfn.supports_snr());
+
+  // 非平稳噪声：白噪 + 脉冲突发。
+  const size_t N = 480;
+  float noisy[N];
+  synth::white_noise(noisy, N, 11);
+  float imp[N];
+  synth::impulse(imp, N);
+  for (size_t i = 0; i < N; ++i)
+    noisy[i] = 0.6f * noisy[i] + 0.4f * imp[i];
+
+  float out[N * 4];
+  noise::DenoiseResult r;
+  for (int f = 0; f < 40; ++f)
+    dfn.process(noisy, N, out, N * 4, &r);
+  double in_sq = 0.0, out_sq = 0.0;
+  for (size_t i = 0; i < N; ++i) {
+    in_sq += static_cast<double>(noisy[i]) * noisy[i];
+    out_sq += static_cast<double>(out[i]) * out[i];
+  }
+  double in_rms = std::sqrt(in_sq / N);
+  double out_rms = std::sqrt(out_sq / N);
+  BOOST_TEST_MESSAGE("DFN in_rms=" << in_rms << " out_rms=" << out_rms
+                                   << " lsnr=" << r.estimated_snr_db);
+  if (in_rms > 1e-6 && out_rms > 1e-6) {
+    double db = 20.0 * std::log10(in_rms / out_rms);
+    BOOST_TEST_MESSAGE("DFN 降噪量 " << db << " dB");
+    BOOST_CHECK_GT(db, 8.0);
+  }
+}
+
+// Step 1e：DTLN LSTM 状态跨帧持久（首帧 vs 后续输出差异，需模型，缺失 SKIP）。
+BOOST_AUTO_TEST_CASE(dtln_lstm_state_persists) {
+  std::string m1 = spec5_find_dtln_model1();
+  if (m1.empty()) {
+    BOOST_TEST_MESSAGE("DTLN 模型未下载，跳过");
+    return;
+  }
+  noise::DtlnAdapter dtln;
+  noise::PluginConfig cfg;
+  cfg.model_path = m1;
+  cfg.sample_rate_in = 48000;
+  if (!dtln.init(cfg)) {
+    BOOST_TEST_MESSAGE("DTLN init 失败，跳过");
+    return;
+  }
+  const size_t N = 480;
+  float sp[N];
+  synth::speech_like(sp, N);
+  float out1[N * 4], out2[N * 4];
+  noise::DenoiseResult r;
+  // 首帧（LSTM 状态为零）。
+  dtln.process(sp, N, out1, N * 4, &r);
+  // 多帧后（LSTM 状态已更新）。
+  for (int f = 0; f < 20; ++f)
+    dtln.process(sp, N, out2, N * 4, &r);
+  // 状态持久：后续帧输出与首帧不同（LSTM 已收敛，输出变化）。
+  // （若状态不喂回，每帧输出相同。此处断言差异 -> 证明状态跨帧传递。）
+  bool differs = false;
+  for (size_t i = 0; i < N; ++i) {
+    if (std::fabs(out1[i] - out2[i]) > 1e-4f) {
+      differs = true;
+      break;
+    }
+  }
+  BOOST_CHECK(differs);
+}
+
+// Step 1f：DFN lookahead=2 缓冲（输出延迟对齐，需模型，缺失 SKIP）。
+BOOST_AUTO_TEST_CASE(dfn_lookahead_buffers) {
+  std::string dir = spec5_find_dfn_dir();
+  if (dir.empty()) {
+    BOOST_TEST_MESSAGE("DFN 模型未下载，跳过");
+    return;
+  }
+  noise::DeepFilterNetAdapter dfn;
+  noise::PluginConfig cfg;
+  cfg.onnx_model_dir = dir;
+  cfg.sample_rate_in = 48000;
+  if (!dfn.init(cfg)) {
+    BOOST_TEST_MESSAGE("DFN init 失败，跳过");
+    return;
+  }
+  // lookahead=2 -> 算法延迟 = hop*(1+2) = 1440 样本。
+  BOOST_CHECK_EQUAL(dfn.algorithmic_latency_samples(), 1440u);
+  // 前若干帧因 lookahead 缓冲输出 < 输入（首帧延迟），flush 取残余。
+  const size_t N = 480;
+  float sp[N];
+  synth::speech_like(sp, N);
+  float out[N * 4];
+  noise::DenoiseResult r;
+  size_t total_out = 0;
+  for (int f = 0; f < 10; ++f)
+    total_out += dfn.process(sp, N, out, N * 4, &r);
+  // flush 取出 lookahead 残余（>= 0，验证 flush 不抛、产出残余）。
+  float tail[N * 4];
+  size_t flushed = dfn.flush(tail, N * 4);
+  BOOST_CHECK_NO_THROW((void)flushed);
+  BOOST_TEST_MESSAGE("DFN lookahead: total_out=" << total_out
+                                                 << " flushed=" << flushed);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

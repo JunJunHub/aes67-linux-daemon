@@ -39,6 +39,7 @@
 #include "noise/noise_http.hpp"
 #include "noise/noise_manager.hpp"
 #include "noise/noise_template_db.hpp"
+#include "noise/onnx_session.hpp"  // Spec5 T2：Ort::Env 生命周期装配
 #include "noise_session_manager_bridge.hpp"
 #include "pcm_capture_service.hpp"
 #endif
@@ -198,9 +199,16 @@ int main(int argc, char* argv[]) {
         throw std::runtime_error(
             std::string("PcmCaptureService:: create failed"));
       }
+      // Spec5 T2：Ort::Env 生命周期装配。Meyer's singleton 首次 touch 构造，
+      // 析构在程序静态析构阶段，晚于 NoiseManager（main shared_ptr 局部）持有
+      // 的所有 Ort::Session（§9.1）。必须在任何 CreateOnnxSession（即
+      // switch_plugin("dtln"/"deepfilternet") 触发的 adapter init）前完成。
+      // 同时注入 ONNX 模型目录到 NoiseManager（Config -> 各 sensor adapter）。
+      noise::OnnxEnv::instance();
       auto noise_bridge =
           std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
       auto noise_manager = std::make_shared<noise::NoiseManager>(*noise_bridge);
+      noise_manager->set_onnx_model_dir(config->get_onnx_model_dir());
       // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
       if (!config->get_noise_status_file().empty()) {
         noise_manager->load_status(config->get_noise_status_file());

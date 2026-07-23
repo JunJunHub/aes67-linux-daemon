@@ -133,6 +133,11 @@ struct NoiseMetricsSnapshot {
   // Spec4 T4：当前告警级别（引擎评估结果）。None=不告警。
   // 与 is_alerting 语义对应（level != None <-> is_alerting=true）。
   AlertLevel alert_level{AlertLevel::None};
+  // Spec5 T2：降噪插件已降级（ONNX 反复失败 -> 切 passthrough）。
+  // 由 NoiseManager housekeeper（on_period_end）在切 passthrough 后置 true，
+  // 在 switch_plugin 到非 passthrough 插件且该插件恢复 kOk 后清。告警引擎
+  // 据此评估 plugin_degraded 规则（Warning）。
+  bool plugin_degraded{false};
 };
 
 // ④NoiseMetrics - 聚合 ①②③ 链路结果到 NoiseMetricsSnapshot。
@@ -194,6 +199,14 @@ class NoiseMetrics {
     latest_.snr_alert_threshold_db = snr_threshold_db;
     latest_.ref_similarity_threshold = ref_similarity_threshold;
     latest_.alert_debounce_periods = debounce_periods;
+  }
+
+  // Spec5 T2：控制线程置/清 plugin_degraded 标志（housekeeper 切 passthrough
+  // 后置 true；switch_plugin 到非 passthrough 且恢复后清）。持 metrics_mutex_
+  // 与 collect 互斥。告警引擎 evaluate_alerts 据此评估 plugin_degraded 规则。
+  void set_plugin_degraded(bool degraded) {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    latest_.plugin_degraded = degraded;
   }
 
   // ── Spec4 T4：告警规则引擎（D-S4.2 + arch §3.6 规则表）──

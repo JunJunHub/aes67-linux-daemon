@@ -355,6 +355,11 @@ class NoiseManager {
   }
   const std::string& get_status_file_for_test() const { return status_file_; }
 
+  // Spec5 T2：注入 ONNX 模型目录（main.cpp 从 Config 注入）。add_sensor 时
+  // 转发到每个 DenoiseProcessor 的 current_config_.onnx_model_dir，供 dtln/
+  // deepfilternet init 推导模型路径。控制线程调用（main wiring，init 前）。
+  void set_onnx_model_dir(const std::string& dir) { onnx_model_dir_ = dir; }
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -390,6 +395,8 @@ class NoiseManager {
   // atomic: load_status (控制线程写) 与 save_status (控制线程读，由
   // add_sensor 内部调用) 跨函数但同线程，atomic 保证可见性。
   mutable std::atomic<bool> load_in_progress_{false};
+  // Spec5 T2：ONNX 模型目录（Config 注入，转发到 DenoiseProcessor）。
+  std::string onnx_model_dir_;
   // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
   // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
   // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，

@@ -13,6 +13,7 @@
 #ifndef NOISE_DENOISE_PROCESSOR_HPP_
 #define NOISE_DENOISE_PROCESSOR_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -51,6 +52,25 @@ class DenoiseProcessor {
   // 真正的 atomic<uint32_t>+memcpy 在 Task 4 RnnoiseAdapter 验证。
   void set_dry_wet(float ratio);
   bool set_param(const std::string& key, const std::string& value);
+  // Spec5 T2：注入 ONNX 模型目录到 current_config_（add_sensor 时由
+  // NoiseManager 调用），供 dtln/deepfilternet init 推导模型路径。
+  void set_onnx_model_dir(const std::string& dir) {
+    current_config_.onnx_model_dir = dir;
+  }
+
+  // ── Spec5 T2：ONNX 失败降级（D-S5.5）──
+  // process() 内对 plugin 返回的 result->status 计数：连续 kBypass 达阈值
+  // kDegradationThreshold(10) -> 升级为 kError + 置 degraded_pending_。
+  // 控制线程 housekeeper（on_period_end 经 NoiseManager）检查 degraded_pending_
+  // -> switch_plugin("passthrough") + 上报告警。RT 仅置原子标志，实际切换在
+  // 控制线程（switch_plugin 含 RcuPtr publish + retire，非 RT 安全；on_period_end
+  // 非每帧紧路径，罕见故障下可接受，旧 slot 经 retire 延迟回收避免 RT 析构）。
+  bool degraded_pending() const {
+    return degraded_pending_.load(std::memory_order_acquire);
+  }
+  void clear_degraded_pending() {
+    degraded_pending_.store(false, std::memory_order_release);
+  }
 
   // ── 音频线程：周期顶部 pin 一次，整周期复用，不每帧原子操作 ──
   void on_period_begin();
@@ -139,6 +159,10 @@ class DenoiseProcessor {
   size_t max_frame_{480};
   // 50ms @48k 收敛余量（架构 §4.2 L668）。
   static constexpr size_t kConvergenceMargin = 2400;
+  // Spec5 T2：连续 kBypass 阈值，达此升级为 kError（D-S5.5）。
+  static constexpr size_t kDegradationThreshold = 10;
+  size_t consecutive_bypass_count_{0};  // RT 线程写（process）
+  std::atomic<bool> degraded_pending_{false};  // RT 写，控制线程读+清
 };
 
 }  // namespace noise

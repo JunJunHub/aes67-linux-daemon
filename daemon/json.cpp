@@ -106,6 +106,8 @@ std::string config_to_json(const Config& config) {
      << escape_json(config.get_noise_status_file()) << "\""
      << ",\n  \"noise_template_dir\": \""
      << escape_json(config.get_noise_template_dir()) << "\""
+     << ",\n  \"onnx_model_dir\": \""
+     << escape_json(config.get_onnx_model_dir()) << "\""
      << ",\n  \"fake_pcm_source\": \""
      << escape_json(config.get_fake_pcm_source()) << "\""
      << ",\n  \"interface_name\": \""
@@ -376,6 +378,9 @@ Config json_to_config_(std::istream& js, Config& config) {
             remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "noise_template_dir") {
         config.set_noise_template_dir(
+            remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "onnx_model_dir") {
+        config.set_onnx_model_dir(
             remove_undesired_chars(val.get_value<std::string>()));
       } else if (key == "fake_pcm_source") {
         config.set_fake_pcm_source(

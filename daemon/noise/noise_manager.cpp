@@ -67,6 +67,8 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.denoise_enabled = cfg.denoise_enabled;
   // ① DenoiseProcessor：构造即装 PassthroughPlugin（plugin_ 永不为空）。
   ctx.denoise = std::make_shared<DenoiseProcessor>();
+  // Spec5 T2：注入 ONNX 模型目录（dtln/deepfilternet init 推导模型路径用）。
+  ctx.denoise->set_onnx_model_dir(onnx_model_dir_);
   // 若 cfg 指定非 passthrough 插件，切换（如 "rnnoise"）。
   if (!cfg.plugin_name.empty() && cfg.plugin_name != "passthrough") {
     ctx.denoise->switch_plugin(cfg.plugin_name);
@@ -155,6 +157,11 @@ bool NoiseManager::switch_plugin(uint8_t sensor_id, const std::string& name) {
   if (ok) {
     it->second.cfg.plugin_name = name;
     save_status();
+    // Spec5 T2：切到非 passthrough 插件视为用户重试 -> 清 plugin_degraded
+    // 告警锁存（新插件若再次反复失败会重新置位）。切 passthrough 不清
+    // （degradation 本身就是切 passthrough，告警应保持）。
+    if (name != "passthrough" && it->second.metrics)
+      it->second.metrics->set_plugin_degraded(false);
   }
   return ok;
 }
@@ -400,6 +407,20 @@ void NoiseManager::on_period_end() {
         ctx.denoise->on_period_end();
       if (ctx.metrics)
         ctx.metrics->on_period_end();
+    }
+    // Spec5 T2：ONNX 失败降级 housekeeper（D-S5.5）。RT 线程 process 在连续
+    // kBypass 达阈值后置 degraded_pending_；此处（on_period_end，每 period 一次，
+    // 非每帧紧路径）检查并切 passthrough + 锁存告警。switch_plugin("passthrough")
+    // 廉价（无模型 I/O）；旧 ONNX slot 经 retire 延迟到控制线程析构，不在 RT。
+    // 在 evaluate_alerts 前执行，使 plugin_degraded 规则本 period 即可触发。
+    for (auto& [id, ctx] : *pinned_table_) {
+      if (ctx.denoise && ctx.denoise->degraded_pending()) {
+        ctx.denoise->clear_degraded_pending();
+        ctx.denoise->switch_plugin("passthrough");
+        ctx.denoise->drain_retire();
+        if (ctx.metrics)
+          ctx.metrics->set_plugin_degraded(true);
+      }
     }
     // Spec4 T4：告警引擎评估（D-S4.2）。
     // 在 denoise/metrics on_period_end（swap + collect 完成）后，

@@ -201,6 +201,15 @@ std::optional<AlertEvent> NoiseMetrics::evaluate_alerts(uint8_t sensor_id) {
     message = "hum detected";
   }
 
+  // 规则 6（Spec5 T2）：plugin_degraded -> Warning。
+  // ONNX 降噪插件反复失败已切 passthrough（denoise 不可用，音频仍直通）。
+  // 仅当 desired < Warning 时评估（不被更低级覆盖）。
+  if (desired < AlertLevel::Warning && latest_.plugin_degraded) {
+    desired = AlertLevel::Warning;
+    rule = "plugin_degraded";
+    message = "denoise plugin degraded to passthrough";
+  }
+
   const uint32_t N = latest_.alert_debounce_periods;
   // 防御性：N=0 时去抖禁用，单 period 即 raise/clear（仍可用但无去抖）。
   const uint32_t debounce = (N > 0) ? N : 1;

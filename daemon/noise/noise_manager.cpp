@@ -33,9 +33,9 @@ namespace noise {
 // 入口 Resampler 将 native 采样率转为此值；native==此值时 passthrough。
 // 与 RnnoiseAdapter::native_sample_rate()(48k) + RefComparator 默认 48k 同源。
 static constexpr uint32_t kPipelineRateHz = 48000;
-// 48k 链路的 per-chunk 帧数（= denoise max_frame_ = RNNoise kFrameSize = 480）。
-// on_frame 接收 native-rate 480-样本子帧（bridge kSubFrame），重采样后按 48k
-// 480-样本 chunk 喂入 ①②③④。
+// 48k 链路的 per-chunk 帧数（= denoise max_frame_ = RNNoise kFrameSize =
+// 480）。 on_frame 接收 native-rate 480-样本子帧（bridge
+// kSubFrame），重采样后按 48k 480-样本 chunk 喂入 ①②③④。
 static constexpr size_t kPipelineFrame = 480;
 
 NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {
@@ -277,18 +277,21 @@ void NoiseManager::on_frame(uint8_t sink_id,
     // Resampler 为 passthrough，零 SpeexDSP 开销直通。重采样为流式（SpeexDSP
     // 滤波状态跨 on_frame 连续），输出进 per-sensor FIFO，按 48k 480-样本 chunk
     // 逐个喂入 ①②③④（一个 on_frame 可能 emit 0/1/N 个 chunk；period_begin/end
-    // 仍每 ALSA period 一次，metrics 在 on_period_end 聚合，变长 chunk 不影响）。
-    // 注意：RefComparator 路由（on_frame 末尾，原生帧）不变，仍每 on_frame 一次。
+    // 仍每 ALSA period 一次，metrics 在 on_period_end 聚合，变长 chunk
+    // 不影响）。 注意：RefComparator 路由（on_frame 末尾，原生帧）不变，仍每
+    // on_frame 一次。
     if (!ctx.resampler || ctx.resampler->is_passthrough()) {
       // 48k 直通：不经 SpeexDSP / FIFO，直接处理输入帧（与 Spec4 行为一致）。
       process_pipeline_chunk(ctx, frames, frame_size);
     } else {
-      // native≠48k：resample native chunk -> per-sensor FIFO -> 喂 48k 480 chunk。
+      // native≠48k：resample native chunk -> per-sensor FIFO -> 喂 48k 480
+      // chunk。
       const size_t need = ctx.resampler->max_output_for_input(frame_size);
       if (resample_scratch_.size() < need)
         resample_scratch_.resize(need);  // 首帧 warmup 后稳定，无重新分配
-      const size_t produced = ctx.resampler->process(
-          frames, frame_size, resample_scratch_.data(), resample_scratch_.size());
+      const size_t produced =
+          ctx.resampler->process(frames, frame_size, resample_scratch_.data(),
+                                 resample_scratch_.size());
       auto& fifo = *ctx.resample_fifo;
       fifo.insert(fifo.end(), resample_scratch_.data(),
                   resample_scratch_.data() + produced);
@@ -309,6 +312,16 @@ void NoiseManager::on_frame(uint8_t sink_id,
   // 持 ref_mutex_（~0.5μs memcpy，与 NoiseMetrics::collect 同模式，不影响
   // RT 预算）。一个 sink 可同时是多个 comparator 的输入，遍历所有匹配路由。
   // Spec5 T1：路由仍用原生帧（frame_size），每 on_frame 一次，不变。
+  //
+  // 已知限制（reviewer 标 Important，controller 决策显式延后，非 silently
+  // closed）： T1 解除了 on_frame 的 48k 限制，使 native≠48k 可达此路径，但
+  // RefComparator 构造用默认 sample_rate=48000（见 add_ref_comparator 的
+  // make_shared<RefComparator>）， delay_ms 按此换算（ref_comparator.cpp
+  // delay_samples*1000/sample_rate_）。故 native≠48k 时 comparator 吃原生帧却按
+  // 48k 算 delay_ms -> 数值失准（44.1k 偏低 ~8.4%）。修复需设计 comparator 的
+  // 48k 流喂入语义（频率/缓冲），当前 native≠48k +comparator
+  // 组合无测试场景，延后到 spec6（3.6 RT refactor）或独立 fix task。
+  // passthrough 路径（native==48k，全部已测生产）字节一致 Spec4，不受影响。
   route_to_ref_comparators(sink_id, frames, frame_size);
 }
 
@@ -333,8 +346,7 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
     detection.is_speech =
         denoise_result.has_vad && (denoise_result.vad_probability > 0.5f);
     // 同时调 Detector 做监测（SF/SNR 用于交叉验证），但 VAD 不覆盖。
-    NoiseDetectionResult det_monitoring =
-        ctx.detector->process_frame(pcm, n);
+    NoiseDetectionResult det_monitoring = ctx.detector->process_frame(pcm, n);
     detection.spectral_flatness = det_monitoring.spectral_flatness;
     detection.estimated_snr_db = det_monitoring.estimated_snr_db;
     detection.confidence = det_monitoring.confidence;
@@ -372,8 +384,7 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
       denoised_rms += out->denoised[i] * out->denoised[i];
     denoised_rms = std::sqrt(denoised_rms / static_cast<float>(dn));
   }
-  ctx.metrics->collect(denoise_result, detection, ar, input_rms,
-                       denoised_rms);
+  ctx.metrics->collect(denoise_result, detection, ar, input_rms, denoised_rms);
 }
 
 void NoiseManager::on_period_end() {

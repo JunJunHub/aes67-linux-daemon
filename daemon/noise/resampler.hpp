@@ -5,11 +5,13 @@
 //
 // 职责：参数化、RAII、流式重采样，封装 SpeexDSP。
 //   - 参数化采样率对 Resampler(in_rate, out_rate, channels)：T1 用 (native,48k)
-//     解 ①②③④ 链路 + RNNoise 的 48kHz 限制；T2 DTLN 复用 (48k,16k)（同一原语）。
+//     解 ①②③④ 链路 + RNNoise 的 48kHz 限制；T2 DTLN 复用
+//     (48k,16k)（同一原语）。
 //   - RAII：构造即 speex_resampler_init，析构即 speex_resampler_destroy。
 //   - 流式：SpeexDSP 维护内部滤波状态跨调用连续（sample-by-sample 的实时流）。
 //   - passthrough：in_rate==out_rate（或 SpeexDSP 初始化失败降级）时不实例化
-//     SpeexDSP，process() 退化为拷贝，零 SpeexDSP 开销（匹配 "48k 直通零成本"）。
+//     SpeexDSP，process() 退化为拷贝，零 SpeexDSP 开销（匹配 "48k
+//     直通零成本"）。
 //
 // 线程模型：构造/析构在控制线程（add_sensor），process() 在 capture 线程
 // （on_frame RT 路径）。SpeexDSP 状态非线程安全：一个 Resampler 实例仅供一个
@@ -61,10 +63,17 @@ class Resampler {
   uint32_t out_rate() const { return out_rate_; }
   uint32_t channels() const { return channels_; }
 
-  // 滤波器输出延迟（样本数）。实时流式不调 speex_resampler_skip_zeros，
+  // 滤波器输出延迟（样本数）。实时流式不调 speex_resampler_skip_zeros,
   // 首帧有此延迟的微小 ramp-up（arch §3.1：<<1ms），但输出时长与输入一致、
   // 无样本丢弃。供测试对齐参考 + max_output_for_input 缓冲上界计算。
   // passthrough 时为 0。
+  //
+  // 已知限制（reviewer ⚠️，controller 确认有意延后）：本延迟当前未折入
+  // DenoiseProcessor::algorithmic_latency_samples()。后者是 plugin 级语义
+  // （denoise_plugin.hpp），且其 set_latency_change_cb 暂无外部消费者
+  // （pcm_capture_service.cpp 仅注释提及），pipeline 级（入口 resampler +
+  // plugin）总延迟上报机制尚未完整接线。native==48k 时 resampler 为
+  // passthrough、延迟=0，不影响现有延迟账。延后到延迟上报机制接线时统一处理。
   size_t output_latency() const { return output_latency_; }
 
   // 给定输入长度，返回输出样本数的保守上界（含滤波器延迟 + 余量），供
@@ -78,7 +87,7 @@ class Resampler {
   uint32_t channels_;
   bool passthrough_;
   SpeexResamplerState* state_;  // nullptr 当 passthrough_（含 init 失败降级）
-  size_t output_latency_;       // speex_resampler_get_output_latency；passthrough=0
+  size_t output_latency_;  // speex_resampler_get_output_latency；passthrough=0
 };
 
 }  // namespace noise

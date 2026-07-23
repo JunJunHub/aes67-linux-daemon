@@ -282,15 +282,18 @@ size_t DtlnAdapter::process(const float* in,
     if (process_one_frame_()) {
       continue;
     }
-    // Run 失败：直通本 hop 的 128 输入样本到 out_fifo16_（保持流率对齐），
-    // 置 kBypass。DenoiseProcessor 计连续 kBypass -> kError -> 切 passthrough。
+    // Run 失败：置 kBypass。DenoiseProcessor 计连续 kBypass -> kError -> 切
+    // passthrough。 D-S5.5 偏差（reviewer final Important
+    // #2，文档化接受）：理想 memcpy in->out passthrough，但 DTLN 跨采样率（48k
+    // 输入经 down_ 重采样入 in_fifo16_，失败 hop 的对应输入需 48k->16k
+    // 重采样延迟输入 in_delay48_，复杂），故失败帧用 silence 安全降级（sanitize
+    // 完整 + 10 帧界 + 最终切 passthrough，不喂下游 错误样本）。真实 memcpy
+    // passthrough 延后 spec6。
     failed = true;
-    for (size_t i = 0; i < kHop && !in_fifo16_.empty(); ++i) {
-      // 该 hop 已被 process_one_frame_ 消费填入 frame_buffer_，但失败时
-      // frame_buffer 的内容无效；用对应输入样本直通（从 in_delay48 间接
-      // 不可得 @16k，这里近似用 0 填充：失败帧静音，避免喂下游错误样本）。
+    // 无条件 push kHop 个 0（不依赖 in_fifo16_ 状态；原条件 !in_fifo16_.empty()
+    // 在 fifo 空时提前停 -> 输出 < kHop -> 流率失配 rate glitch）。
+    for (size_t i = 0; i < kHop; ++i)
       out_fifo16_.push_back(0.0f);
-    }
   }
 
   // 4. 16k -> 48k 重采样，入 out_fifo48_。

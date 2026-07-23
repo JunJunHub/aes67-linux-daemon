@@ -70,7 +70,13 @@ if(WITH_NOISE)
   # 会被链接器丢弃 -> 注册不发生。whole-archive 确保所有 adapter（rnnoise/dtln/
   # deepfilternet/passthrough）的注册 lambda 在生产二进制中执行，且 dtln/dfn
   # 引用的 ONNX Runtime 符号使 libonnxruntime 进入 NEEDED（运行时自动加载）。
-  target_link_libraries(aes67-daemon "$<LINK_LIBRARY:WHOLE_ARCHIVE,noise>")
+  # portable form（兼容 CMake <3.24：$<LINK_LIBRARY:WHOLE_ARCHIVE> 需 3.24+，
+  # 低版本静默丢弃 adapter 注册 lambda -> switch_plugin 运行时失败无 crash；
+  # 项目 Linux-only 用 -Wl 链接选项，reviewer final Important #1）。
+  target_link_libraries(aes67-daemon
+    "-Wl,--whole-archive"
+    noise
+    "-Wl,--no-whole-archive")
 endif()
 
 target_link_libraries(aes67-daemon ${Boost_LIBRARIES})
@@ -106,7 +112,11 @@ if(ENABLE_TESTS AND WITH_NOISE)
   add_executable(noise-test noise/tests/noise_test.cpp
                  pcm_capture_service.cpp noise_session_manager_bridge.cpp)
   target_include_directories(noise-test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-  target_link_libraries(noise-test PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,noise>" ${Boost_LIBRARIES} ${ALSA_LIBRARY} Threads::Threads)
+  target_link_libraries(noise-test PRIVATE
+    "-Wl,--whole-archive"
+    noise
+    "-Wl,--no-whole-archive"
+    ${Boost_LIBRARIES} ${ALSA_LIBRARY} Threads::Threads)
   target_compile_definitions(noise-test PRIVATE -D_USE_FAKE_DRIVER_ -D_USE_NOISE_)
   # Spec3 Task 8：E2E 测试 /denoised AAC 断言需 faac 编码。WITH_STREAMER=ON
   # 时链接 faac + 定义 _USE_STREAMER_（E2E test_case 的 #ifdef 守卫）。

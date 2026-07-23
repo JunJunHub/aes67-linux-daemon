@@ -498,8 +498,11 @@ size_t DeepFilterNetAdapter::process(const float* in,
       continue;
     }
     failed = true;
-    // 失败：直通该 hop 样本（从 in_fifo 已被消费，用占位 0 维持流率，
-    // DenoiseProcessor 连续 kBypass -> kError -> 切 passthrough）。
+    // D-S5.5 偏差（reviewer final Important #2，文档化接受）：理想 memcpy
+    // in->out passthrough，但失败 hop 的对应输入 in_delay_ 需对齐（lookahead
+    // 缓冲 + 48k 流式），故用 silence 安全降级（sanitize 完整 + 10 帧界 +
+    // 最终切 passthrough，不喂下游错误样本）。真实 memcpy passthrough 延后
+    // spec6。
     std::vector<float> passthrough(kHop, 0.0f);
     out_frame_buf_.push_back(std::move(passthrough));
   }

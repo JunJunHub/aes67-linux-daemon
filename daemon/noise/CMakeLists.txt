@@ -4,7 +4,6 @@
 # 库合法），改用 STATIC + 普通链接（daemon/CMakeLists.txt 的 noise-test target
 # 用 target_link_libraries(... noise)）。
 set(NOISE_SOURCES
-  audio_capture.cpp
   noise_manager.cpp
   noise_metrics.cpp
   noise_http.cpp

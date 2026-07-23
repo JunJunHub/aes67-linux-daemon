@@ -2,7 +2,6 @@
 #include "noise_session_manager_bridge.hpp"
 
 #include "pcm_capture_service.hpp"
-#include "noise/audio_capture.hpp"
 
 NoiseSessionManagerBridge::NoiseSessionManagerBridge(
     std::shared_ptr<PcmCaptureService> pcm_capture)
@@ -128,12 +127,13 @@ void NoiseSessionManagerBridge::on_pcm_frame(const uint8_t* interleaved_pcm,
     period_end_cb_();
 }
 
-// uint8_t(S16_LE 交错) -> float 单通道解复用。
-void NoiseSessionManagerBridge::test_demux_for_test(const uint8_t* interleaved,
-                                                    size_t samples,
-                                                    uint8_t channels,
-                                                    uint8_t ch_index,
-                                                    AudioCapture& cap) {
+// uint8_t(S16_LE 交错) -> float 单通道解复用，调 cb 帧回调。
+void NoiseSessionManagerBridge::test_demux_for_test(
+    const uint8_t* interleaved,
+    size_t samples,
+    uint8_t channels,
+    uint8_t ch_index,
+    const std::function<void(const float*, size_t, uint8_t)>& cb) {
   // §11 风险18：容量断言
   if (samples * channels > kMaxPeriodSamples * kMaxChannels) {
     return;  // 超容量丢弃（驱动异常，Spec1 不越界写）
@@ -144,7 +144,6 @@ void NoiseSessionManagerBridge::test_demux_for_test(const uint8_t* interleaved,
     convert_buffer_[i] =
         static_cast<float>(src[i * channels + ch_index]) / 32768.0f;
   }
-  cap.on_period_begin();
-  cap.on_frame(0, convert_buffer_.data(), samples, 1);
-  cap.on_period_end();
+  if (cb)
+    cb(convert_buffer_.data(), samples, 1);
 }

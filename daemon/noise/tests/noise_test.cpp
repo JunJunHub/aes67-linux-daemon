@@ -82,7 +82,6 @@ BOOST_AUTO_TEST_CASE(const_t_supported) {
 BOOST_AUTO_TEST_SUITE_END()
 
 #include "noise_session_manager_bridge.hpp"
-#include "noise/audio_capture.hpp"
 
 #include "pcm_capture_service.hpp"
 #include <chrono>
@@ -114,16 +113,15 @@ BOOST_AUTO_TEST_CASE(bridge_demux_and_float_conversion) {
   const int16_t interleaved[8] = {0, 0, 16384, 0, -16384, 0, 32767, 0};
   static std::vector<float> received;
   received.clear();
-  AudioCapture cap;
-  cap.register_callback([](const float* frames, size_t n, uint8_t ch) {
-    BOOST_CHECK_EQUAL(ch, 1);
-    for (size_t i = 0; i < n; ++i)
-      received.push_back(frames[i]);
-  });
-  // Bridge 把交错 S16 转 float 单通道后喂 AudioCapture 回调
+  // AudioCapture 已删（vestigial，生产不经它）；test_demux_for_test 改用
+  // 回调 lambda 直接收集 demux 后的 float 单通道样本。
   bridge.test_demux_for_test(reinterpret_cast<const uint8_t*>(interleaved),
                              4 /*samples*/, 2 /*channels*/, 0 /*ch_index*/,
-                             cap);
+                             [](const float* frames, size_t n, uint8_t ch) {
+                               BOOST_CHECK_EQUAL(ch, 1);
+                               for (size_t i = 0; i < n; ++i)
+                                 received.push_back(frames[i]);
+                             });
   BOOST_CHECK_EQUAL(received.size(), 4u);
   BOOST_CHECK_CLOSE(received[0], 0.0f / 32768.0f, 0.01);
   BOOST_CHECK_CLOSE(received[1], 16384.0f / 32768.0f, 0.01);

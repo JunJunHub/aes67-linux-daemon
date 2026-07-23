@@ -4,6 +4,7 @@
 #define DAEMON_NOISE_SESSION_MANAGER_BRIDGE_HPP_
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -13,7 +14,6 @@
 #include "noise/rcu_ptr.hpp"
 
 class PcmCaptureService;
-class AudioCapture;
 
 class NoiseSessionManagerBridge : public noise::NoiseAudioBridge {
  public:
@@ -36,12 +36,15 @@ class NoiseSessionManagerBridge : public noise::NoiseAudioBridge {
   void set_sink_add_callback(SinkChangeCallback cb) override;
   void set_sink_remove_callback(SinkChangeCallback cb) override;
 
-  // 测试专用：把交错 uint8_t(S16_LE) 转 float 单通道后喂 AudioCapture 回调。
-  void test_demux_for_test(const uint8_t* interleaved,
-                           size_t samples,
-                           uint8_t channels,
-                           uint8_t ch_index,
-                           AudioCapture& cap);
+  // 测试专用：把交错 uint8_t(S16_LE) 转 float 单通道后调 cb 帧回调。
+  // 生产路径不经 AudioCapture（C2 fix 直接 on_pcm_frame -> entry.provider
+  // -> NoiseManager::on_frame）；AudioCapture 已删，此 helper 改用回调。
+  void test_demux_for_test(
+      const uint8_t* interleaved,
+      size_t samples,
+      uint8_t channels,
+      uint8_t ch_index,
+      const std::function<void(const float*, size_t, uint8_t)>& cb);
 
  private:
   // PcmCaptureService 全局帧回调（注册为 provider）。

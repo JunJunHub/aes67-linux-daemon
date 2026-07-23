@@ -360,6 +360,17 @@ class NoiseManager {
   // deepfilternet init 推导模型路径。控制线程调用（main wiring，init 前）。
   void set_onnx_model_dir(const std::string& dir) { onnx_model_dir_ = dir; }
 
+  // Spec5 T3（D-S5.8）：注入 L3 ML 分类器 + 模板库。add_sensor 时转发到每个
+  // sensor 的 NoiseAnalyzer（L3 在 capture 线程调 classify，所有 sensor 共享
+  // 同一 MlClassifier/TemplateDB 实例）。空 shared_ptr -> L3 跳过。
+  // 控制线程调用（main wiring，init 前；已有 sensor 也会逐个 set）。
+  void set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
+    ml_classifier_ = ml;
+  }
+  void set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
+    template_db_ = db;
+  }
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -367,9 +378,10 @@ class NoiseManager {
   RetireQueue<const SensorTable> retire_queue_;
   // period 顶部 load 的快照（裸指针），整 period 内复用，on_period_end 置空。
   const SensorTable* pinned_table_{nullptr};
-  // Spec5 T1：重采样 process() 输出暂存（capture 线程独占，单线程复用，无并发）。
-  // per-sensor 复用同一暂存（native rate 全局一致，所有 sensor 重采样输出上界
-  // 相同）。首次 on_frame 按 max_output_for_input(kPipelineFrame) 惰性 resize，
+  // Spec5 T1：重采样 process() 输出暂存（capture
+  // 线程独占，单线程复用，无并发）。 per-sensor 复用同一暂存（native rate
+  // 全局一致，所有 sensor 重采样输出上界 相同）。首次 on_frame 按
+  // max_output_for_input(kPipelineFrame) 惰性 resize，
   // 之后稳定不重新分配（warmup 后零分配）。不用 shared_ptr：属 NoiseManager 非
   // SensorTable，不经 COW 复制。
   std::vector<float> resample_scratch_;
@@ -397,6 +409,11 @@ class NoiseManager {
   mutable std::atomic<bool> load_in_progress_{false};
   // Spec5 T2：ONNX 模型目录（Config 注入，转发到 DenoiseProcessor）。
   std::string onnx_model_dir_;
+  // Spec5 T3：L3 ML 分类器 + 模板库（Config 注入，转发到各 sensor 的
+  // analyzer）。 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor
+  // 共享同一实例。
+  std::shared_ptr<MlClassifier> ml_classifier_;
+  std::shared_ptr<NoiseTemplateDB> template_db_;
   // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
   // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
   // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，

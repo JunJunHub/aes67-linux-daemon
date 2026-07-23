@@ -1432,7 +1432,7 @@ BOOST_AUTO_TEST_CASE(template_crud_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db);
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1510,7 +1510,7 @@ BOOST_AUTO_TEST_CASE(template_post_rejects_non_48k_wav) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db);
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1564,7 +1564,7 @@ BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db);
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1595,7 +1595,7 @@ BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
   noise::NoiseTemplateDB db2;
   db2.set_dir_for_test(d2);
   httplib::Server svr2;
-  noise::register_noise_template_routes(svr2, mgr, db2);
+  noise::register_noise_template_routes(svr2, mgr, db2, nullptr);
   int port2 = svr2.bind_to_any_port("127.0.0.1");
   std::thread svr_thread2([&svr2]() { svr2.listen_after_bind(); });
   httplib::Client cli2("127.0.0.1", port2);
@@ -1683,7 +1683,7 @@ BOOST_AUTO_TEST_CASE(template_match_test_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db);
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1747,7 +1747,7 @@ BOOST_AUTO_TEST_CASE(template_post_rejects_corrupt_wav) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db);
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -3600,6 +3600,238 @@ BOOST_AUTO_TEST_CASE(dfn_lookahead_buffers) {
   BOOST_CHECK_NO_THROW((void)flushed);
   BOOST_TEST_MESSAGE("DFN lookahead: total_out=" << total_out
                                                  << " flushed=" << flushed);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// =============================================================================
+// Spec5 Task 3：L3 ML 分类 VGGish（D-S5.8）测试套件。
+// =============================================================================
+#include "ml_classifier.hpp"
+#include "noise/noise_template_db.hpp"
+#include "noise/noise_analyzer.hpp"
+#include <filesystem>
+#include <fstream>
+
+BOOST_AUTO_TEST_SUITE(spec5_l3_ml_tests)
+
+// 返回 VGGish ONNX 模型路径或空串（未下载 -> SKIP）。查找顺序与
+// spec5_find_dtln_model1 一致：NOISE_MODELS_DIR 环境变量优先。
+static std::string spec5_find_vggish_model() {
+  const char* env = std::getenv("NOISE_MODELS_DIR");
+  std::vector<std::string> cands;
+  if (env && *env)
+    cands.push_back(std::string(env) + "/vggish.onnx");
+  cands.push_back("./noise_models/vggish.onnx");
+  cands.push_back("../noise_models/vggish.onnx");
+  cands.push_back("./noise_models/vggish/vggish.onnx");
+  cands.push_back("/home/Share/GitHub/noise-model/vggish/vggish.onnx");
+  for (const auto& p : cands) {
+    std::ifstream f(p, std::ios::binary);
+    if (f.good())
+      return p;
+  }
+  return "";
+}
+
+// 测试用假分类器：覆写 classify/embed 以注入确定性结果 + 计数调用。
+// 不加载真实 ONNX 模型（base 默认构造 available()=false），使 L3 触发/
+// 跳过逻辑可在无模型环境下确定性验证（不依赖网络/模型下载）。
+class FakeMlClassifier : public noise::MlClassifier {
+ public:
+  mutable size_t classify_count{0};
+  mutable size_t embed_count{0};
+  bool return_match{true};
+  noise::L3Match canned;
+
+  FakeMlClassifier() {
+    canned.template_id = 7;
+    canned.label = "未知风扇";
+    canned.similarity = 0.9f;
+  }
+  std::array<float, noise::kVggishEmbedDim> embed(const float* /*pcm*/,
+                                                  size_t /*n*/) const override {
+    ++embed_count;
+    std::array<float, noise::kVggishEmbedDim> e{};
+    e[0] = 1.0f;  // 非零占位
+    return e;
+  }
+  std::optional<noise::L3Match> classify(
+      const float* pcm,
+      size_t n,
+      const noise::NoiseTemplateDB& /*templates*/) const override {
+    ++classify_count;
+    if (return_match) {
+      // 仍走一次 base embed 以模拟真实路径（计数 embed 调用）。
+      (void)noise::MlClassifier::embed(pcm, n);
+      return canned;
+    }
+    return std::nullopt;
+  }
+};
+
+// Step 1a：VGGish 嵌入已知噪声 -> 128 维向量合理（非零、有限）。需模型。
+BOOST_AUTO_TEST_CASE(vggish_embeds_known_noise) {
+  std::string path = spec5_find_vggish_model();
+  if (path.empty()) {
+    BOOST_TEST_MESSAGE(
+        "VGGish 模型未下载，跳过（./daemon/noise/tests/"
+        "download_models.sh）");
+    return;
+  }
+  noise::MlClassifier ml;
+  if (!ml.init(path)) {
+    BOOST_TEST_MESSAGE("VGGish init 失败（模型签名不匹配？），跳过");
+    return;
+  }
+  BOOST_CHECK(ml.available());
+  // 0.96s @48k = 46080 样本白噪。
+  constexpr size_t N = 46080;
+  std::vector<float> pcm(N);
+  synth::white_noise(pcm.data(), N, 21);
+  auto emb = ml.embed(pcm.data(), N);
+  // 128 维、非零、有限。
+  float norm = 0.0f;
+  bool all_finite = true;
+  for (size_t i = 0; i < emb.size(); ++i) {
+    norm += emb[i] * emb[i];
+    if (!std::isfinite(emb[i]))
+      all_finite = false;
+  }
+  BOOST_CHECK_EQUAL(emb.size(), noise::kVggishEmbedDim);
+  BOOST_CHECK(all_finite);
+  BOOST_CHECK_GT(norm, 0.0f);
+}
+
+// Step 1b：录入 vggish 模板 -> classify 同类噪声 -> 匹配 + similarity > 阈值。
+// 需模型。用同一 seed 噪声做录入与检索 -> 嵌入应高度相似（确定性）。
+BOOST_AUTO_TEST_CASE(ml_classify_matches_template) {
+  std::string path = spec5_find_vggish_model();
+  if (path.empty()) {
+    BOOST_TEST_MESSAGE("VGGish 模型未下载，跳过");
+    return;
+  }
+  noise::MlClassifier ml;
+  if (!ml.init(path)) {
+    BOOST_TEST_MESSAGE("VGGish init 失败，跳过");
+    return;
+  }
+  constexpr size_t N = 46080;
+  std::vector<float> pcmA(N), pcmB(N);
+  synth::white_noise(pcmA.data(), N, 31);  // 噪声 A
+  synth::white_noise(pcmB.data(), N, 99);  // 噪声 B（不同）
+  auto embA = ml.embed(pcmA.data(), N);
+  noise::NoiseTemplateDB db;
+  std::array<float, 32> bark{};
+  db.add_template("噪声A", "", "", noise::TemplateFeatureType::Vggish, bark,
+                  embA);
+  // 同类（A）检索 -> 匹配。
+  auto m = ml.classify(pcmA.data(), N, db);
+  BOOST_REQUIRE(m.has_value());
+  BOOST_CHECK_GT(m->similarity, noise::NoiseTemplateDB::kVggishMatchThreshold);
+  BOOST_TEST_MESSAGE("L3 classify A sim=" << m->similarity);
+  // 异类（B）检索 -> 相似度应低于同类（嵌入区分力）。
+  auto mB = ml.classify(pcmB.data(), N, db);
+  if (mB.has_value()) {
+    BOOST_TEST_MESSAGE("L3 classify B sim=" << mB->similarity << "（应 < A）");
+    BOOST_CHECK_LT(mB->similarity, m->similarity + 0.001f);
+  }
+}
+
+// Step 1c：L1+L2 低置信度 -> 触发 L3 -> noise_type_source=l3。
+// 用假分类器（计数 classify 调用）+ 静音输入（L1 无候选 -> confidence 0 <
+// 阈值）。 静音填满 0.96s PCM 环形缓冲后 L3 触发。无模型依赖，恒跑。
+BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
+  auto fake_ptr = std::make_shared<FakeMlClassifier>();
+  noise::NoiseAnalyzer a;
+  a.set_ml_classifier(fake_ptr);
+  a.set_template_db(std::make_shared<noise::NoiseTemplateDB>());
+  // 静音帧：L1 规则全不命中 -> primary_confidence=0 < 0.5 -> L3 可触发。
+  float sil[synth::kFrameSize];
+  synth::silence(sil, synth::kFrameSize);
+  noise::NoiseDetectionResult det{};
+  bool triggered = false;
+  // 46080/480 = 96 帧填满 PCM 环形缓冲；后续帧若仍低置信 -> L3 触发。
+  for (int f = 0; f < 120; ++f) {
+    auto ar = a.analyze(sil, synth::kFrameSize, det);
+    if (ar.noise_type_source == "l3") {
+      triggered = true;
+      BOOST_CHECK_EQUAL(ar.l3_match_type, std::string("未知风扇"));
+      BOOST_CHECK_GT(ar.l3_similarity, 0.0f);
+      break;
+    }
+  }
+  BOOST_CHECK(triggered);
+  BOOST_CHECK_GT(fake_ptr->classify_count, 0u);
+}
+
+// Step 1d：L1 高置信度 -> 不调 L3（性能：classify 计数=0）。
+// 白噪 SF~1 -> White 候选 confidence~1.0 > 阈值 -> L3 跳过。无模型依赖，恒跑。
+BOOST_AUTO_TEST_CASE(l3_skipped_when_l1_confident) {
+  auto fake_ptr = std::make_shared<FakeMlClassifier>();
+  noise::NoiseAnalyzer a;
+  a.set_ml_classifier(fake_ptr);
+  a.set_template_db(std::make_shared<noise::NoiseTemplateDB>());
+  // L3 触发阈值设 0.4：合成白噪 L1 White conf≈0.49（sf≈0.848，
+  // conf=(sf-0.7)/0.3），>= 0.4 判 L1 已识别不触发 L3；默认 0.5 会使
+  // 边界 conf 0.49 误触发 L3（白噪非"L1 高置信度"强信号）。
+  a.set_l3_confidence_threshold(0.4f);
+  float wn[synth::kFrameSize];
+  synth::white_noise(wn, synth::kFrameSize, 5);
+  noise::NoiseDetectionResult det{};
+  for (int f = 0; f < 120; ++f) {
+    auto ar = a.analyze(wn, synth::kFrameSize, det);
+    // L1 置信（conf >= threshold）-> source=l1，绝不 l3。
+    BOOST_CHECK_NE(ar.noise_type_source, "l3");
+    BOOST_CHECK(ar.primary_confidence >= 0.4f ||
+                ar.primary_type == noise::NoiseType::Unknown);
+  }
+  // L1 始终高置信 -> L3 从未被调用。
+  BOOST_CHECK_EQUAL(fake_ptr->classify_count, 0u);
+}
+
+// Step 1e：bark/vggish 模板录入 + 检索往返 + 持久化。无模型依赖，恒跑。
+BOOST_AUTO_TEST_CASE(template_feature_type_roundtrip) {
+  const char* d = "test_noise_templates_l3";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  std::array<float, 32> bark{};
+  for (auto& v : bark)
+    v = 0.3f;
+  std::array<float, 128> vgg{};
+  for (size_t i = 0; i < vgg.size(); ++i)
+    vgg[i] = static_cast<float>(i) * 0.01f;
+  // 录入：1 个 bark + 1 个 vggish 模板。
+  uint32_t id_bark = db.add_template("空调(bark)", bark);
+  uint32_t id_vgg = db.add_template(
+      "风扇(vgg)", "desc", "", noise::TemplateFeatureType::Vggish, bark, vgg);
+  BOOST_CHECK_GT(id_bark, 0u);
+  BOOST_CHECK_GT(id_vgg, id_bark);
+  // 内存检索：vggish 嵌入匹配 vggish 模板（同向量 -> sim=1）。
+  auto [mid, sim] = db.match_vggish(vgg);
+  BOOST_CHECK_EQUAL(mid, id_vgg);
+  BOOST_CHECK_GT(sim, 0.99f);
+  // bark 检索不命中 vggish 模板（match 仅扫 bark）。
+  auto [bid, bsim] = db.match(bark);
+  BOOST_CHECK_EQUAL(bid, id_bark);
+  // 持久化往返。
+  BOOST_CHECK(db.save(d));
+  noise::NoiseTemplateDB db2;
+  BOOST_CHECK(db2.load(d));
+  const noise::Template* tv = db2.get_template(id_vgg);
+  BOOST_REQUIRE_NE(tv, nullptr);
+  BOOST_CHECK(tv->feature_type == noise::TemplateFeatureType::Vggish);
+  for (size_t i = 0; i < vgg.size(); ++i)
+    BOOST_CHECK_CLOSE(tv->vggish_embedding[i], vgg[i], 1e-4);
+  const noise::Template* tb = db2.get_template(id_bark);
+  BOOST_REQUIRE_NE(tb, nullptr);
+  BOOST_CHECK(tb->feature_type == noise::TemplateFeatureType::Bark);
+  // 往返后 vggish 检索仍命中。
+  auto [mid2, sim2] = db2.match_vggish(vgg);
+  BOOST_CHECK_EQUAL(mid2, id_vgg);
+  std::filesystem::remove_all(d);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

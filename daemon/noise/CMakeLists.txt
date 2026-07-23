@@ -19,6 +19,7 @@ set(NOISE_SOURCES
   ref_comparator.cpp
   sse_broadcaster.cpp
   resampler.cpp
+  ml_classifier.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})

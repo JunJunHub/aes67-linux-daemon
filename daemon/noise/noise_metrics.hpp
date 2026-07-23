@@ -95,6 +95,10 @@ struct NoiseMetricsSnapshot {
   NoiseType noise_type{NoiseType::Unknown};
   float noise_type_confidence{0.0f};  // 分类置信度（区别于 noise_confidence）
   bool is_mixed{false};
+  // Spec5 T3（D-S5.8）：主结果来源层 "l1"|"l2"|"l3"（默认空=l1）。
+  // 由 collect() 从 NoiseAnalysisResult.noise_type_source 拷入。source="l3"
+  // 时权威类型为 l3_match_type（模板 label），noise_type 仍为 L1 的 Unknown。
+  std::string noise_type_source;
   std::array<NoiseTypeCandidateSnapshot, kMaxNoiseCandidates>
       noise_candidates{};
   size_t noise_candidates_count{0};

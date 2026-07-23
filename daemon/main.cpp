@@ -37,6 +37,7 @@
 
 #ifdef _USE_NOISE_
 #include "noise/noise_http.hpp"
+#include "noise/ml_classifier.hpp"  // Spec5 T3：L3 VGGish ML 分类
 #include "noise/noise_manager.hpp"
 #include "noise/noise_template_db.hpp"
 #include "noise/onnx_session.hpp"  // Spec5 T2：Ort::Env 生命周期装配
@@ -209,13 +210,23 @@ int main(int argc, char* argv[]) {
           std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
       auto noise_manager = std::make_shared<noise::NoiseManager>(*noise_bridge);
       noise_manager->set_onnx_model_dir(config->get_onnx_model_dir());
-      // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
-      if (!config->get_noise_status_file().empty()) {
-        noise_manager->load_status(config->get_noise_status_file());
-      }
+      // Spec5 T3：L3 VGGish ML 分类器 + 模板库（须在 load_status/add_sensor 前
+      // 注入，使恢复的 sensor 的 NoiseAnalyzer 持有 ml_classifier +
+      // template_db； 为空/加载失败 -> available()=false，L3 跳过，L1+L2
+      // 不受影响）。
       auto noise_template_db = std::make_shared<noise::NoiseTemplateDB>();
       if (!config->get_noise_template_dir().empty()) {
         noise_template_db->load(config->get_noise_template_dir());
+      }
+      auto ml_classifier = std::make_shared<noise::MlClassifier>();
+      if (!config->get_ml_model_path().empty()) {
+        ml_classifier->init(config->get_ml_model_path());
+      }
+      noise_manager->set_ml_classifier(ml_classifier);
+      noise_manager->set_template_db(noise_template_db);
+      // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
+      if (!config->get_noise_status_file().empty()) {
+        noise_manager->load_status(config->get_noise_status_file());
       }
       // T7 path A 回调：PcmCaptureService 在 PTP unlock -> stop_capture join
       // capture 线程后回调 -> NoiseManager::on_capture_thread_joined（控制
@@ -297,7 +308,7 @@ int main(int argc, char* argv[]) {
       // 注册 /api/noise/* 路由（sensor + template，arch §5.1/§5.3）。
       // http_server.init() 之后调用（svr_ 已配置，未 listen）。
       noise::register_noise_routes(http_server.server(), *noise_manager,
-                                   *noise_template_db);
+                                   *noise_template_db, ml_classifier);
 #endif
 
       /* load session status from file */

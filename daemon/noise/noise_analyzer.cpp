@@ -11,8 +11,12 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstring>
 #include <numeric>
 #include <vector>
+
+#include "ml_classifier.hpp"        // Spec5 T3：L3 ML 分类
+#include "noise_template_db.hpp"    // Spec5 T3：L3 kNN 模板检索
 
 namespace noise {
 
@@ -159,6 +163,19 @@ void accumulate_bark_bands(const std::vector<float>& power,
 }
 }  // namespace
 
+// Spec5 T3：out-of-line 构造/析构。ml_classifier_/template_db_ 的 shared_ptr
+// 成员需完整类型析构（前向声明在头），定义在 .cpp（此处 include 全定义）。
+NoiseAnalyzer::NoiseAnalyzer() = default;
+NoiseAnalyzer::~NoiseAnalyzer() = default;
+
+void NoiseAnalyzer::set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
+  ml_classifier_ = std::move(ml);
+}
+
+void NoiseAnalyzer::set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
+  template_db_ = std::move(db);
+}
+
 NoiseAnalysisResult NoiseAnalyzer::analyze(
     const float* frames,
     size_t frame_size,
@@ -173,6 +190,10 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   result.hum_strength_db = 0.0f;
   result.impulse_count = 0.0f;
   result.band_energy.fill(0.0f);
+  // Spec5 T3：L3 字段默认（source 默认 l1；L3 触发时 maybe_run_l3_ 覆盖）。
+  result.l3_match_type.clear();
+  result.l3_similarity = 0.0f;
+  result.noise_type_source = "l1";
 
   if (frame_size == 0 || frames == nullptr)
     return result;
@@ -404,7 +425,69 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
     aggregate_window();
   }
 
+  // Spec5 T3：L1 规则式结果已定。若 primary_confidence < 阈值（L1+L2 未识别）
+  // 且 MlClassifier 可用，追加 PCM 环形缓冲并触发 L3（覆盖 noise_type_source=l3）。
+  maybe_run_l3_(result, frames, frame_size);
+
   return result;
+}
+
+// Spec5 T3（D-S5.8）：L3 ML 分类层。
+// 每帧追加 analysis PCM 到 0.96s 环形缓冲；当缓冲满 + L1 未识别
+// （primary_confidence < 阈值）+ 节流冷却到期时，取最新一窗 PCM 调
+// MlClassifier::classify 做嵌入 + kNN 检索。命中 -> noise_type_source="l3"
+// + l3_match_type/l3_similarity；未命中/未触发 -> 保持 source="l1"。
+//
+// 触发频率：节流 kL3CooldownFrames(=0.96s) 一次，避免持续未知噪声时每帧
+// 跑 ONNX。L3 仅在 L1+L2 未识别时触发（低频），~ms 级可接受（brief）。
+// 注意：当前 L2 Bark 模板匹配未接入 RT analyze() 路径（既有 HTTP /test 独有），
+// 故 primary_confidence 实际反映 L1 规则式结果；L2 接入是既有 gap，不在 T3
+// 范围。L3 门的语义（置信度低才触发）与 spec 一致。
+void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
+                                  const float* frames,
+                                  size_t frame_size) {
+  if (!ml_classifier_ || !template_db_)
+    return;
+  if (frames == nullptr || frame_size == 0)
+    return;
+
+  // 追加到 PCM 环形缓冲（惰性分配）。
+  if (pcm_ring_.empty())
+    pcm_ring_.assign(kVggishWindowSamples, 0.0f);
+  for (size_t i = 0; i < frame_size; ++i) {
+    pcm_ring_[pcm_ring_head_] = frames[i];
+    pcm_ring_head_ = (pcm_ring_head_ + 1) % kVggishWindowSamples;
+    if (pcm_ring_count_ < kVggishWindowSamples)
+      ++pcm_ring_count_;
+  }
+
+  // 节流冷却递减。
+  if (l3_cooldown_ > 0)
+    --l3_cooldown_;
+
+  // 触发条件：缓冲满 + L1 未识别 + 冷却到期。
+  if (pcm_ring_count_ < kVggishWindowSamples)
+    return;  // 不足 0.96s，无法嵌入
+  if (result.primary_confidence >= l3_threshold_)
+    return;  // L1 已识别，跳过 L3
+  if (l3_cooldown_ > 0)
+    return;  // 节流中
+
+  // 取最新一窗（环形缓冲按写入顺序展开为连续 0.96s）。
+  std::vector<float> window(kVggishWindowSamples);
+  // head 指向下一个写入位置 = 最旧样本位置（缓冲满时）。
+  for (size_t i = 0; i < kVggishWindowSamples; ++i)
+    window[i] = pcm_ring_[(pcm_ring_head_ + i) % kVggishWindowSamples];
+
+  auto m = ml_classifier_->classify(window.data(), kVggishWindowSamples,
+                                    *template_db_);
+  l3_cooldown_ = kL3CooldownFrames;  // 触发后冷却（无论命中）
+  if (m.has_value()) {
+    result.noise_type_source = "l3";
+    result.l3_match_type = m->label;
+    result.l3_similarity = m->similarity;
+  }
+  // 未命中：保持 source="l1"（L1 的 Unknown），L3 已尽力。
 }
 
 void NoiseAnalyzer::set_analysis_window_ms(uint32_t ms) {

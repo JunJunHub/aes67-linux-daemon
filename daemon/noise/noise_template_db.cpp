@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include <boost/foreach.hpp>
+#include <boost/optional.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
@@ -41,6 +42,26 @@ float cosine_similarity(const std::array<float, 32>& a,
   }
   return dot / (norm_a * norm_b);
 }
+
+// Spec5 T3：128 维 VGGish 嵌入的余弦相似度（L3 kNN 检索用）。
+// 与 32 维版本同语义，零范数守卫。
+float cosine_similarity_128(const std::array<float, 128>& a,
+                            const std::array<float, 128>& b) {
+  float dot = 0.0f;
+  float norm_a = 0.0f;
+  float norm_b = 0.0f;
+  for (size_t i = 0; i < 128; ++i) {
+    dot += a[i] * b[i];
+    norm_a += a[i] * a[i];
+    norm_b += b[i] * b[i];
+  }
+  norm_a = std::sqrt(norm_a);
+  norm_b = std::sqrt(norm_b);
+  if (norm_a == 0.0f || norm_b == 0.0f) {
+    return 0.0f;
+  }
+  return dot / (norm_a * norm_b);
+}
 }  // namespace
 
 uint32_t NoiseTemplateDB::add_template(
@@ -54,12 +75,35 @@ uint32_t NoiseTemplateDB::add_template(
     const std::array<float, 32>& bark_features,
     const std::string& description,
     const std::string& wav_file) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   Template t;
   t.template_id = next_id_++;
   t.name = name;
   t.bark_features = bark_features;
   t.description = description;
   t.wav_file = wav_file;
+  t.feature_type = TemplateFeatureType::Bark;  // 既有路径默认 bark
+  templates_.push_back(std::move(t));
+  return templates_.back().template_id;
+}
+
+// Spec5 T3（D-S5.8）：按特征类型添加模板。
+uint32_t NoiseTemplateDB::add_template(
+    const std::string& name,
+    const std::string& description,
+    const std::string& wav_file,
+    TemplateFeatureType feature_type,
+    const std::array<float, 32>& bark_features,
+    const std::array<float, 128>& vggish_embedding) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  Template t;
+  t.template_id = next_id_++;
+  t.name = name;
+  t.description = description;
+  t.wav_file = wav_file;
+  t.feature_type = feature_type;
+  t.bark_features = bark_features;
+  t.vggish_embedding = vggish_embedding;
   templates_.push_back(std::move(t));
   return templates_.back().template_id;
 }
@@ -72,6 +116,9 @@ std::pair<uint32_t, float> NoiseTemplateDB::match(
   uint32_t best_id = 0;
   float best_sim = 0.0f;
   for (const auto& t : templates_) {
+    // Spec5 T3：L2 仅扫 bark 模板，vggish 模板交 L3。
+    if (t.feature_type == TemplateFeatureType::Vggish)
+      continue;
     float sim = cosine_similarity(bark_spectrum, t.bark_features);
     if (sim > best_sim) {
       best_sim = sim;
@@ -85,7 +132,28 @@ std::pair<uint32_t, float> NoiseTemplateDB::match(
   return {0, 0.0f};
 }
 
+// Spec5 T3（D-S5.8）：L3 VGGish 嵌入 kNN 检索。
+std::pair<uint32_t, float> NoiseTemplateDB::match_vggish(
+    const std::array<float, 128>& embedding) const {
+  uint32_t best_id = 0;
+  float best_sim = 0.0f;
+  for (const auto& t : templates_) {
+    if (t.feature_type != TemplateFeatureType::Vggish)
+      continue;
+    float sim = cosine_similarity_128(embedding, t.vggish_embedding);
+    if (sim > best_sim) {
+      best_sim = sim;
+      best_id = t.template_id;
+    }
+  }
+  if (best_sim > kVggishMatchThreshold) {
+    return {best_id, best_sim};
+  }
+  return {0, 0.0f};
+}
+
 bool NoiseTemplateDB::remove_template(uint32_t template_id) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   auto it = std::find_if(templates_.begin(), templates_.end(),
                          [template_id](const Template& t) {
                            return t.template_id == template_id;
@@ -99,6 +167,7 @@ bool NoiseTemplateDB::remove_template(uint32_t template_id) {
 
 std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
     const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   std::vector<std::pair<uint32_t, std::string>> result;
   result.reserve(templates_.size());
   for (const auto& t : templates_) {
@@ -108,6 +177,7 @@ std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
 }
 
 const Template* NoiseTemplateDB::get_template(uint32_t template_id) const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   for (const auto& t : templates_) {
     if (t.template_id == template_id)
       return &t;
@@ -118,6 +188,7 @@ const Template* NoiseTemplateDB::get_template(uint32_t template_id) const {
 bool NoiseTemplateDB::update_template(uint32_t template_id,
                                       const std::string& new_label,
                                       const std::string& new_description) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   for (auto& t : templates_) {
     if (t.template_id == template_id) {
       // label/description 仅在非空时覆盖（PUT {"label":"x"} 不清空
@@ -144,6 +215,7 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
 bool NoiseTemplateDB::save(const std::string& dir) const {
   if (dir.empty())
     return false;
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   // 序列化 templates_ 为 JSON（arch §7.5 格式）：
   // { "templates": [ { "id": 1, "label": "test", "bark_spectrum": [...],
   //                    "description": "...", "wav_file": "...",
@@ -168,7 +240,20 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
     ss << "],\n      \"description\": \"" << escape_json(t.description) << "\""
        << ",\n      \"wav_file\": \"" << escape_json(t.wav_file) << "\""
        << ",\n      \"wav_available\": " << (t.wav_available ? "true" : "false")
-       << "\n    }";
+       << ",\n      \"feature_type\": \""
+       << (t.feature_type == TemplateFeatureType::Vggish ? "vggish" : "bark")
+       << "\"";
+    // Spec5 T3：vggish 模板序列化 128 维嵌入（bark 模板不输出该字段，省空间）。
+    if (t.feature_type == TemplateFeatureType::Vggish) {
+      ss << ",\n      \"vggish_embedding\": [";
+      for (size_t j = 0; j < t.vggish_embedding.size(); ++j) {
+        if (j > 0)
+          ss << ", ";
+        ss << t.vggish_embedding[j];
+      }
+      ss << "]";
+    }
+    ss << "\n    }";
   }
   ss << "\n  ]\n}\n";
   std::string path = dir + "/templates.json";
@@ -178,6 +263,7 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
 bool NoiseTemplateDB::load(const std::string& dir) {
   if (dir.empty())
     return false;
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   dir_ = dir;
   std::string path = dir + "/templates.json";
   if (!std::filesystem::exists(path))
@@ -202,6 +288,10 @@ bool NoiseTemplateDB::load(const std::string& dir) {
       t.wav_file = v.second.get<std::string>("wav_file", "");
       // Spec4 T1（D-S4.8）：wav_available 缺省 = true（向后兼容旧 JSON）。
       t.wav_available = v.second.get<bool>("wav_available", true);
+      // Spec5 T3（D-S5.8）：feature_type 缺省 = bark（向后兼容）。
+      std::string ft = v.second.get<std::string>("feature_type", "bark");
+      t.feature_type = (ft == "vggish") ? TemplateFeatureType::Vggish
+                                       : TemplateFeatureType::Bark;
       std::array<float, 32> feat{};
       size_t idx = 0;
       BOOST_FOREACH (const boost::property_tree::ptree::value_type& f,
@@ -210,6 +300,20 @@ bool NoiseTemplateDB::load(const std::string& dir) {
           feat[idx++] = f.second.get_value<float>();
       }
       t.bark_features = feat;
+      // Spec5 T3：vggish 嵌入缺省全零（bark 模板 / 旧 JSON）。
+      std::array<float, 128> vgg{};
+      if (t.feature_type == TemplateFeatureType::Vggish) {
+        size_t vi = 0;
+        boost::optional<const boost::property_tree::ptree&> vp =
+            v.second.get_child_optional("vggish_embedding");
+        if (vp) {
+          BOOST_FOREACH (const boost::property_tree::ptree::value_type& f, *vp) {
+            if (vi < 128)
+              vgg[vi++] = f.second.get_value<float>();
+          }
+        }
+      }
+      t.vggish_embedding = vgg;
       // Spec4 T1（D-S4.7 风险15）：逐条检查 WAV 文件是否存在。
       // wav_file 非空但文件缺失 -> wav_available=false + 告警。
       // bark_spectrum 特征向量保留，L2 匹配仍可用，仅回听不可用。
@@ -241,6 +345,7 @@ bool NoiseTemplateDB::load(const std::string& dir) {
 // wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
 // 否则返回 dir_ + "/" + wav_file。未找到模板 -> 返回空串。
 std::string NoiseTemplateDB::get_wav_path(uint32_t template_id) const {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   const Template* t = get_template(template_id);
   if (t == nullptr)
     return "";
@@ -333,6 +438,7 @@ bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
 uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
                                                 const std::string& description,
                                                 const std::string& wav_bytes) {
+  std::lock_guard<std::recursive_mutex> lock(mutex_);
   if (dir_.empty())
     return 0;
   // 1. 解析 WAV -> float PCM

@@ -82,6 +82,11 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.detector->set_sensitivity(cfg.sensitivity);
   // ③ NoiseAnalyzer（L1 规则式 + L2 模板匹配）。
   ctx.analyzer = std::make_shared<NoiseAnalyzer>();
+  // Spec5 T3：注入 L3 ML 分类器 + 模板库（main 装配 set_ml_classifier/
+  // set_template_db 后，add_sensor 时传给各 sensor analyzer；为空则 L3 跳过，
+  // L1+L2 不受影响）。
+  ctx.analyzer->set_ml_classifier(ml_classifier_);
+  ctx.analyzer->set_template_db(template_db_);
   // ④ NoiseMetrics（Spec3 Task 2 真聚合，替 Spec2 stub）。
   // set_denoise_state 用 atomic 写，collect() RT 路径 atomic 读 -> 无竞争。
   ctx.metrics = std::make_shared<NoiseMetrics>();

@@ -541,6 +541,9 @@ paths:
         创建新传感器或更新已有传感器配置。请求体中未提供的字段保持原值不变。
         创建传感器时需指定 sink_id（该传感器监测哪个 Sink 的接收音频）。
         与 daemon 既有 PUT 约定一致：创建与更新均返回 HTTP 200（非 201）。
+        降噪插件切换通过请求体的 denoise_plugin 字段完成（默认 passthrough），
+        可选值取决于编译选项：rnnoise / dtln / deepfilternet / passthrough。
+        切换为准热切换：原子替换插件实例后静音一个冷启动窗口再恢复输出。
       operationId: putNoiseSensor
       parameters:
         - $ref: "#/components/parameters/sensorId"
@@ -681,135 +684,72 @@ paths:
           $ref: "#/components/responses/NotFound"
 
   # ──────────────────────────────────────────────
-  # 降噪插件
+  # 告警与指标 SSE 流（Spec4）
   # ──────────────────────────────────────────────
 
-  /api/noise/plugins:
+  /api/noise/sensor/{id}/metrics/sse:
     get:
-      tags: [Denoise Plugin]
-      summary: 列出可用降噪插件
+      tags: [Noise Sensor]
+      summary: SSE 实时推送指标快照
       description: |
-        返回编译期可用的所有降噪插件及其元信息（原生采样率、是否支持 VAD、
-        算法延迟、可配置参数列表）。用于 Web UI 展示插件选型下拉框。
-      operationId: listDenoisePlugins
+        通过 Server-Sent Events (SSE) 实时推送该传感器的指标快照（Spec4 Task 3）。
+        约每 ALSA period（~128ms）推送一次事件，每个事件 data 字段为
+        NoiseMetricsSnapshot 的子集 JSON（含 sensor_id 及关键检测/分析/降噪指标与
+        ref_* 比对结果，不含 timestamp_ms / noise_candidates / noise_type_source 等字段）。
+        传感器不存在时返回 404。客户端通过 EventSource 建立长连接接收。
+      operationId: streamNoiseSensorMetrics
+      parameters:
+        - $ref: "#/components/parameters/sensorId"
       responses:
         "200":
-          description: 成功返回插件列表
+          description: SSE 流已建立，持续推送指标快照事件
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/SseMetricsStream"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/alerts:
+    get:
+      tags: [Noise Sensor]
+      summary: 查询告警历史
+      description: |
+        返回所有传感器的告警历史 ring（Spec4 Task 4）。告警引擎在 raise/clear 状态
+        转换时记录事件到 per-sensor 内存 ring（容量 100，Phase 2 不持久化）。
+        返回的 alerts 按时间顺序排列，含触发传感器、级别、规则、消息、时间戳与是否激活。
+      operationId: getNoiseAlerts
+      responses:
+        "200":
+          description: 成功返回告警历史
           content:
             application/json:
               schema:
                 type: object
-                required: [plugins]
+                required: [alerts]
                 properties:
-                  plugins:
+                  alerts:
                     type: array
-                    description: 编译期可用的降噪插件列表
+                    description: 所有传感器的告警事件列表（按时间顺序）
                     items:
-                      $ref: "#/components/schemas/PluginInfo"
+                      $ref: "#/components/schemas/AlertEvent"
 
-  /api/noise/sensor/{id}/plugin:
-    put:
-      tags: [Denoise Plugin]
-      summary: 切换降噪插件
-      description: |
-        为指定传感器切换降噪插件。每个传感器独立持有自己的插件实例，
-        切换某一路只静音该路约 50-90ms，不影响其它传感器。
-        切换采用准热切换：原子替换插件实例，切换后静音一个冷启动窗口
-        让新插件填满内部缓冲与状态，然后恢复正常输出。切换瞬间有短暂静音，无需重启 daemon。
-      operationId: switchDenoisePlugin
-      parameters:
-        - $ref: "#/components/parameters/sensorId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [name]
-              properties:
-                name:
-                  type: string
-                  description: |
-                    目标插件名称，必须是 /api/noise/plugins 返回的插件之一。
-                    可选值：rnnoise、dtln、deepfilternet（取决于编译选项）。
-                  example: rnnoise
-      responses:
-        "200":
-          description: 插件已切换，返回新降噪配置
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DenoiseConfig"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "404":
-          $ref: "#/components/responses/NotFound"
-
-  /api/noise/sensor/{id}/plugin/params:
+  /api/noise/alerts/sse:
     get:
-      tags: [Denoise Plugin]
-      summary: 读取插件特有参数
+      tags: [Noise Sensor]
+      summary: SSE 实时推送告警事件
       description: |
-        返回当前插件的所有特有参数键值对。
-        各插件可配置参数不同（如 rnnoise 的 model、dtln 的 quantized、
-        deepfilternet 的 postfilter），详见 /api/noise/plugins 返回的 params 列表。
-      operationId: getPluginParams
-      parameters:
-        - $ref: "#/components/parameters/sensorId"
+        通过 Server-Sent Events (SSE) 实时推送全局告警事件（Spec4 Task 4，非 per-sensor）。
+        告警引擎在 raise/clear 状态转换时向全局 broadcaster 推送一个 AlertEvent。
+        仅当有订阅者时才推送（消除 idle 开销）。客户端通过 EventSource 建立长连接接收。
+      operationId: streamNoiseAlerts
       responses:
         "200":
-          description: 成功返回插件参数
+          description: SSE 流已建立，持续推送告警事件
           content:
-            application/json:
+            text/event-stream:
               schema:
-                $ref: "#/components/schemas/PluginParams"
-        "404":
-          $ref: "#/components/responses/NotFound"
-
-    put:
-      tags: [Denoise Plugin]
-      summary: 写入插件特有参数
-      description: |
-        批量设置当前插件的特有参数。未知 key 被忽略，不报错。
-        部分参数变更可能触发插件内部重初始化（如切换 model 文件）。
-      operationId: setPluginParams
-      parameters:
-        - $ref: "#/components/parameters/sensorId"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/PluginParams"
-      responses:
-        "200":
-          description: 参数已更新，返回更新后的完整参数集
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/PluginParams"
-        "400":
-          $ref: "#/components/responses/BadRequest"
-        "404":
-          $ref: "#/components/responses/NotFound"
-
-  /api/noise/sensor/{id}/denoise:
-    get:
-      tags: [Denoise Plugin]
-      summary: 获取当前降噪配置
-      description: 返回该传感器的降噪配置摘要，包括当前插件名、dry/wet 比和算法延迟。
-      operationId: getDenoiseConfig
-      parameters:
-        - $ref: "#/components/parameters/sensorId"
-      responses:
-        "200":
-          description: 成功返回降噪配置
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DenoiseConfig"
-        "404":
-          $ref: "#/components/responses/NotFound"
+                $ref: "#/components/schemas/SseAlertStream"
 
   # ──────────────────────────────────────────────
   # 噪声模板库
@@ -841,9 +781,11 @@ paths:
       tags: [Noise Template]
       summary: 录入新噪声模板
       description: |
-        上传一段噪声示例音频，系统自动提取 32 维 Bark 频带能量作为模板特征，
-        存入模板库供实时匹配使用。请求为 multipart/form-data，包含 WAV 音频文件
-        和模板元信息（标签、描述）。
+        上传一段噪声示例音频，系统提取特征存入模板库供实时匹配使用。
+        请求为 multipart/form-data，包含 WAV 音频文件和模板元信息（标签、描述、
+        特征类型）。feature_type=bark（默认）提取 32 维 Bark 频带能量；
+        feature_type=vggish 提取 128 维 VGGish 嵌入（Spec5 T3，需 ml_model_path
+        配置且模型已加载，否则返回 400）。WAV 须 48kHz PCM-16 mono，否则返回 400。
       operationId: createNoiseTemplate
       requestBody:
         required: true
@@ -870,6 +812,16 @@ paths:
                   description: |
                     模板的详细描述（可选），如"机房精密空调低频隆隆声+风道共振"。
                     供运维人员理解模板含义。
+                feature_type:
+                  type: string
+                  description: |
+                    特征类型（Spec5 T3，可选，默认 bark）。
+                    bark=提取 32 维 Bark 频带能量（L2 模板匹配）；
+                    vggish=提取 128 维 VGGish 嵌入（L3 ML 分类，需 ml_model_path
+                    配置且 MlClassifier 可用，否则返回 400）。
+                  enum: [bark, vggish]
+                  default: bark
+                  example: bark
       responses:
         "201":
           description: 模板已创建
@@ -923,6 +875,35 @@ paths:
                 $ref: "#/components/schemas/NoiseTemplate"
         "404":
           $ref: "#/components/responses/NotFound"
+
+  /api/noise/template/{templateId}/wav:
+    get:
+      tags: [Noise Template]
+      summary: 获取模板原始 WAV 音频
+      description: |
+        返回指定模板录入时保存的原始 WAV 文件二进制（audio/wav）。
+        用于回听模板的噪声示例音频。仅录入时提供了 WAV 的模板可用；
+        JSON 导入的模板无 WAV 文件，返回 404。
+      operationId: getNoiseTemplateWav
+      parameters:
+        - $ref: "#/components/parameters/templateId"
+      responses:
+        "200":
+          description: 模板原始 WAV 文件二进制
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+                description: 48kHz PCM-16 mono WAV 文件
+        "404":
+          description: |
+            模板不存在、模板无 WAV 文件（wav_file 为空）或磁盘文件缺失
+            （text/plain 错误描述）
+          content:
+            text/plain:
+              schema:
+                type: string
 
   /api/noise/template/{templateId}/test:
     post:
@@ -1407,6 +1388,19 @@ components:
           minimum: 1
           maximum: 64
           example: 16
+        onnx_model_dir:
+          type: string
+          description: |
+            ONNX 模型目录（Spec5 T2，dtln/deepfilternet 推导模型路径）。
+            对应 Config::get_onnx_model_dir，默认 ./noise_models。仅在 WITH_NOISE=ON 编译时有效。
+          example: "./noise_models"
+        ml_model_path:
+          type: string
+          description: |
+            VGGish ML 模型文件路径（Spec5 T3，L3 分类用）。对应 Config::get_ml_model_path。
+            空字符串=不加载 VGGish，L3 分类跳过（L1+L2 仍可用，additive 降级）。
+            非空时指向 vggish.onnx（如 ./noise_models/vggish.onnx）。仅在 WITH_NOISE=ON 编译时有效。
+          example: ""
 
     # ──────────────────────────────────────────
     # PTP
@@ -1863,6 +1857,28 @@ components:
           format: float
           description: 工频哼声强度（dB）。-65 以下为无哼声，-40 以上为明显哼声
           example: -65.0
+        noise_type_source:
+          type: string
+          description: |
+            主噪声类型的来源层（Spec5 T3）：l1（L1 规则式，默认）、l2（Bark 模板匹配）、
+            l3（VGGish ML 分类）。source="l3" 时权威类型为 l3_match_type（模板 label），
+            noise_type 仍为 L1 的 Unknown。对应 NoiseMetricsSnapshot.noise_type_source。
+          enum: [l1, l2, l3]
+          example: l1
+        l3_match_type:
+          type: string
+          description: |
+            L3 ML 分类匹配到的模板 label（Spec5 T3）。来自 NoiseAnalysisResult.l3_match_type。
+            仅当 L1+L2 均未识别且 MlClassifier 可用并触发 L3 时填充；空表示未触发或未匹配。
+            noise_type_source="l3" 时为本次分类的权威噪声类型名。
+          example: "空调噪声"
+        l3_similarity:
+          type: number
+          format: float
+          description: |
+            L3 VGGish 嵌入余弦相似度（Spec5 T3）[-1, 1]。来自 NoiseAnalysisResult.l3_similarity，
+            仅 L3 触发时有效。
+          example: 0.89
 
     NoiseSensorConfig:
       type: object
@@ -1894,6 +1910,21 @@ components:
           type: integer
           description: 参考音 Sink ID（255 = 不使用参考比对）
           example: 255
+        denoise_plugin:
+          type: string
+          description: |
+            降噪插件名（Spec5，默认 passthrough）。每个传感器独立持有插件实例，
+            通过此字段切换插件（替代独立的 plugin 切换端点）。
+            可选值取决于编译选项：rnnoise、dtln、deepfilternet、passthrough。
+            切换为准热切换：原子替换实例后静音一个冷启动窗口再恢复输出。
+          default: passthrough
+          example: rnnoise
+        sensitivity:
+          type: number
+          format: float
+          description: 检测灵敏度倍率（默认 1.0），影响噪声检测阈值缩放
+          default: 1.0
+          example: 1.0
 
     NoiseType:
       type: string
@@ -1961,6 +1992,13 @@ components:
           type: boolean
           description: 是否为混合噪声（次高置信度 > 0.3 时为 true）
           example: false
+        noise_type_source:
+          type: string
+          description: |
+            主噪声类型的来源层（Spec5 T3）：l1（L1 规则式，默认）、l2（Bark 模板）、
+            l3（VGGish ML）。对应 NoiseMetricsSnapshot.noise_type_source。
+          enum: [l1, l2, l3]
+          example: l1
         noise_level_dbfs:
           type: number
           format: float
@@ -2023,6 +2061,73 @@ components:
           format: float
           description: 降噪量（dB）= input_level_dbfs - output_level_dbfs
           example: 18.2
+        alert_level:
+          $ref: "#/components/schemas/AlertLevel"
+        plugin_degraded:
+          type: boolean
+          description: |
+            降噪插件是否已降级（Spec5 T2）。ONNX 反复失败后 housekeeper 切换到
+            passthrough 并置 true；切换到非 passthrough 插件且恢复后清。
+            告警引擎据此评估 plugin_degraded 规则（Warning）。
+          example: false
+
+    # ──────────────────────────────────────────
+    # 告警（Spec4 T4）
+    # ──────────────────────────────────────────
+
+    AlertLevel:
+      type: string
+      description: |
+        告警级别（Spec4 T4）。由告警引擎按规则表评估，数字有序
+        Critical > Warning > Info > None，便于比较取最高级。
+        用于 AlertEvent.level（告警事件级别）与 NoiseMetricsSnapshot.alert_level
+        （当前告警级别，None=不告警，与 is_alerting 语义对应：level != None
+        <-> is_alerting=true）。对应 C++ AlertLevel enum（noise_metrics.hpp L56）。
+      enum: [none, info, warning, critical]
+      x-enum-descriptions:
+        - "无告警"
+        - "信息级"
+        - "警告级（噪声级超过阈值等）"
+        - "严重级（参考比对严重不一致等）"
+
+    AlertEvent:
+      type: object
+      description: |
+        告警事件（Spec4 T4，arch §C）。告警引擎在 raise/clear 状态转换时产出，
+        push 到全局 alert_broadcaster_（SSE）并记录到 per-sensor 告警历史 ring
+        （GET /api/noise/alerts 查询）。对应 C++ AlertEvent（noise_metrics.hpp L67）。
+      required: [sensor_id, level, rule, message, raised_at_ms, is_active]
+      properties:
+        sensor_id:
+          type: integer
+          description: 触发告警的传感器 ID（0-63）
+          example: 3
+        level:
+          $ref: "#/components/schemas/AlertLevel"
+        rule:
+          type: string
+          description: |
+            触发规则名。告警引擎规则集（noise_metrics.hpp）：
+            noise_level_dbfs / snr_db / hum_strength_db / ref_similarity /
+            plugin_degraded。
+          example: "noise_level_dbfs"
+        message:
+          type: string
+          description: 人可读的告警描述
+          example: "noise level -28.5 dBFS exceeds threshold -30.0 dBFS"
+        raised_at_ms:
+          type: integer
+          format: int64
+          description: |
+            告警时间戳（毫秒）。相对帧计数（与 NoiseMetricsSnapshot.timestamp_ms
+            同源），非墙钟时间。
+          example: 128000
+        is_active:
+          type: boolean
+          description: |
+            true=raise 事件（告警触发/升级），false=clear 事件（告警解除）。
+            仅在状态转换时产出事件。
+          example: true
 
     # ──────────────────────────────────────────
     # 降噪插件
@@ -2166,6 +2271,25 @@ components:
             cluster = 系统自动聚类生成（Phase 2）。
           enum: [manual, cluster]
           default: manual
+        feature_type:
+          type: string
+          description: |
+            特征类型（Spec5 T3，默认 bark）。bark=32 维 Bark 频带能量（L2 模板匹配）；
+            vggish=128 维 VGGish 嵌入（L3 ML 分类）。对应 Template.feature_type。
+            POST /api/noise/template 录入时通过 feature_type 表单字段指定。
+          enum: [bark, vggish]
+          default: bark
+          example: bark
+        vggish_embedding:
+          type: array
+          description: |
+            VGGish 128 维嵌入向量（Spec5 T3，可选）。仅 feature_type=vggish 时填充，
+            供 L3 kNN 检索。对应 Template.vggish_embedding。bark 模板为全零。
+          items:
+            type: number
+            format: float
+          minItems: 128
+          maxItems: 128
 
     # 导入请求专用：id 与 created_at 由系统分配，客户端不应提供。
     # 导入时按 label 去重（见 POST /api/noise/templates/import 描述）。
@@ -2237,3 +2361,43 @@ components:
         id:
           type: string
           description: 递增序列号，用于断线重连时从上次位置续传
+
+    SseAlertStream:
+      type: object
+      description: |
+        Server-Sent Events (SSE) 告警事件流（Spec4 T4）。
+        每个 SSE 事件为 `data:` 行，data 字段为 AlertEvent JSON；不发送 `event:` 与
+        `id:` 字段（事件以默认 "message" 类型投递）。连接建立时先发送 `: connected`
+        注释行。事件格式：
+
+          : connected
+
+          data: {"sensor_id": 3, "level": "warning", "rule": "noise_level_dbfs", "message": "...", "raised_at_ms": 128000, "is_active": true}
+
+        客户端通过 EventSource 建立长连接（监听默认 "message" 事件）：
+          const es = new EventSource('/api/noise/alerts/sse');
+          es.onmessage = (e) => { const alert = JSON.parse(e.data); };
+      properties:
+        data:
+          $ref: "#/components/schemas/AlertEvent"
+
+    SseMetricsStream:
+      type: object
+      description: |
+        Server-Sent Events (SSE) 指标快照流（Spec4 Task 3）。
+        约每 ALSA period（~128ms）推送一次事件，data 字段为 NoiseMetricsSnapshot 的
+        子集 JSON（含 sensor_id 及关键检测/分析/降噪指标与 ref_* 比对结果，
+        不含 timestamp_ms / noise_candidates / noise_type_source 等字段）。
+        不发送 `event:` 与 `id:` 字段（事件以默认 "message" 类型投递）。连接建立时
+        先发送 `: connected` 注释行。事件格式：
+
+          : connected
+
+          data: {"sensor_id": 0, "noise_level_dbfs": -42.3, "noise_type": "hum_50hz", ...}
+
+        客户端通过 EventSource 建立长连接（监听默认 "message" 事件）：
+          const es = new EventSource('/api/noise/sensor/0/metrics/sse');
+          es.onmessage = (e) => { const snap = JSON.parse(e.data); };
+      properties:
+        data:
+          $ref: "#/components/schemas/NoiseMetricsSnapshot"

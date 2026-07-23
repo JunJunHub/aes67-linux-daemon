@@ -41,7 +41,8 @@ constexpr size_t kVggishNumFrames = 96;        // 0.96s -> 96 帧
 constexpr size_t kVggishMelBins = 64;          // mel 滤波器组 bin 数
 constexpr float kVggishMelLo = 125.0f;         // mel 下限 (Hz)
 constexpr float kVggishMelHi = 7500.0f;        // mel 上限 (Hz)
-constexpr float kVggishLogOffset = 1.0f;       // log1p 偏移（稳定零谱）
+constexpr float kVggishLogOffset =
+    0.01f;  // canonical VGGish log(mel+0.01) 偏移
 
 // hz -> mel（HTK 公式：2595·log10(1+hz/700)）。
 inline float hz_to_mel(float hz) {
@@ -129,7 +130,10 @@ void MlClassifier::ensure_mel_filterbank() const {
     float f_left = mel_to_hz(mel_left);
     float f_center = mel_to_hz(mel_center);
     float f_right = mel_to_hz(mel_right);
-    float row_sum = 0.0f;
+    // canonical VGGish（tf.signal.linear_to_mel_weight_matrix）：未归一化原始
+    // 三角权重（不做行和归一化）。归一化改变 mel 能量分布，喂给在未归一化 mel
+    // 上训练的 VGGish ONNX off-distribution 输入 -> embed 不可靠（review
+    // Important）。
     for (size_t k = 0; k < nbins; ++k) {
       float f = static_cast<float>(k) * (static_cast<float>(kVggishSampleRate) /
                                          static_cast<float>(kVggishNfft));
@@ -145,13 +149,6 @@ void MlClassifier::ensure_mel_filterbank() const {
         w = (denom > 1e-12f) ? (f_right - f) / denom : 0.0f;
       }
       impl_->mel_filterbank[m][k] = w;
-      row_sum += w;
-    }
-    // 归一化行（能量均衡，与 librosa normalize=None 不同但对 kNN 余弦相似度
-    // 无影响 -- 余弦对放缩不敏感）。
-    if (row_sum > 1e-12f) {
-      for (size_t k = 0; k < nbins; ++k)
-        impl_->mel_filterbank[m][k] /= row_sum;
     }
   }
   impl_->mel_built = true;
@@ -178,11 +175,12 @@ std::array<float, kVggishEmbedDim> MlClassifier::embed(const float* pcm48k,
     // 2. STFT -> log-mel [96][64]。
     impl_->logmel.assign(kVggishNumFrames * kVggishMelBins, 0.0f);
     const size_t nbins = kVggishNfft / 2 + 1;  // 257
-    // Hann 窗（每帧同窗，预算一次）。
+    // canonical VGGish（tf.signal.hann_window）：周期 Hann（periodic，分母 N）
+    // 而非对称 Hann（分母 N-1）。
     std::vector<float> hann(kVggishFrame);
     for (size_t i = 0; i < kVggishFrame; ++i)
       hann[i] = 0.5f - 0.5f * std::cos(2.0f * fft::kPi * static_cast<float>(i) /
-                                       static_cast<float>(kVggishFrame - 1));
+                                       static_cast<float>(kVggishFrame));
     if (impl_->scratch_frame.size() < kVggishNfft)
       impl_->scratch_frame.assign(kVggishNfft, 0.0f);
 
@@ -197,14 +195,14 @@ std::array<float, kVggishEmbedDim> MlClassifier::embed(const float* pcm48k,
       }
       // radix-2 FFT（512 是 2 的幂）。
       fft::FftRadix2(X, -1);
-      // 功率谱 -> mel -> log1p。
+      // 功率谱 -> mel -> log(mel + 0.01)（canonical VGGish：加 0.01 偏移，
+      // 非 log1p(e)=log(1+e*1.0)；0.01 vs 1 偏移差异大，off-distribution）。
       for (size_t m = 0; m < kVggishMelBins; ++m) {
         float e = 0.0f;
         for (size_t k = 0; k < nbins; ++k) {
           e += impl_->mel_filterbank[m][k] * std::norm(X[k]);
         }
-        impl_->logmel[fr * kVggishMelBins + m] =
-            std::log1p(e * kVggishLogOffset);
+        impl_->logmel[fr * kVggishMelBins + m] = std::log(e + kVggishLogOffset);
       }
     }
 

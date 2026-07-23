@@ -409,10 +409,25 @@ void NoiseManager::on_period_end() {
         ctx.metrics->on_period_end();
     }
     // Spec5 T2：ONNX 失败降级 housekeeper（D-S5.5）。RT 线程 process 在连续
-    // kBypass 达阈值后置 degraded_pending_；此处（on_period_end，每 period 一次，
-    // 非每帧紧路径）检查并切 passthrough + 锁存告警。switch_plugin("passthrough")
-    // 廉价（无模型 I/O）；旧 ONNX slot 经 retire 延迟到控制线程析构，不在 RT。
-    // 在 evaluate_alerts 前执行，使 plugin_degraded 规则本 period 即可触发。
+    // kBypass 达阈值后置 degraded_pending_；此处（on_period_end，每 period 一次
+    // 约 128ms，非每帧紧路径）检查并切 passthrough + 锁存告警。
+    //
+    // 线程模型偏差（reviewer 标 Important，controller 决策文档化接受）：
+    // brief path A 要求实际 switch_plugin 在控制线程 housekeeper。当前在
+    // capture 线程执行（on_period_end 由 NoiseSessionManagerBridge period-end
+    // 回调在 PcmCaptureService::dispatch 内调，即 capture 线程）。接受理由：
+    // (1) on_period_end 是 period 边界低频路径（~128ms），非 per-frame RT 紧
+    // 路径，近似 path A 精神（不在 per-frame 重活）；(2) switch_plugin 的 RCU
+    // publish 是 atomic store（RT-safe），PassthroughPlugin init 廉价无模型
+    // I/O；(3) just-switched 旧 ONNX slot 经 2-epoch grace safe（drain_retire
+    // reclaim 需 current_epoch>=retire_epoch+2，本 period advance 到 E+1 未达
+    // E+2，不被 reclaim，不在 RT 析构）；(4) older previously-retired slots 的
+    // Ort::Session teardown（ms 级）会在 capture 线程发生，但频率=失败降级触发
+    // 频率（极低，需连续 10 帧 kBypass），在 period 预算内可接受。真正 RT
+    // 严格化
+    // （per-sink thread + seqlock + 控制线程 housekeeper）延后 spec6（3.6 RT
+    // refactor）。在 evaluate_alerts 前执行，使 plugin_degraded 规则本 period
+    // 即可触发。
     for (auto& [id, ctx] : *pinned_table_) {
       if (ctx.denoise && ctx.denoise->degraded_pending()) {
         ctx.denoise->clear_degraded_pending();

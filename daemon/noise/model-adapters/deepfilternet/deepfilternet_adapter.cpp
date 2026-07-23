@@ -5,13 +5,25 @@
 // **当前实现状态（Spec5 T2）**：
 // init() 加载 enc/df_dec/erb_dec 三子图并校验签名，构造 ERB 滤波器组与
 // vorbis 窗。process() 完整实现 libDF 的逐帧流式信号处理（STFT/特征/norm
-// 状态/三子图编排/深度滤波应用/ISTFT overlap-add/lookahead 缓冲），数值
-// 对齐 libDF/src/lib.rs（已克隆仓库实测）。
+// 状态/三子图编排/深度滤波应用/ISTFT overlap-add/lookahead 缓冲）。
 //
-// **风险标注**：DeepFilterNet 三子图的深度滤波（df_op）含 lookahead=2 的
-// 复 FIR 卷积，索引微妙；960 点非二次幂 FFT 经 Bluestein。若数值与 Python
-// 参考偏差，process 退化为直通 + kBypass（§2.2 实时安全契约），绝不喂下游
-// 错误样本。dfn_denoises_nonstation 测试在无模型时 SKIP。
+// **DFN deep-filter correctness debt（reviewer 标 Important，controller 决策
+// 延后+标注，非 silently closed）**：本实现对齐 libDF/src/lib.rs，但 lib.rs 是
+// bare STFT/ISTFT round-trip（无 df/mask 应用），真实深度滤波神经网络逻辑在
+// Python DeepFilterNet/df/modules.py 的 DfOp + spec_pad。对照参考，本实现有 3
+// 处 fidelity 偏差（见下方 6b 深度滤波处详注）：
+//   (a) 因果性反转：参考 spec_pad(df_order=5, lookahead=2) 对输出帧 i 卷积
+//       [i-2, i+2]（2 future 帧），本实现纯因果（current + 4 past），2 帧
+//       未来依赖结构缺失；
+//   (b) coef-to-frame 映射反转：参考 coef[0] 配最旧帧，本实现 coef[0]
+//   配最新帧； (c) 缺 assign_df alpha blend：参考 spec_f*alpha +
+//   spec*(1-alpha)，本实现
+//       纯乘替换 spec_e = (re,im)*gain。
+// 影响：DFN deep-filter 路径 fidelity 降级（ERB mask + global gain 仍工作，故
+// dfn_denoises_nonstation >8dB pass），非崩溃（try/catch + sanitize 保证无 bad
+// samples 喂下游）。修复需对照 modules.py 重写 df 卷积（non-causal window +
+// buffer future frames + coef mapping + alpha blend），应作为独立 DFN 修正
+// task。 在真实 DFN 部署或声称 parity 前必须修。
 #include "deepfilternet_adapter.hpp"
 
 #include <algorithm>
@@ -387,12 +399,23 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
     // 6b. 深度滤波：spec_e[0:96] = df_op(df_spec_history, coefs)。
     // 滑窗 df_spec_history_（最新帧在尾），复 FIR 卷积 order=5。
     // 更新 history：push 当前 spec（前 96 频点），pop 最旧。
+    //
+    // DFN deep-filter correctness debt（详见文件头"DFN deep-filter correctness
+    // debt"，reviewer 标 Important，controller 决策延后）：本卷积为纯因果
+    // （current + 4 past），但参考 DeepFilterNet/df/modules.py 的 DfOp +
+    // spec_pad(df_order=5, lookahead=2) 是非因果 [i-2, i+2]（2 future 帧）。
+    // 此处 (a) 因果性反转 + (b) coef[0] 配最新帧（参考配最旧帧）+
+    // (c) L417 纯乘 spec_e=...*gain 缺 assign_df 的 spec_f*alpha+spec*(1-alpha)
+    // blend。ERB mask + global gain 仍工作故降噪有效，但 df 路径 fidelity
+    // 降级。 修复需对照 modules.py 重写（buffer future frames + coef mapping +
+    // alpha）。
     for (size_t f = 0; f < kNbDf; ++f)
       df_spec_history_.back()[f] = spec_[f];
     std::vector<fft::Complex> spec_e(kFreq);
     for (size_t f = 0; f < kNbDf; ++f) {
       // coefs[f*10 + o*2 + 0]=re_o, [+1]=im_o；sum_o coefs[o]*history[o]。
-      // history 索引：最新帧对应 o=0，越旧 o 越大（时序因果卷积）。
+      // history 索引：最新帧对应 o=0，越旧 o 越大（时序因果卷积，见上方
+      // debt）。
       float re_out = 0.0f, im_out = 0.0f;
       for (size_t o = 0; o < kDfOrder; ++o) {
         const float cr = coefs[f * 10 + o * 2 + 0];

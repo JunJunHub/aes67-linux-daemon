@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -36,6 +37,13 @@ bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
 //   load 时检查 wav_file 对应文件是否存在，缺失则置 false（arch §11 风险15）。
 //   bark_spectrum 特征向量保留，L2 匹配仍可用。save 序列化该字段，
 //   load 时缺省 = true（向后兼容旧 templates.json）。
+// Spec5 T3（D-S5.8）：新增 feature_type + vggish_embedding 字段（additive）。
+//   feature_type 区分 L2（bark，32 维频谱）与 L3（vggish，128 维嵌入）模板。
+//   默认 bark 向后兼容：旧 templates.json 缺该字段 -> Bark。L2 match() 仅扫
+//   bark 模板，L3 经 MlClassifier 扫 vggish 模板。save 序列化该字段 + 嵌入；
+//   load 缺省 feature_type=Bark / vggish_embedding 全零。
+enum class TemplateFeatureType : uint8_t { Bark = 0, Vggish = 1 };
+
 struct Template {
   uint32_t template_id{0};
   std::string name;
@@ -43,6 +51,9 @@ struct Template {
   std::string description;   // Spec3 Task 5（arch §7.5）
   std::string wav_file;      // Spec3 Task 5：相对 template_dir 的文件名
   bool wav_available{true};  // Spec4 T1（D-S4.8）：WAV 文件是否存在
+  // Spec5 T3（D-S5.8）：特征类型 + VGGish 嵌入（仅 feature_type=Vggish 用）。
+  TemplateFeatureType feature_type{TemplateFeatureType::Bark};
+  std::array<float, 128> vggish_embedding{};  // L3 kNN 检索特征向量
 };
 
 // L2 模板匹配库(arch §3.3.5)。
@@ -54,6 +65,11 @@ struct Template {
 // Spec3 Task 4:load(dir)/save(dir) 持久化到 dir/templates.json(arch §7.5)。
 class NoiseTemplateDB {
  public:
+  // Spec5 T3：L3 VGGish 嵌入余弦相似度匹配阈值（identification §3.4 0.75
+  // 沿用；嵌入同类噪声相似度通常 >0.85）。最高相似度 > 此值才判匹配。
+  // public：测试断言 + MlClassifier::classify 检索共用。
+  static constexpr float kVggishMatchThreshold = 0.75f;
+
   // 添加模板,返回分配的 template_id(从 1 起,单调递增)。
   uint32_t add_template(const std::string& name,
                         const std::array<float, 32>& bark_features);
@@ -65,10 +81,30 @@ class NoiseTemplateDB {
                         const std::string& description,
                         const std::string& wav_file);
 
+  // Spec5 T3（D-S5.8）：按特征类型添加模板。
+  //   feature_type=Bark -> 走既有 bark_features 路径（vggish_embedding 忽略）。
+  //   feature_type=Vggish -> 存 vggish_embedding（128 维），bark_features 留空
+  //     （L2 match 跳过该模板）。供 HTTP /api/noise/template POST feature_type=
+  //     vggish 录入路径调用（嵌入由 MlClassifier::embed 提取后传入）。
+  uint32_t add_template(const std::string& name,
+                        const std::string& description,
+                        const std::string& wav_file,
+                        TemplateFeatureType feature_type,
+                        const std::array<float, 32>& bark_features,
+                        const std::array<float, 128>& vggish_embedding);
+
   // 匹配给定 Bark 频谱,返回 (template_id, similarity)。
   // 最高相似度 > 0.75 才视为匹配;否则返回 (0, 0.0f)。
   // 空库直接返回 (0, 0.0f)。零范数守卫:|a|==0 或 |b|==0 时该对相似度记 0。
+  // Spec5 T3：仅扫 feature_type=Bark 模板（vggish 模板不参与 L2）。
   std::pair<uint32_t, float> match(const std::array<float, 32>& bark_spectrum);
+
+  // Spec5 T3（D-S5.8）：L3 VGGish 嵌入检索。仅扫 feature_type=Vggish 模板，
+  // 逐一算 128 维余弦相似度，返回最高（> 阈值）的 (template_id, similarity)；
+  // 无 vggish 模板 / 最高 <= 阈值 / 零范数 -> 返回 (0, 0.0f)。
+  // 供 MlClassifier::classify 调用。kNN 检索的最近邻即最高相似度者。
+  std::pair<uint32_t, float> match_vggish(
+      const std::array<float, 128>& embedding) const;
 
   // 按 id 删除模板。找到并删除返回 true,未找到返回 false。
   // 不重新压缩 id;next_id_ 持续递增。
@@ -126,6 +162,15 @@ class NoiseTemplateDB {
 
   // 匹配阈值(arch §3.3.5 L540):> 0.75 判为该模板的噪声类型。
   static constexpr float kMatchThreshold = 0.75f;
+
+  // Spec5 T3：DB 并发访问保护。原 Spec2/3 DB 仅 HTTP 单线程访问（无锁，
+  // 债务见上文 "Spec3 的 HTTP 层暴露 DB 时再加 mutex"）。L3 在 capture 线程
+  // 读 vggish 模板（match_vggish）而 HTTP 线程增删模板 -> 需互斥。用
+  // recursive_mutex：add_template_from_wav 持锁调 add_template/get_template/
+  // save/remove_template（嵌套同线程重入），plain mutex 会死锁。RT 读
+  // match_vggish 非竞争锁 ~25ns，调用 ~1Hz，占比可忽略（与 NoiseMetrics::
+  // collect 持 metrics_mutex_ 同论证）。
+  mutable std::recursive_mutex mutex_;
 };
 
 }  // namespace noise

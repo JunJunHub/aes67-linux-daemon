@@ -29,6 +29,15 @@ std::string noise_type_to_string(NoiseType type);
 
 namespace noise {
 
+// Spec5 T1：①②③④ 链路固定工作在 48kHz（RNNoise native 48k，arch §3.1）。
+// 入口 Resampler 将 native 采样率转为此值；native==此值时 passthrough。
+// 与 RnnoiseAdapter::native_sample_rate()(48k) + RefComparator 默认 48k 同源。
+static constexpr uint32_t kPipelineRateHz = 48000;
+// 48k 链路的 per-chunk 帧数（= denoise max_frame_ = RNNoise kFrameSize =
+// 480）。 on_frame 接收 native-rate 480-样本子帧（bridge
+// kSubFrame），重采样后按 48k 480-样本 chunk 喂入 ①②③④。
+static constexpr size_t kPipelineFrame = 480;
+
 NoiseManager::NoiseManager(NoiseAudioBridge& bridge) : bridge_(bridge) {
   // Spec3 T8b（C2 修复）：向 Bridge 注册 period 生命周期回调，使
   // PcmCaptureService provider 回调能驱动 on_period_begin/on_period_end
@@ -58,6 +67,8 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.denoise_enabled = cfg.denoise_enabled;
   // ① DenoiseProcessor：构造即装 PassthroughPlugin（plugin_ 永不为空）。
   ctx.denoise = std::make_shared<DenoiseProcessor>();
+  // Spec5 T2：注入 ONNX 模型目录（dtln/deepfilternet init 推导模型路径用）。
+  ctx.denoise->set_onnx_model_dir(onnx_model_dir_);
   // 若 cfg 指定非 passthrough 插件，切换（如 "rnnoise"）。
   if (!cfg.plugin_name.empty() && cfg.plugin_name != "passthrough") {
     ctx.denoise->switch_plugin(cfg.plugin_name);
@@ -71,6 +82,11 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.detector->set_sensitivity(cfg.sensitivity);
   // ③ NoiseAnalyzer（L1 规则式 + L2 模板匹配）。
   ctx.analyzer = std::make_shared<NoiseAnalyzer>();
+  // Spec5 T3：注入 L3 ML 分类器 + 模板库（main 装配 set_ml_classifier/
+  // set_template_db 后，add_sensor 时传给各 sensor analyzer；为空则 L3 跳过，
+  // L1+L2 不受影响）。
+  ctx.analyzer->set_ml_classifier(ml_classifier_);
+  ctx.analyzer->set_template_db(template_db_);
   // ④ NoiseMetrics（Spec3 Task 2 真聚合，替 Spec2 stub）。
   // set_denoise_state 用 atomic 写，collect() RT 路径 atomic 读 -> 无竞争。
   ctx.metrics = std::make_shared<NoiseMetrics>();
@@ -88,6 +104,13 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   // Spec3 Task 7 path A：plugin reset 计数（控制线程 on_capture_thread_joined
   // 写，plugin_reset_count_for_test 读，shared_ptr 跨 COW 表共享）。
   ctx.reset_count = std::make_shared<std::atomic<size_t>>(0);
+  // Spec5 T1：per-sensor 入口重采样器。native = bridge_.get_sample_rate()
+  // （daemon 原生采样率，arch §3.1），out 固定 48k（①②③④ 链路要求）。
+  // native==48k 时 Resampler 自身为 passthrough（不实例化 SpeexDSP）。
+  // 不加 Config 字段（task brief：用 daemon sample_rate 判断）。
+  const uint32_t native_rate = bridge_.get_sample_rate();
+  ctx.resampler = std::make_shared<Resampler>(native_rate, kPipelineRateHz);
+  ctx.resample_fifo = std::make_shared<std::deque<float>>();
   // Spec3 Task 4：保存原始 cfg 供 save_status 序列化（arch §7.4）。
   ctx.cfg = cfg;
 
@@ -139,6 +162,11 @@ bool NoiseManager::switch_plugin(uint8_t sensor_id, const std::string& name) {
   if (ok) {
     it->second.cfg.plugin_name = name;
     save_status();
+    // Spec5 T2：切到非 passthrough 插件视为用户重试 -> 清 plugin_degraded
+    // 告警锁存（新插件若再次反复失败会重新置位）。切 passthrough 不清
+    // （degradation 本身就是切 passthrough，告警应保持）。
+    if (name != "passthrough" && it->second.metrics)
+      it->second.metrics->set_plugin_degraded(false);
   }
   return ok;
 }
@@ -256,65 +284,36 @@ void NoiseManager::on_frame(uint8_t sink_id,
     if (ctx.frame_count)
       ctx.frame_count->fetch_add(1, std::memory_order_relaxed);
 
-    // ① DenoiseProcessor.process：写 back_（original/denoised/noise）。
-    //    返回 n = 实际输出样本数（plugin 可能因首帧延迟返回 < n_in）。
-    DenoiseResult denoise_result;
-    size_t n = ctx.denoise->process(frames, frame_size, &denoise_result);
-    // 当前 period 的数据视图（back_，刚写入）。get_current_output 与
-    // get_output 的区别见 denoise_processor.hpp 注释。
-    const DenoiseOutput* out = ctx.denoise->get_current_output();
-
-    // ② NoiseDetectionResult 构建（分析源选择 §3.3.1）：
-    //   denoise_enabled=true  -> RNNoise VAD 为主，Detector VAD 辅助（SF/SNR
-    //                            交叉验证），VAD 取 RNNoise。
-    //   denoise_enabled=false -> Detector VAD 为唯一源。
-    NoiseDetectionResult detection{};
-    if (ctx.denoise_enabled) {
-      // RNNoise VAD 为主（denoise_result.has_vad 时取其概率）。
-      detection.is_speech =
-          denoise_result.has_vad && (denoise_result.vad_probability > 0.5f);
-      // 同时调 Detector 做监测（SF/SNR 用于交叉验证），但 VAD 不覆盖。
-      NoiseDetectionResult det_monitoring =
-          ctx.detector->process_frame(frames, frame_size);
-      detection.spectral_flatness = det_monitoring.spectral_flatness;
-      detection.estimated_snr_db = det_monitoring.estimated_snr_db;
-      detection.confidence = det_monitoring.confidence;
-      detection.is_noisy = det_monitoring.is_noisy;
+    // Spec5 T1：入口重采样 native -> 48k（arch §3.1）。①②③④ 链路与 RNNoise
+    // 要求 48k：native≠48k 时 on_frame 顶部先转 48k 再分发；native==48k 时
+    // Resampler 为 passthrough，零 SpeexDSP 开销直通。重采样为流式（SpeexDSP
+    // 滤波状态跨 on_frame 连续），输出进 per-sensor FIFO，按 48k 480-样本 chunk
+    // 逐个喂入 ①②③④（一个 on_frame 可能 emit 0/1/N 个 chunk；period_begin/end
+    // 仍每 ALSA period 一次，metrics 在 on_period_end 聚合，变长 chunk
+    // 不影响）。 注意：RefComparator 路由（on_frame 末尾，原生帧）不变，仍每
+    // on_frame 一次。
+    if (!ctx.resampler || ctx.resampler->is_passthrough()) {
+      // 48k 直通：不经 SpeexDSP / FIFO，直接处理输入帧（与 Spec4 行为一致）。
+      process_pipeline_chunk(ctx, frames, frame_size);
     } else {
-      detection = ctx.detector->process_frame(frames, frame_size);
+      // native≠48k：resample native chunk -> per-sensor FIFO -> 喂 48k 480
+      // chunk。
+      const size_t need = ctx.resampler->max_output_for_input(frame_size);
+      if (resample_scratch_.size() < need)
+        resample_scratch_.resize(need);  // 首帧 warmup 后稳定，无重新分配
+      const size_t produced =
+          ctx.resampler->process(frames, frame_size, resample_scratch_.data(),
+                                 resample_scratch_.size());
+      auto& fifo = *ctx.resample_fifo;
+      fifo.insert(fifo.end(), resample_scratch_.data(),
+                  resample_scratch_.data() + produced);
+      float chunk[kPipelineFrame];
+      while (fifo.size() >= kPipelineFrame) {
+        std::copy(fifo.begin(), fifo.begin() + kPipelineFrame, chunk);
+        fifo.erase(fifo.begin(), fifo.begin() + kPipelineFrame);
+        process_pipeline_chunk(ctx, chunk, kPipelineFrame);
+      }
     }
-
-    // ③ 分析源选择（arch §3.3.1）：
-    //   denoise_enabled=true  -> NoisePCM (out->noise = original - denoised)
-    //                            纯噪声分量，分类最准
-    //   denoise_enabled=false -> OriginalPCM (frames)
-    const float* analysis_pcm = frames;
-    size_t analysis_n = frame_size;
-    if (ctx.denoise_enabled && out != nullptr && out->noise != nullptr) {
-      analysis_pcm = out->noise;
-      analysis_n = n;
-    }
-    NoiseAnalysisResult ar =
-        ctx.analyzer->analyze(analysis_pcm, analysis_n, detection);
-    *ctx.last_analysis =
-        ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
-
-    // ④ NoiseMetrics 真聚合（Spec3 Task 2，替 Spec2 stub no-op）。
-    // input_rms = RMS(frames)（原始 PCM），denoised_rms = RMS(out->denoised)
-    // （降噪 PCM）。out 可能为 nullptr（首帧或异常），此时 denoised_rms=0，
-    // collect() 内部 guard divide-by-zero（noise_reduction_db=0）。
-    float input_rms = 0.0f;
-    for (size_t i = 0; i < frame_size; ++i)
-      input_rms += frames[i] * frames[i];
-    input_rms = std::sqrt(input_rms / static_cast<float>(frame_size));
-    float denoised_rms = 0.0f;
-    if (out != nullptr && out->denoised != nullptr && n > 0) {
-      for (size_t i = 0; i < n; ++i)
-        denoised_rms += out->denoised[i] * out->denoised[i];
-      denoised_rms = std::sqrt(denoised_rms / static_cast<float>(n));
-    }
-    ctx.metrics->collect(denoise_result, detection, ar, input_rms,
-                         denoised_rms);
     break;
   }
 
@@ -324,7 +323,80 @@ void NoiseManager::on_frame(uint8_t sink_id,
   // 查找用 ref_routing_ map（sink_id -> {comparator_id, role}）。
   // 持 ref_mutex_（~0.5μs memcpy，与 NoiseMetrics::collect 同模式，不影响
   // RT 预算）。一个 sink 可同时是多个 comparator 的输入，遍历所有匹配路由。
+  // Spec5 T1：路由仍用原生帧（frame_size），每 on_frame 一次，不变。
+  //
+  // 已知限制（reviewer 标 Important，controller 决策显式延后，非 silently
+  // closed）： T1 解除了 on_frame 的 48k 限制，使 native≠48k 可达此路径，但
+  // RefComparator 构造用默认 sample_rate=48000（见 add_ref_comparator 的
+  // make_shared<RefComparator>）， delay_ms 按此换算（ref_comparator.cpp
+  // delay_samples*1000/sample_rate_）。故 native≠48k 时 comparator 吃原生帧却按
+  // 48k 算 delay_ms -> 数值失准（44.1k 偏低 ~8.4%）。修复需设计 comparator 的
+  // 48k 流喂入语义（频率/缓冲），当前 native≠48k +comparator
+  // 组合无测试场景，延后到 spec6（3.6 RT refactor）或独立 fix task。
+  // passthrough 路径（native==48k，全部已测生产）字节一致 Spec4，不受影响。
   route_to_ref_comparators(sink_id, frames, frame_size);
+}
+
+void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
+                                          const float* pcm,
+                                          size_t n) {
+  // ① DenoiseProcessor.process：写 back_（original/denoised/noise）。
+  //    返回 dn = 实际输出样本数（plugin 可能因首帧延迟返回 < n）。
+  DenoiseResult denoise_result;
+  size_t dn = ctx.denoise->process(pcm, n, &denoise_result);
+  // 当前 period 的数据视图（back_，刚写入）。get_current_output 与
+  // get_output 的区别见 denoise_processor.hpp 注释。
+  const DenoiseOutput* out = ctx.denoise->get_current_output();
+
+  // ② NoiseDetectionResult 构建（分析源选择 §3.3.1）：
+  //   denoise_enabled=true  -> RNNoise VAD 为主，Detector VAD 辅助（SF/SNR
+  //                            交叉验证），VAD 取 RNNoise。
+  //   denoise_enabled=false -> Detector VAD 为唯一源。
+  NoiseDetectionResult detection{};
+  if (ctx.denoise_enabled) {
+    // RNNoise VAD 为主（denoise_result.has_vad 时取其概率）。
+    detection.is_speech =
+        denoise_result.has_vad && (denoise_result.vad_probability > 0.5f);
+    // 同时调 Detector 做监测（SF/SNR 用于交叉验证），但 VAD 不覆盖。
+    NoiseDetectionResult det_monitoring = ctx.detector->process_frame(pcm, n);
+    detection.spectral_flatness = det_monitoring.spectral_flatness;
+    detection.estimated_snr_db = det_monitoring.estimated_snr_db;
+    detection.confidence = det_monitoring.confidence;
+    detection.is_noisy = det_monitoring.is_noisy;
+  } else {
+    detection = ctx.detector->process_frame(pcm, n);
+  }
+
+  // ③ 分析源选择（arch §3.3.1）：
+  //   denoise_enabled=true  -> NoisePCM (out->noise = original - denoised)
+  //                            纯噪声分量，分类最准
+  //   denoise_enabled=false -> OriginalPCM (pcm)
+  const float* analysis_pcm = pcm;
+  size_t analysis_n = n;
+  if (ctx.denoise_enabled && out != nullptr && out->noise != nullptr) {
+    analysis_pcm = out->noise;
+    analysis_n = dn;
+  }
+  NoiseAnalysisResult ar =
+      ctx.analyzer->analyze(analysis_pcm, analysis_n, detection);
+  *ctx.last_analysis =
+      ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
+
+  // ④ NoiseMetrics 真聚合（Spec3 Task 2，替 Spec2 stub no-op）。
+  // input_rms = RMS(pcm)（原始 PCM），denoised_rms = RMS(out->denoised)
+  // （降噪 PCM）。out 可能为 nullptr（首帧或异常），此时 denoised_rms=0，
+  // collect() 内部 guard divide-by-zero（noise_reduction_db=0）。
+  float input_rms = 0.0f;
+  for (size_t i = 0; i < n; ++i)
+    input_rms += pcm[i] * pcm[i];
+  input_rms = std::sqrt(input_rms / static_cast<float>(n));
+  float denoised_rms = 0.0f;
+  if (out != nullptr && out->denoised != nullptr && dn > 0) {
+    for (size_t i = 0; i < dn; ++i)
+      denoised_rms += out->denoised[i] * out->denoised[i];
+    denoised_rms = std::sqrt(denoised_rms / static_cast<float>(dn));
+  }
+  ctx.metrics->collect(denoise_result, detection, ar, input_rms, denoised_rms);
 }
 
 void NoiseManager::on_period_end() {
@@ -340,6 +412,35 @@ void NoiseManager::on_period_end() {
         ctx.denoise->on_period_end();
       if (ctx.metrics)
         ctx.metrics->on_period_end();
+    }
+    // Spec5 T2：ONNX 失败降级 housekeeper（D-S5.5）。RT 线程 process 在连续
+    // kBypass 达阈值后置 degraded_pending_；此处（on_period_end，每 period 一次
+    // 约 128ms，非每帧紧路径）检查并切 passthrough + 锁存告警。
+    //
+    // 线程模型偏差（reviewer 标 Important，controller 决策文档化接受）：
+    // brief path A 要求实际 switch_plugin 在控制线程 housekeeper。当前在
+    // capture 线程执行（on_period_end 由 NoiseSessionManagerBridge period-end
+    // 回调在 PcmCaptureService::dispatch 内调，即 capture 线程）。接受理由：
+    // (1) on_period_end 是 period 边界低频路径（~128ms），非 per-frame RT 紧
+    // 路径，近似 path A 精神（不在 per-frame 重活）；(2) switch_plugin 的 RCU
+    // publish 是 atomic store（RT-safe），PassthroughPlugin init 廉价无模型
+    // I/O；(3) just-switched 旧 ONNX slot 经 2-epoch grace safe（drain_retire
+    // reclaim 需 current_epoch>=retire_epoch+2，本 period advance 到 E+1 未达
+    // E+2，不被 reclaim，不在 RT 析构）；(4) older previously-retired slots 的
+    // Ort::Session teardown（ms 级）会在 capture 线程发生，但频率=失败降级触发
+    // 频率（极低，需连续 10 帧 kBypass），在 period 预算内可接受。真正 RT
+    // 严格化
+    // （per-sink thread + seqlock + 控制线程 housekeeper）延后 spec6（3.6 RT
+    // refactor）。在 evaluate_alerts 前执行，使 plugin_degraded 规则本 period
+    // 即可触发。
+    for (auto& [id, ctx] : *pinned_table_) {
+      if (ctx.denoise && ctx.denoise->degraded_pending()) {
+        ctx.denoise->clear_degraded_pending();
+        ctx.denoise->switch_plugin("passthrough");
+        ctx.denoise->drain_retire();
+        if (ctx.metrics)
+          ctx.metrics->set_plugin_degraded(true);
+      }
     }
     // Spec4 T4：告警引擎评估（D-S4.2）。
     // 在 denoise/metrics on_period_end（swap + collect 完成）后，

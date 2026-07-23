@@ -519,7 +519,11 @@ BOOST_AUTO_TEST_CASE(set_ptp_config) {
   auto domain = pt.get<int>("domain");
   auto dscp = pt.get<int>("dscp");
   BOOST_REQUIRE_MESSAGE(domain == 1 && dscp == 48, "ptp config as excepcted");
-  std::ifstream fs("./daemon.conf");
+  // 用 AES67_DAEMON_TEST_DIR 绝对路径（daemon 写 config 到 start_dir=
+  // AES67_DAEMON_TEST_DIR=daemon/tests/）；原 "./daemon.conf" 相对测试进程
+  // 工作目录，不在 daemon/tests/ 跑时找不到 -> fs.good() fatal -> 恢复
+  // set_ptp_config(0,46) 不执行 -> daemon.conf 留 1/48 污染。
+  std::ifstream fs(std::string(AES67_DAEMON_TEST_DIR) + "/daemon.conf");
   BOOST_REQUIRE_MESSAGE(fs.good(), "config file status as excepcted");
   boost::property_tree::read_json(fs, pt);
   domain = pt.get<int>("ptp_domain");

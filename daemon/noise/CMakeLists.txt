@@ -4,7 +4,6 @@
 # 库合法），改用 STATIC + 普通链接（daemon/CMakeLists.txt 的 noise-test target
 # 用 target_link_libraries(... noise)）。
 set(NOISE_SOURCES
-  audio_capture.cpp
   noise_manager.cpp
   noise_metrics.cpp
   noise_http.cpp
@@ -18,10 +17,29 @@ set(NOISE_SOURCES
   noise_template_db.cpp
   ref_comparator.cpp
   sse_broadcaster.cpp
+  resampler.cpp
+  ml_classifier.cpp
 )
 
 add_library(noise STATIC ${NOISE_SOURCES})
 target_include_directories(noise PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Spec5 T1：SpeexDSP 重采样依赖（native↔48k，resampler.cpp）。
+# 本文件仅在 daemon/CMakeLists.txt 的 if(WITH_NOISE) 内 add_subdirectory，
+# 故 WITH_NOISE=OFF 时此块不执行，不引入 SpeexDSP（--no-noise 零回归）。
+# libspeexdsp 无 CMake config（仅 .pc），用 find_path/find_library（与 daemon
+# 既有 ALSA/AVAHI/faac 同模式；不用 pkg_check_modules 以匹配本仓库风格）。
+# resampler.hpp 是 noise 的 PUBLIC 头（noise_manager.hpp 经它暴露 SpeexDSP
+# 类型），故 include + link 用 PUBLIC：noise-test / aes67-daemon 经 noise
+# 传递性获得 SpeexDSP 头与库。
+find_path(SPEEXDSP_INCLUDE_DIR speex/speex_resampler.h)
+find_library(SPEEXDSP_LIBRARY NAMES speexdsp)
+if(NOT SPEEXDSP_INCLUDE_DIR OR NOT SPEEXDSP_LIBRARY)
+  message(FATAL_ERROR
+    "SpeexDSP not found (install libspeexdsp-dev, e.g. debian-packages.sh)")
+endif()
+target_include_directories(noise PUBLIC ${SPEEXDSP_INCLUDE_DIR})
+target_link_libraries(noise PUBLIC ${SPEEXDSP_LIBRARY})
 
 # RNNoise 降噪插件（Spec2 1.6b）。
 # 整个 daemon/noise/CMakeLists.txt 由 daemon/CMakeLists.txt 的
@@ -113,4 +131,67 @@ if(NOISE_PLUGIN_RNNOISE)
   # "rnnoise.h",故 noise 的消费者（noise-test / aes67-daemon）需可见 rnnoise 的
   # include 目录才能编译包含 adapter 头的源文件。
   target_link_libraries(noise PUBLIC rnnoise)
+endif()
+
+# ── Spec5 T2：ONNX Runtime 统一后端 + DTLN/DeepFilterNet 插件 ──────────────
+# denoise-plugin §0.1/§3.2/§3.3：DTLN/DFN 经 ONNX Runtime C++ 加载 ONNX 模型。
+# onnxruntime 无系统包（venv 仅 Python binding），下载官方 C/C++ release 到
+# build 缓存目录（与 RNNoise model tarball 同模式：file(DOWNLOAD) + 缓存）。
+# 版本 1.27.0（与验证环境 venv onnxruntime 一致）。
+option(NOISE_PLUGIN_DTLN "Build DTLN denoise plugin (needs ONNX Runtime)" ON)
+option(NOISE_PLUGIN_DEEPFILTER "Build DeepFilterNet denoise plugin (needs ONNX Runtime)" ON)
+
+if(NOISE_PLUGIN_DTLN OR NOISE_PLUGIN_DEEPFILTER)
+  set(ORT_VERSION "1.27.0")
+  set(ORT_TGZ_NAME "onnxruntime-linux-x64-${ORT_VERSION}.tgz")
+  set(ORT_CACHE_DIR "${CMAKE_BINARY_DIR}/onnxruntime-cache")
+  set(ORT_TGZ "${ORT_CACHE_DIR}/${ORT_TGZ_NAME}")
+  set(ORT_EXTRACT_DIR "${ORT_CACHE_DIR}/onnxruntime-linux-x64-${ORT_VERSION}")
+  if(NOT EXISTS "${ORT_EXTRACT_DIR}/include/onnxruntime_cxx_api.h")
+    if(EXISTS "${ORT_TGZ}")
+      message(STATUS "Using cached ONNX Runtime tarball")
+    else()
+      message(STATUS "Downloading ONNX Runtime C/C++ release (~30MB)...")
+      file(DOWNLOAD
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ_NAME}"
+        ${ORT_TGZ} SHOW_PROGRESS TIMEOUT 600)
+    endif()
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E tar xf ${ORT_TGZ}
+      WORKING_DIRECTORY ${ORT_CACHE_DIR}
+      RESULT_VARIABLE ort_result)
+    if(NOT ort_result EQUAL 0)
+      message(FATAL_ERROR "Failed to extract ONNX Runtime tarball")
+    endif()
+  endif()
+
+  # find_path/find_library 指向解压目录（不污染系统搜索路径）。
+  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            PATHS "${ORT_EXTRACT_DIR}/include" NO_DEFAULT_PATH)
+  # release 同时提供 libonnxruntime.so(.1/.1.27.0) 三个符号链接/文件。
+  find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime onnxruntime.1
+               PATHS "${ORT_EXTRACT_DIR}/lib" NO_DEFAULT_PATH)
+  if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
+    message(FATAL_ERROR "ONNX Runtime headers/lib not found in ${ORT_EXTRACT_DIR}")
+  endif()
+  message(STATUS "ONNX Runtime: ${ONNXRUNTIME_LIBRARY}")
+  # ONNX 基建 TU（Ort::Env 单例 + CreateOnnxSession）：仅 onnxruntime 可用时编译
+  # （onnx_session.hpp include onnxruntime_cxx_api.h，无 ORT 时不可编译）。
+  target_sources(noise PRIVATE onnx_session.cpp)
+  # noise 的 PUBLIC 头（onnx_session.hpp）include onnxruntime_cxx_api.h，故
+  # include 用 PUBLIC：noise-test / aes67-daemon 经 noise 传递性获得头。
+  target_include_directories(noise PUBLIC ${ONNXRUNTIME_INCLUDE_DIR})
+  # 链接 full-path .so：CMake 默认把 lib 所在目录加入可执行文件 RPATH，
+  # 使 noise-test / aes67-daemon 运行时能找到 libonnxruntime.so。
+  target_link_libraries(noise PUBLIC ${ONNXRUNTIME_LIBRARY})
+  # 显式 BUILD_RPATH 兜底（部分 CMake 版本对 PRIVATE 传递不自动加 RPATH）。
+  set(ONNXRUNTIME_LIB_DIR "${ORT_EXTRACT_DIR}/lib" CACHE PATH "ONNX Runtime lib dir")
+endif()
+
+if(NOISE_PLUGIN_DTLN)
+  target_sources(noise PRIVATE model-adapters/dtln/dtln_adapter.cpp)
+endif()
+if(NOISE_PLUGIN_DEEPFILTER)
+  target_sources(noise PRIVATE
+    model-adapters/deepfilternet/deepfilternet_adapter.cpp)
 endif()

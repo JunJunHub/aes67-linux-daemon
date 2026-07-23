@@ -189,7 +189,7 @@ flowchart TB
 
     subgraph NOISE["噪声分析与降噪模块"]
         BRIDGE_IF["NoiseAudioBridge<br/>纯虚桥接接口"]
-        CAP["AudioCapture<br/>帧分发 (噪声内部)"]
+        NM2["NoiseManager::on_frame<br/>帧分发 (噪声内部)"]
         DNR["① DenoiseProcessor×N<br/>降噪 (三路输出)<br/>(per-sensor 各持插件)<br/>始终执行，不门控"]
         DET["② NoiseDetector<br/>噪声检测 (监测角色)<br/>始终执行，纯监测"]
         ANA["③ NoiseAnalyzer<br/>分类 + 置信度"]
@@ -227,7 +227,7 @@ flowchart TB
 >
 > **Streamer 重构**：Streamer 不再持有 `capture_handle_`，不再调用 `snd_pcm_open()`/`snd_pcm_readi()`，改为从 `PcmCaptureService` 注册 FrameProvider 拿帧。Streamer 支持 **AAC 编码**和 **PCM 直通**两种输出模式，可选择编码原始 PCM、降噪 PCM 或噪声 PCM（= 原始 - 降噪）三路之一。
 >
-> **AudioCapture 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内的 `AudioCapture` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后经 NoiseManager 按传感器调度 ①→②→③→④ 顺序处理链路。两者职责不同，不在同一抽象层次。
+> **NoiseManager::on_frame 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内 `NoiseManager::on_frame` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后经 NoiseManager 按传感器调度 ①→②→③→④ 顺序处理链路。两者职责不同，不在同一抽象层次。
 >
 > **①→② 顺序执行，无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（详见 §6.3 线程模型）。
 >
@@ -243,9 +243,9 @@ flowchart TB
 |------|------|
 | **模块化隔离** | 噪声模块由 `WITH_NOISE` CMake 选项控制（默认 OFF），关闭时 daemon 行为零变化，代码隔离在 `daemon/noise/` |
 | **桥接解耦** | 噪声模块经纯虚接口 `NoiseAudioBridge` 接入 daemon 核心，不直接依赖 SessionManager/Config |
-| **统一 PCM 分发** | Bridge 实现类独占 ALSA capture 设备，所有帧消费者（AudioCapture、Streamer）通过 FrameProvider 回调获取帧，避免设备冲突和重复读取 |
+| **统一 PCM 分发** | Bridge 实现类独占 ALSA capture 设备，所有帧消费者（NoiseManager、Streamer）通过 FrameProvider 回调获取帧，避免设备冲突和重复读取 |
 | **帧式处理** | 所有分析/降噪以固定帧长（RNNoise = 480 样本 @48kHz = 10ms）为处理单元，保证实时性 |
-| **零拷贝优先** | 帧分发全程 const 指针传递（PcmCaptureService → Bridge → AudioCapture → NoiseManager → ①②③④），仅 ALSA 读取和 uint8_t→float 格式转换产生不可消除拷贝；DenoiseProcessor 每帧拷贝 input → original_buf_（1.9 KB，保证 Phase 1/3 线程安全统一）；NoiseAnalyzer 缓冲逐帧特征而非原始 PCM（§3.3.7，-92% 内存） |
+| **零拷贝优先** | 帧分发全程 const 指针传递（PcmCaptureService → Bridge → NoiseManager → ①②③④），仅 ALSA 读取和 uint8_t→float 格式转换产生不可消除拷贝；DenoiseProcessor 每帧拷贝 input → original_buf_（1.9 KB，保证 Phase 1/3 线程安全统一）；NoiseAnalyzer 缓冲逐帧特征而非原始 PCM（§3.3.7，-92% 内存） |
 | **HTTP 可控** | 噪声检测/降噪的启停、参数调整均通过 HTTP REST API 暴露，供 Web UI 或外部脚本操作 |
 
 ### 2.3 目录结构
@@ -271,7 +271,7 @@ daemon/
 │   ├── denoise_plugin_factory.hpp      # DenoisePluginRegistry 单例（注册/创建插件）
 │   ├── noise_template.hpp/cpp          # NoiseTemplate 结构 + NoiseTemplateDB 模板库
 │   │                                    # 持久化: templates.json (特征索引) + *.wav (原始音频)
-│   ├── resampler.hpp/cpp               # 入口重采样 native↔48k（libsamplerate/SpeexDSP）；AudioCapture 入口调用，Phase ≥2 非原生 48kHz 时启用；与 adapter 内部 48k↔16k（DTLN 自包含）区分
+│   ├── resampler.hpp/cpp               # 入口重采样 native↔48k（libsamplerate/SpeexDSP）；NoiseManager::on_frame 入口调用，Phase ≥2 非原生 48kHz 时启用；与 adapter 内部 48k↔16k（DTLN 自包含）区分
 │   ├── model-adapters/                       # 降噪插件适配器（每个模型一个子目录）
 │   │   ├── rnnoise/                    # RNNoise 适配器
 │   │   │   ├── rnnoise_adapter.hpp     # RnnoiseAdapter : IDenoisePlugin
@@ -316,15 +316,14 @@ daemon/
 
 ## 3. 模块详细设计
 
-### 3.1 AudioCapture — 噪声模块帧分发
+### 3.1 噪声模块帧分发（NoiseManager::on_frame）
 
-**职责**：从 `NoiseAudioBridge` 的 `FrameProvider` 回调接收 PCM 帧，分发给下游噪声分析/降噪模块。AudioCapture 是噪声模块内部的帧分发入口，不直接打开 ALSA 设备——ALSA capture 由核心层的 `PcmCaptureService` 负责。
+**职责**：`NoiseManager::on_frame` 从 `NoiseAudioBridge` 的 `FrameProvider` 回调接收 PCM 帧（经 `NoiseSessionManagerBridge::on_pcm_frame` 解复用 S16->float 后调用），在顶部做入口重采样（native->48k，Spec5 T1）后调度 ①->②->③->④ 链路。不直接打开 ALSA 设备--ALSA capture 由核心层的 `PcmCaptureService` 负责。
 
 ```mermaid
 flowchart LR
     PCS["PcmCaptureService<br/>(daemon 核心层)"] -->|FrameProvider| BRIDGE["NoiseAudioBridge"]
-    BRIDGE --> CAP["AudioCapture<br/>(noise 模块)"]
-    CAP --> NM["NoiseManager<br/>on_frame()"]
+    BRIDGE -->|"on_pcm_frame -> entry.provider lambda"| NM["NoiseManager<br/>on_frame()"]
     NM --> DNR["① DenoiseProcessor<br/>(始终执行，不门控)"]
     DNR --> DET["② NoiseDetector<br/>(始终执行，纯监测)"]
     DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA["③ NoiseAnalyzer"]
@@ -340,50 +339,20 @@ flowchart LR
 |------|------|------|
 | **daemon 核心层** | `PcmCaptureService` | 独占 ALSA capture，读取帧，推送给所有 FrameProvider 消费者 |
 | **noise 桥接层** | `NoiseAudioBridge` / `NoiseSessionManagerBridge` | 适配接口，将 PcmCaptureService 的帧桥接到噪声模块 |
-| **noise 模块层** | `AudioCapture` → `NoiseManager` | 帧入口 + 按传感器顺序调度处理链路（①→②→③→④） |
+| **noise 模块层** | `NoiseManager::on_frame` | 帧入口（native->48k 重采样）+ 按传感器顺序调度处理链路（①->②->③->④） |
 
 > **①→② 顺序执行，但无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不依赖②的结果来决定是否处理，②也不依赖①——两者无数据依赖，但始终顺序执行（NoiseDetector 仅 ~0.3ms，并行省不到 3% 帧预算，不值得引入线程同步开销）。③NoiseAnalyzer 根据降噪模式从①或②取输入。RefComparator 不在主链路中，维护双路环形缓冲独立触发（虚线箭头）。详见 §6.3 线程模型。
 
 **关键设计**：
 
-- **帧来源**：`PcmCaptureService`（核心层）独占 ALSA 设备 `plughw:RAVENNA`，读取帧后推送给所有注册的 FrameProvider。AudioCapture 通过 NoiseAudioBridge 间接收帧
-- **帧格式**：float（与 RNNoise 输入一致），48kHz 采样率（RNNoise 固定要求，AudioCapture 入口重采样后的下游格式）
+- **帧来源**：`PcmCaptureService`（核心层）独占 ALSA 设备 `plughw:RAVENNA`，读取帧后推送给所有注册的 FrameProvider。`NoiseManager` 经 `NoiseAudioBridge` 间接收帧（`on_pcm_frame` -> `entry.provider` lambda -> `on_frame`）
+- **帧格式**：float（与 RNNoise 输入一致），48kHz 采样率（RNNoise 固定要求，`on_frame` 入口重采样后的下游格式）
 - **帧长**：480 样本/帧（10ms @48kHz），与 RNNoise `FRAME_SIZE` 一致
-- **通道选择**：由 `PcmCaptureService` 按 Sink 的 channel map 从 ALSA 交错缓冲区提取，AudioCapture 收到的已是目标通道的连续帧
-- **分发机制**：观察者模式，注册帧回调；多个消费者共享同一帧缓冲（零拷贝读）
-- **采样率适配**：`PcmCaptureService` 始终以 daemon 配置的**原生采样率**分发帧（Streamer 的 faac 按原生采样率打开）。噪声模块在入口（`AudioCapture`）用 `noise/resampler.hpp` 将原生采样率转 48kHz（RNNoise 固定要求）再分发下游；Phase 1 限定 48kHz，原生即 48kHz，重采样为直通。详见 §11 风险 1
+- **通道选择**：由 `PcmCaptureService` 按 Sink 的 channel map 从 ALSA 交错缓冲区提取，`on_frame` 收到的已是目标通道的连续帧
+- **分发机制**：`on_frame` 内顺序调度 ①->②->③->④（无观察者模式，C2 fix 直接调用）
+- **采样率适配**：`PcmCaptureService` 始终以 daemon 配置的**原生采样率**分发帧（Streamer 的 faac 按原生采样率打开）。`NoiseManager::on_frame` 顶部用 `noise/resampler.hpp`（Spec5 T1）将原生采样率转 48kHz（RNNoise 固定要求）再分发下游；native==48k 时 passthrough 直通零成本。详见 §11 风险 1
 
-**接口**：
-
-```cpp
-// daemon/noise/audio_capture.hpp
-class AudioCapture {
-public:
-  using FrameCallback = std::function<void(const float* frames, size_t frame_size,
-                                            uint8_t channel_count)>;
-
-  // 启动截取：向 Bridge 注册 FrameProvider，开始接收 PCM 帧
-  bool start(uint8_t sink_id, NoiseAudioBridge& bridge);
-  bool stop();
-  void register_callback(FrameCallback cb);
-  bool is_running() const;
-
-  // ── period 生命周期（BL2）：由 NoiseSessionManagerBridge.on_pcm_frame 在
-  //   ALSA period 边界调用--on_period_begin 在帧分发前，on_period_end 在分发后。
-  //   转发给 NoiseManager.on_period_begin/end（§3.7），驱动 RcuPtr pin/unpin +
-  //   DenoiseProcessor front/back swap（§3.4）。一个 ALSA period 调一次，非每帧。
-  void on_period_begin();
-  void on_period_end();
-
-private:
-  // Bridge 回调入口（Bridge 的 capture 线程调用）
-  // 读 per-sensor 处理组件走 NoiseManager 的 RCU 快照（on_period_begin 顶部 pin，见 §3.7），
-  // 本身不持锁、不查可变 map。
-  void on_frame(uint8_t sink_id, const float* frames, size_t frame_size,
-                uint8_t channels);
-  // 帧分发（调用各 FrameCallback）
-};
-```
+**接口**：`NoiseManager::on_frame`（见 §3.7），签名 `void on_frame(uint8_t sink_id, const float* frames, size_t frame_size)`。`AudioCapture` 类已删除（Spec5，vestigial）；测试用 `NoiseSessionManagerBridge::test_demux_for_test`（回调 lambda，替代原 AudioCapture frame_cb_）。
 
 ### 3.2 NoiseDetector — 噪声检测（监测角色，非门控）
 
@@ -937,7 +906,7 @@ class RcuPtr {
 
 噪声模块不直接依赖 `SessionManager`/`Config` 等 daemon 核心类，经纯虚接口 `NoiseAudioBridge` 接入，保证模块可独立编译与单元测试（`WITH_NOISE` 关闭时 daemon 行为零变化）。实现位于 daemon 根目录 `noise_session_manager_bridge.hpp/cpp`。
 
-**统一 PCM 分发**：Bridge 实现类**独占** ALSA capture 设备，是 PCM 帧的唯一读取者。所有帧消费者（AudioCapture、Streamer）均通过 `FrameProvider` 回调获取帧。这解决了 RAVENNA ALSA LKM 只允许一次 capture open 的限制，同时让 Streamer 能获取降噪后和噪声 PCM 流。
+**统一 PCM 分发**：Bridge 实现类**独占** ALSA capture 设备，是 PCM 帧的唯一读取者。所有帧消费者（NoiseManager、Streamer）均通过 `FrameProvider` 回调获取帧。这解决了 RAVENNA ALSA LKM 只允许一次 capture open 的限制，同时让 Streamer 能获取降噪后和噪声 PCM 流。
 
 ### 4.1 NoiseAudioBridge — 纯虚接口
 
@@ -952,7 +921,7 @@ class RcuPtr {
 
 | 消费者 | 注册时机 | 用途 |
 |--------|---------|------|
-| AudioCapture | 噪声传感器启动时 | 分发给 NoiseDetector/Analyzer/DenoiseProcessor/RefComparator |
+| NoiseManager::on_frame | 噪声传感器启动时 | 分发给 NoiseDetector/Analyzer/DenoiseProcessor/RefComparator |
 | Streamer | PTP locked 时（与当前行为一致） | AAC 编码 + HTTP 分发（原始/降噪/噪声三路可选） |
 
 > **关键区分**：SessionManager 管理 Sink 配置和驱动流生命周期（通过 netlink 向内核注册/注销 RTP 流），**不直接提供 PCM 帧数据**。PCM 帧由 Bridge 实现类独占读取。Streamer 不再自己 `snd_pcm_open("plughw:RAVENNA")`，改为从 Bridge 注册 FrameProvider 拿帧。
@@ -1065,11 +1034,11 @@ private:
 >
 > **关键**：WITH_NOISE=ON 时 PcmCaptureService 是 ALSA capture 的**唯一管理者**，Streamer 不得再 `snd_pcm_open("plughw:RAVENNA")`（`#ifdef _USE_NOISE_` 已切走该路径）；WITH_NOISE=OFF 时 PcmCaptureService 不编译，Streamer 沿用上游自管 ALSA。`http_server.cpp` 的 `/api/streamer/stream/:sinkId/denoised|noise` 路由同样 `#ifdef _USE_NOISE_` 守卫（或抽到 `noise_http_routes.cpp` 注册），使上游 http_server.cpp diff 最小。fork-maintenance 笔记须记录 streamer.cpp / http_server.cpp 的 `#ifdef _USE_NOISE_` 分歧（见 .claude/rules/fork-maintenance.md）。
 
-**帧粒度**：按 ALSA period 大小分发（A7 修复：`PcmCaptureService` 读粒度 hard-code `constexpr uint32_t kPeriodSamples = 6144`，与 streamer.cpp L252 既有 `chunk_samples_ = 6144` 一致；ALSA 在内核累积 hw period 至 6144 后 `snd_pcm_readi` 返回）。6144 非帧长 480 的倍数（6144÷480=12.8），零头 384 样本由 AudioCapture carry-over 处理（§6.2.1）。`fake_capture_loop()` 每回调投递恰好 `kPeriodSamples` 样本以对齐真实 ALSA 节拍（§11 风险21）。不从 `tic_frame_size_at_1fs` 推导（TIC 帧与 ALSA period 是不同概念）。
+**帧粒度**：按 ALSA period 大小分发（A7 修复：`PcmCaptureService` 读粒度 hard-code `constexpr uint32_t kPeriodSamples = 6144`，与 streamer.cpp L252 既有 `chunk_samples_ = 6144` 一致；ALSA 在内核累积 hw period 至 6144 后 `snd_pcm_readi` 返回）。6144 非帧长 480 的倍数（6144÷480=12.8），零头 384 样本由 bridge on_pcm_frame carry-over 处理（§6.2.1）。`fake_capture_loop()` 每回调投递恰好 `kPeriodSamples` 样本以对齐真实 ALSA 节拍（§11 风险21）。不从 `tic_frame_size_at_1fs` 推导（TIC 帧与 ALSA period 是不同概念）。
 
 消费者收到的是原始 ALSA chunk（全通道交错，`kPeriodSamples` 样本），各自负责拆帧：
 - Streamer：按 AAC 编码帧长拆分
-- Noise AudioCapture：拆成 480 样本帧给 NoiseDetector/DenoiseProcessor（carry-over 见 §6.2.1）
+- NoiseManager::on_frame：拆成 480 样本帧给 NoiseDetector/DenoiseProcessor（carry-over 见 §6.2.1）
 
 **FAKE_DRIVER 模式**：fake driver 的 PTP 永远 UNLOCKED，PcmCaptureService 无法从真实 ALSA 设备读取。此时 **PcmCaptureService 忽略 PTP 状态**，直接启动 `fake_capture_loop()` 从 WAV 文件循环读取 PCM 帧作为替代数据源。这样 FAKE_DRIVER 模式下帧始终可达，消费者无需关心 PTP 状态——与真实模式下"PTP locked 才有帧"的行为对齐（区别仅在于帧来源）。可通过配置 `fake_pcm_source` 指定 WAV 文件路径；未指定时使用内置静音帧。
 
@@ -1351,7 +1320,7 @@ flowchart LR
 
 > **①→② 顺序执行，无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标，仅 ~0.3ms）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（并行省不到 3% 帧预算，不值得引入线程同步）。③NoiseAnalyzer 根据降噪模式从①或②取输入。详见 §6.3 线程模型。
 
-> **重采样位置**：`RESAMPLE` 在噪声模块入口（`AudioCapture`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §11 风险 1。
+> **重采样位置**：`RESAMPLE` 在噪声模块入口（`NoiseManager::on_frame`）将原生采样率转 48kHz，`PcmCaptureService` 保持原生分发。Streamer 原始 AAC 取 `CH_EXTRACT` 原生帧（`WITH_NOISE=OFF` 也可用）；降噪/噪声 PCM 为 48kHz，非原生 48kHz 时需回采到原生再喂 faac。Phase 1 限定 48kHz，无重采样（直通）。详见 §11 风险 1。
 
 ### 6.2 帧处理时序
 
@@ -1364,7 +1333,7 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
   │
   │ → Streamer: 按 AAC 帧长拆分, 编码, HTTP 分发 (原生采样率)
   │
-  │ → NoiseAudioBridge → AudioCapture → NoiseManager.on_frame():
+  │ → NoiseAudioBridge → NoiseManager.on_frame():
   │     [原生 ≠ 48k 时] 入口重采样 原生转 48k (resampler.hpp)
   │     拆成 480 样本帧 (48k 下 6144/480 = 12.8 帧/period)
   │     ──┬──────┬──────┬── ... ──┬──────┬──
@@ -1382,7 +1351,7 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 | 步骤 | 延迟 | 说明 |
 |------|------|------|
 | PcmCaptureService: ALSA period 读取 | ~128ms | 6144 样本等待（ALSA period） |
-| AudioCapture: 拆帧 + 通道提取 | <0.01ms | 指针运算 |
+| on_frame: 拆帧 + 通道提取 | <0.01ms | 指针运算 |
 | VAD | <0.1ms | WebRTC VAD 极快 |
 | RNNoise 降噪 | <1ms | RNN 推理（AVX2 下 <0.5ms） |
 | NoiseAnalyzer: FFT + L1 分类 | <0.5ms | 512 点 FFT + 规则置信度计算 |
@@ -1390,7 +1359,7 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 | 指标聚合 | <0.1ms | 简单算术 |
 | **单帧处理** | **<2ms** | 远低于 10ms 帧预算，实时性充足 |
 
-> ALSA period 延迟（~128ms）是采集侧的固有等待，不影响帧处理实时性——PcmCaptureService 读满一个 period 后，AudioCapture 在 <2ms 内处理完该 period 内的所有 480 样本帧。
+> ALSA period 延迟（~128ms）是采集侧的固有等待，不影响帧处理实时性——PcmCaptureService 读满一个 period 后，NoiseManager::on_frame 在 <2ms 内处理完该 period 内的所有 480 样本帧。
 
 单帧 PCM 数据拷贝链路（480 样本 @48kHz，单通道）：
 
@@ -1424,7 +1393,7 @@ PcmCaptureService (ALSA period, 原生采样率; 图示为 48kHz 即 Phase 1: 61
 
 **问题**：`PcmCaptureService` 按 ALSA period 分发，period 样本数（6144，见 §4.3 / §11 风险21）不是 RNNoise 帧长 480 的整数倍：6144 ÷ 480 = 12.8 帧/period，每个 period 尾部剩 6144 − 12×480 = 384 样本零头。RNNoise `rnnoise_process_frame` 要求**恰好 480 样本**（附录 A `rnnoise_get_frame_size()=480`），384 样本调用是未定义行为或静默零输出。
 
-**规格**：`AudioCapture` 为每个 sink 维护一个 per-sink carry-over 缓冲（≤479 样本，复用，运行时零分配）。每个 period 到达时：
+**规格**：`NoiseSessionManagerBridge::on_pcm_frame` 为每个 sink 维护一个 per-sink carry-over 缓冲（≤479 样本，复用，运行时零分配）。每个 period 到达时：
 
 ```
 carry = carry_over[sink]                          // 上一 period 尾部残余（≤479）
@@ -1442,7 +1411,7 @@ carry_over[sink] = combined[n_full*480 .. ]        // 剩余零头留到下个 p
 3. **stop 时的残余**：sink 停止时若 carry-over 有不足 480 的残余，**丢弃**（不补零凑帧--补零会引入伪噪声帧进分析；残余 <480 无法产出有效 RNNoise 结果，丢弃对长期噪声统计无影响）。
 4. **采样率非 48kHz**（Phase ≥3，resampler.hpp 启用）：重采样在 carry-over **之前**，即先重采样到 48k 再做 480 分帧。Phase 1 限定 48kHz，无重采样，carry-over 直接对原始 period 样本分帧。
 
-> **为何不调整 period_size 为 480 倍数**：ALSA period_size 由 RAVENNA LKM 驱动决定（与 `tic_frame_size_at_1fs` 关联），`PcmCaptureService` 不可单方面改。streamer.cpp 现有 `chunk_samples_ = 6144`（L252 硬编码，"AAC 6 channels input"）也印证 6144 是既定读取粒度。故在 AudioCapture 层做 carry-over 是唯一方案，且与 streamer.cpp 现有 `buffer_offset_` 累积模式同构（可借鉴）。
+> **为何不调整 period_size 为 480 倍数**：ALSA period_size 由 RAVENNA LKM 驱动决定（与 `tic_frame_size_at_1fs` 关联），`PcmCaptureService` 不可单方面改。streamer.cpp 现有 `chunk_samples_ = 6144`（L252 硬编码，"AAC 6 channels input"）也印证 6144 是既定读取粒度。故在 bridge on_pcm_frame 层做 carry-over 是唯一方案，且与 streamer.cpp 现有 `buffer_offset_` 累积模式同构（可借鉴）。
 
 ### 6.3 线程模型
 
@@ -1943,7 +1912,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 1.0 | **CMake 脚手架（先于一切编码）**：`option(WITH_NOISE)` + §8.2 的 SOURCES 追加（`pcm_capture_service.cpp`、`noise_session_manager_bridge.cpp`，须在 add_executable 前）+ `add_subdirectory(noise)` + `noise-dev.sh` build 加 `-DWITH_NOISE=ON`。先建 `daemon/noise/` 空目录 + 空 `CMakeLists.txt`（空 `add_library(noise STATIC)`）使 `add_subdirectory` 不报错。**此步不实现任何功能代码，仅让后续 1.1-1.11 能编译进 daemon** | 构建验证：`./noise-dev.sh build`（WITH_NOISE=ON）通过；`cmake -DFAKE_DRIVER=ON -DWITH_NOISE=OFF .` 通过且 daemon 行为零变化 |
 | 1.1 | PcmCaptureService：独占 ALSA capture + FrameProvider 分发机制 + PTP observer + FAKE_DRIVER fake_capture_loop（依赖 1.0 的 CMake 脚手架） | 单元测试：帧回调触发；FAKE_DRIVER 模式帧可达 |
 | 1.2 | Streamer 重构：删除 snd_pcm_open/readi，从 PcmCaptureService 注册 FrameProvider 拿帧 | 回归测试：WITH_NOISE=OFF 时 AAC 流功能不变 |
-| 1.3 | NoiseSessionManagerBridge + AudioCapture：实现 NoiseAudioBridge 纯虚接口（委托 PcmCaptureService），格式转换（uint8_t→float）+ 通道解复用 + 帧分发入口 | 单元测试：Bridge 帧回调触发；格式转换精度 |
+| 1.3 | NoiseSessionManagerBridge + NoiseManager::on_frame：实现 NoiseAudioBridge 纯虚接口（委托 PcmCaptureService），格式转换（uint8_t→float）+ 通道解复用 + 帧分发入口 | 单元测试：Bridge 帧回调触发；格式转换精度 |
 | 1.4a | RcuPtr\<T\> 自实现 RCU 原语（§3.8：原子发布 + period 顶部 pin + retire 队列 + 2-epoch 回收 + 裸 `T*` load）**独立单测**（含 `const T` 支持，M2） | 单元测试：publish/load/advance_epoch 正确性；2-epoch 后旧值可释放；裸指针 period 内有效、跨 period 无效 |
 | 1.4b | NoiseManager 骨架：SensorTable COW + 帧路由到 stub processor；①->②->③->④ 真实集成验证留到 1.9，此步用 stub processor 跑通帧路由 + on_period_begin/end 驱动 RcuPtr pin/unpin | 单元测试：多 sensor 路由；sensor 增删不阻塞帧处理；period 钩子驱动 pin/unpin |
 | 1.5 | NoiseDetector（监测角色，非门控）：WebRTC VAD 集成 + 频谱平坦度 + 噪声底估计（最小统计法）。始终执行，输出监测指标；不门控 DenoiseProcessor。VAD 来源优先级：降噪开启时 RNNoise VAD 为主（更准），降噪关闭时 NoiseDetector VAD 为唯一来源 | 单元测试：白噪声/语音/静音检测；VAD 精度 |
@@ -1953,7 +1922,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 1.9 | NoiseMetrics + HTTP REST API：指标聚合（合并 ①②③ 结果）+ 告警规则（噪声级/SNR/哼声）+ sensor CRUD + metrics/history 端点 | 集成测试：API 响应；告警触发 |
 | 1.10 | 数据持久化：`noise_status.json` 传感器配置 + `noise_templates/` 模板库 + Config 新增 `noise_status_file`/`noise_template_dir` 字段 + 原子写入（tmp + rename）+ 启动加载/变更即写/退出保存 | 集成测试：重启后传感器+模板恢复；崩溃后文件完整（无半写） |
 | 1.11 | main.cpp 装配（G7） + Streamer 三路 AAC 流 API + 构建验证：在 main.cpp 现有装配序列（L128-195：config、driver、browser、session_manager、streamer、http_server）注入 `PcmCaptureService::create(session_manager, config)`（session_manager 之后）、`NoiseSessionManagerBridge(pcm_capture)`、`NoiseManager(bridge)`、注册 `/api/noise/*` 路由到 http_server；Streamer 持 `NoiseManager` 引用（§4.4）。CMake 脚手架见 1.0 | 集成测试：原始/降噪/噪声流可访问；buildfake.sh 通过；WITH_NOISE=OFF 时 main.cpp 注入 `#ifdef _USE_NOISE_` 守卫、daemon 行为零变化 |
-| 1.12 | **端到端 FAKE_DRIVER 集成测试**：`FAKE_DRIVER=ON -DWITH_NOISE=ON` 启动 daemon，`fake_pcm_source` 喂已知含噪 WAV（白噪+语音），断言 `/api/noise/sensor/0` 返回 `noise_type=white`、`/api/streamer/stream/0/denoised` 返回非空 AAC。覆盖 fake_capture_loop->PcmCaptureService->Bridge->AudioCapture->NoiseManager->①②③④->metrics->HTTP 全链路 | E2E 测试通过；全链路无丢帧（partial-frame 处理见 §6.2.1） |
+| 1.12 | **端到端 FAKE_DRIVER 集成测试**：`FAKE_DRIVER=ON -DWITH_NOISE=ON` 启动 daemon，`fake_pcm_source` 喂已知含噪 WAV（白噪+语音），断言 `/api/noise/sensor/0` 返回 `noise_type=white`、`/api/streamer/stream/0/denoised` 返回非空 AAC。覆盖 fake_capture_loop->PcmCaptureService->Bridge->NoiseManager::on_frame->①②③④->metrics->HTTP 全链路 | E2E 测试通过；全链路无丢帧（partial-frame 处理见 §6.2.1） |
 
 **预计工期**：3-4 周
 
@@ -1998,7 +1967,7 @@ target_link_libraries(noise PRIVATE ${NOISE_LIBS})
 | 9 | PcmCaptureService 帧回调内联执行，慢消费者阻塞全局 | 任一 FrameProvider 回调阻塞（如 Streamer 文件 I/O）会拖慢整个 capture 线程，导致 ALSA xrun | Phase 1 帧回调必须快速返回（只做内存拷贝 + 环形缓冲写入），重操作（AAC 编码、文件写入）延后到消费者自身线程 |
 | 10 | Phase 1 多 Sink 帧处理在单 capture 线程内逐帧执行 | 8 路 Sink × RNNoise ~0.7ms = ~5.6ms/period，在 10ms 预算内但无 per-sink 并行。§1.2.1 的"≥8 路"基于单线程逐帧处理的保守估计 | Phase 1 单线程逐帧处理（各 Sink 交替处理，非串行等待）；Phase 3 步骤 3.6 引入 per-sink 线程池做真正并行 |
 | 11 | RT 路径同步原语非无锁 | `std::atomic_load/store(shared_ptr)`（C++17 废弃自由函数）内部用自旋锁，每帧调用致优先级反转/xrun；旧插件析构（ONNX teardown）若在 RT 线程触发同样致 xrun | **不采用** `atomic_load/store(shared_ptr)`。DenoiseProcessor / NoiseManager 统一用 `RcuPtr<T>`：`atomic<T*>` 原子发布 + period 顶部 pin（整 period 复用，不每帧原子操作）+ retire 队列延迟回收（旧插件析构由控制线程 housekeeper 在静止点后完成，绝不在 RT 线程）。`SensorContext` 用 `shared_ptr` 成员使 sensor 表 COW 廉价共享。详见 §3.7 帧回调线程安全 / 降噪插件文档 §4.2 |
-| 12 | RefComparator 需两路 Sink 同时输入但 AudioCapture 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐。设计要点：①两路 Sink 在同一 PTP 域下，帧对齐精度取决于 PTP 同步精度（通常 <1ms），帧回调时机差 ≤1 个 ALSA period；②环形缓冲容量 = 2 × period 样本数（~128ms @48kHz），溢出时丢弃最旧帧并计数告警；③时间戳对齐：按帧序号（PTP 时间戳换算）或按帧到达时间插值，精度要求 ≤1ms（与已有算法 MFCC 互相关对齐精度一致）；④延时差超过 10ms 时标记 `delay_anomaly = true`，不丢弃数据但上报告警供运维排查 |
+| 12 | RefComparator 需两路 Sink 同时输入但 NoiseManager::on_frame 按 per-sink 分发 | 两路 Sink 的帧回调时机和帧数可能不同，参考音和比对音需缓冲对齐后才能处理 | RefComparator 内部维护双路环形缓冲 + 时间戳对齐。设计要点：①两路 Sink 在同一 PTP 域下，帧对齐精度取决于 PTP 同步精度（通常 <1ms），帧回调时机差 ≤1 个 ALSA period；②环形缓冲容量 = 2 × period 样本数（~128ms @48kHz），溢出时丢弃最旧帧并计数告警；③时间戳对齐：按帧序号（PTP 时间戳换算）或按帧到达时间插值，精度要求 ≤1ms（与已有算法 MFCC 互相关对齐精度一致）；④延时差超过 10ms 时标记 `delay_anomaly = true`，不丢弃数据但上报告警供运维排查 |
 | 13 | CPU 过载无主动降级机制 | 多路 DeepFilterNet 或超出 §1.2.1 并发上限时 CPU 预算超限 → ALSA xrun → 音频中断 | Phase 1 由 `noise_max_sensors` 软上限拒绝新建传感器预防过载；Phase 3 步骤 3.6 增加 xrun 计数监控 + 自动降级策略：连续 N 个 period 内 xrun 计数超阈值 → NoiseManager 对占用最高 CPU 的 sensor 切换到 RNNoise（或 bypass），并上报 HTTP 告警 |
 | 14 | JSON 持久化文件损坏 | daemon 崩溃/断电/磁盘满导致 `noise_status.json` 或 `templates.json` 半写 | **原子写入**：先写 `.tmp` 文件 → `fsync` → `rename` 覆盖原文件。POSIX `rename()` 是原子的，崩溃后要么是旧文件要么是新文件，不会出现半写状态。加载时若 JSON 解析失败，日志告警并以空配置启动（不阻塞 daemon 启动） |
 | 15 | 模板 WAV 文件与索引不一致 | 手动删除 WAV 文件或 `templates.json` 引用不存在的文件 | `NoiseTemplateDB::load()` 时逐条检查 WAV 文件是否存在，缺失条目日志告警但仍保留索引（特征向量可用，仅回听不可用）；`get_wav_path()` 返回空串表示无原始音频 |

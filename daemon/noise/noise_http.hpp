@@ -22,6 +22,7 @@
 
 #include <httplib.h>
 
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,8 @@
 #include "noise_template_db.hpp"  // NoiseTemplateDB (Spec3 Task 5)
 
 namespace noise {
+
+class MlClassifier;  // Spec5 T3：L3 ML 分类器（前向声明，.cpp 内 include 全定义）
 
 // NoiseType 枚举序列化：C++ CamelCase -> JSON 小写蛇形（arch §5.4）。
 //   Clean -> "clean", Hum50Hz -> "hum_50hz", Hum60Hz -> "hum_60hz", 等。
@@ -81,15 +84,17 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr);
 // JSON 输出 = 手工拼接（reuse escape_json），输入用 boost::property_tree。
 void register_noise_template_routes(httplib::Server& svr,
                                     NoiseManager& mgr,
-                                    NoiseTemplateDB& template_db);
+                                    NoiseTemplateDB& template_db,
+                                    std::shared_ptr<MlClassifier> ml);
 
 // Spec3 Task 6：聚合注册 sensor + template 路由（main.cpp 单点调用）。
 // 等价于依次调用 register_noise_sensor_routes +
 // register_noise_template_routes。 模板 DB 由调用方持有并传入（review Important
-// #1：DB 独立参数）。
+// #1：DB 独立参数）。Spec5 T3：ml 为 L3 分类器（可空 -> vggish 录入降级为 400）。
 void register_noise_routes(httplib::Server& svr,
                            NoiseManager& mgr,
-                           NoiseTemplateDB& template_db);
+                           NoiseTemplateDB& template_db,
+                           std::shared_ptr<MlClassifier> ml);
 
 // Spec4 Task 3：注册 SSE 路由（arch §5.1 + D-S4.5）。
 // 4 端点：

@@ -27,6 +27,8 @@
 #include <string>
 #include <utility>
 
+#include "ml_classifier.hpp"  // Spec5 T3：vggish 模板录入 embed
+
 namespace noise {
 
 // NoiseType 枚举 -> 小写蛇形字符串（arch §5.4 约定）。
@@ -123,6 +125,8 @@ void append_snapshot_fields(std::stringstream& ss,
      << indent << "\"noise_type_confidence\": " << s.noise_type_confidence
      << ",\n"
      << indent << "\"is_mixed\": " << bool_str(s.is_mixed) << ",\n"
+     << indent << "\"noise_type_source\": \""
+     << escape_json(s.noise_type_source) << "\",\n"
      << indent << "\"estimated_snr_db\": " << s.estimated_snr_db;
   if (include_denoise_enabled) {
     ss << ",\n"
@@ -413,7 +417,8 @@ bool parse_template_id(const httplib::Request& req,
 
 void register_noise_template_routes(httplib::Server& svr,
                                     NoiseManager& /*mgr*/,
-                                    NoiseTemplateDB& template_db) {
+                                    NoiseTemplateDB& template_db,
+                                    std::shared_ptr<MlClassifier> ml) {
   using httplib::Request;
   using httplib::Response;
 
@@ -645,40 +650,99 @@ void register_noise_template_routes(httplib::Server& svr,
   });
 
   // POST /api/noise/template - 录入新模板（multipart: wav + label +
-  // description）。 arch §7.7: HTTP 接收 WAV -> 提取 32 维 Bark -> 存
-  // templates.json + WAV 文件。
-  svr.Post(
-      "/api/noise/template", [&template_db](const Request& req, Response& res) {
-        if (!req.has_file("wav")) {
-          res.status = 400;
-          res.set_content("missing wav file field", "text/plain");
-          return;
+  // description + 可选 feature_type）。 arch §7.7: HTTP 接收 WAV -> 提取特征
+  // -> 存 templates.json + WAV 文件。
+  // Spec5 T3（D-S5.8）：feature_type=bark（默认，既有 Bark 提取）| vggish
+  // （VGGish 128 维嵌入，需 ml_classifier 可用）。vggish 路径写 WAV 供回听 +
+  // 存嵌入。
+  svr.Post("/api/noise/template", [&template_db, ml](const Request& req,
+                                                     Response& res) {
+    if (!req.has_file("wav")) {
+      res.status = 400;
+      res.set_content("missing wav file field", "text/plain");
+      return;
+    }
+    auto wav = req.get_file_value("wav");
+    std::string label;
+    std::string description;
+    std::string feature_type = "bark";  // 默认 bark
+    if (req.has_file("label"))
+      label = req.get_file_value("label").content;
+    if (req.has_file("description"))
+      description = req.get_file_value("description").content;
+    if (req.has_file("feature_type"))
+      feature_type = req.get_file_value("feature_type").content;
+    if (label.empty()) {
+      res.status = 400;
+      res.set_content("missing label field", "text/plain");
+      return;
+    }
+    uint32_t id = 0;
+    if (feature_type == "vggish") {
+      // vggish 录入：解析 WAV -> MlClassifier.embed -> 存 128 维嵌入。
+      if (!ml || !ml->available()) {
+        res.status = 400;
+        res.set_content(
+            "vggish feature_type requires ml_model_path configured + "
+            "model loaded",
+            "text/plain");
+        return;
+      }
+      std::vector<float> samples;
+      uint32_t sample_rate = 0;
+      if (!parse_wav_pcm16_48k_mono(wav.content, samples, sample_rate)) {
+        res.status = 400;
+        res.set_content("WAV must be 48kHz PCM-16 mono (Phase 1 limit)",
+                        "text/plain");
+        return;
+      }
+      auto emb = ml->embed(samples.data(), samples.size());
+      // 写 WAV 文件供回听 + 存 vggish 模板。复用 add_template_from_wav 的
+      // 占位 id -> 写文件 -> 更新模式：先 bark 占位拿 id 不行（会加 bark
+      // 模板）。改为直接 add_template(Vggish) 拿 id，再写 WAV。
+      std::array<float, 32> bark{};
+      id = template_db.add_template(label, description, "",
+                                    TemplateFeatureType::Vggish, bark, emb);
+      if (id == 0) {
+        res.status = 500;
+        res.set_content("template add failed", "text/plain");
+        return;
+      }
+      // 写 WAV 文件（与 add_template_from_wav 同路径：dir/template-<id>.wav）。
+      const std::string& dir = template_db.get_dir_for_test();
+      if (!dir.empty()) {
+        std::string wav_name = "template-" + std::to_string(id) + ".wav";
+        std::string wav_path = dir + "/" + wav_name;
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream out(wav_path, std::ios::binary);
+        if (out.is_open()) {
+          out.write(wav.content.data(),
+                    static_cast<std::streamsize>(wav.content.size()));
+          out.close();
+          if (out.good()) {
+            auto* t = const_cast<Template*>(template_db.get_template(id));
+            if (t)
+              t->wav_file = wav_name;
+          }
+          template_db.save(dir);
         }
-        auto wav = req.get_file_value("wav");
-        std::string label;
-        std::string description;
-        if (req.has_file("label"))
-          label = req.get_file_value("label").content;
-        if (req.has_file("description"))
-          description = req.get_file_value("description").content;
-        if (label.empty()) {
-          res.status = 400;
-          res.set_content("missing label field", "text/plain");
-          return;
-        }
-        uint32_t id =
-            template_db.add_template_from_wav(label, description, wav.content);
-        if (id == 0) {
-          res.status = 400;
-          res.set_content("WAV ingestion failed (must be 48kHz PCM-16 mono)",
-                          "text/plain");
-          return;
-        }
-        std::stringstream ss;
-        ss << "{\n  \"id\": " << id << ",\n  \"label\": \""
-           << escape_json(label) << "\"" << ",\n  \"status\": \"created\"\n}\n";
-        res.set_content(ss.str(), "application/json");
-      });
+      }
+    } else {
+      // bark 录入（既有路径）：WAV -> Bark 频谱 -> 存。
+      id = template_db.add_template_from_wav(label, description, wav.content);
+      if (id == 0) {
+        res.status = 400;
+        res.set_content("WAV ingestion failed (must be 48kHz PCM-16 mono)",
+                        "text/plain");
+        return;
+      }
+    }
+    std::stringstream ss;
+    ss << "{\n  \"id\": " << id << ",\n  \"label\": \"" << escape_json(label)
+       << "\"" << ",\n  \"status\": \"created\"\n}\n";
+    res.set_content(ss.str(), "application/json");
+  });
 }
 
 // register_noise_routes：聚合 sensor + template + SSE 路由（arch §5.1 +
@@ -687,9 +751,10 @@ void register_noise_template_routes(httplib::Server& svr,
 // 匹配，无重叠）。
 void register_noise_routes(httplib::Server& svr,
                            NoiseManager& mgr,
-                           NoiseTemplateDB& template_db) {
+                           NoiseTemplateDB& template_db,
+                           std::shared_ptr<MlClassifier> ml) {
   register_noise_sensor_routes(svr, mgr);
-  register_noise_template_routes(svr, mgr, template_db);
+  register_noise_template_routes(svr, mgr, template_db, std::move(ml));
   // Spec4 Task 3：SSE 路由（4 端点）。
   register_noise_sse_routes(svr, mgr);
 }

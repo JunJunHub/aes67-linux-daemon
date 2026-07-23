@@ -75,6 +75,8 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   latest_.noise_type = analysis.primary_type;
   latest_.noise_type_confidence = analysis.primary_confidence;
   latest_.is_mixed = analysis.is_mixed;
+  // Spec5 T3：主结果来源层（l1/l2/l3）。
+  latest_.noise_type_source = analysis.noise_type_source;
   // candidates：vector -> 定长 array（最多 3，避免 per-call 堆分配）。
   size_t n = std::min(analysis.candidates.size(), kMaxNoiseCandidates);
   for (size_t i = 0; i < n; ++i) {
@@ -199,6 +201,15 @@ std::optional<AlertEvent> NoiseMetrics::evaluate_alerts(uint8_t sensor_id) {
     desired = AlertLevel::Info;
     rule = "hum_strength_db";
     message = "hum detected";
+  }
+
+  // 规则 6（Spec5 T2）：plugin_degraded -> Warning。
+  // ONNX 降噪插件反复失败已切 passthrough（denoise 不可用，音频仍直通）。
+  // 仅当 desired < Warning 时评估（不被更低级覆盖）。
+  if (desired < AlertLevel::Warning && latest_.plugin_degraded) {
+    desired = AlertLevel::Warning;
+    rule = "plugin_degraded";
+    message = "denoise plugin degraded to passthrough";
   }
 
   const uint32_t N = latest_.alert_debounce_periods;

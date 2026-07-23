@@ -35,6 +35,10 @@ struct PluginConfig {
   float dry_wet{1.0f};             // 干湿比 0=原音 1=全降噪
   // 通用键值参数，各插件自定义（如 postfilter=true）
   std::unordered_map<std::string, std::string> params;
+  // Spec5 T2：ONNX 模型目录（dtln/deepfilternet 从此推导模型路径）。
+  // additive：rnnoise/passthrough 忽略。由 NoiseManager 从 Config 注入
+  // （main.cpp wiring），adapter 在 model_path 为空时用 <dir>/<model>.onnx。
+  std::string onnx_model_dir;
 };
 
 // 降噪插件统一接口

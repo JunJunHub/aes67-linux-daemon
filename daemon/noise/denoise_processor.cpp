@@ -77,6 +77,22 @@ size_t DenoiseProcessor::process(const float* in,
   // ① 降噪：plugin 写 back_->denoised（IDenoisePlugin 单输出契约，§2.2）
   size_t n = pinned_->plugin->process(in, n_in, back_->denoised.get(),
                                       max_frame_, result);
+  // Spec5 T2：消费 result->status（D-S5.5 失败降级）。
+  // adapter 在 Run 异常时置 kBypass + 直通；连续 kBypass 达阈值升级 kError
+  // + 置 degraded_pending_（控制线程 housekeeper 据此切 passthrough + 告警）。
+  if (result) {
+    if (result->status == ProcessStatus::kBypass) {
+      ++consecutive_bypass_count_;
+      if (consecutive_bypass_count_ >= kDegradationThreshold) {
+        result->status = ProcessStatus::kError;  // 升级为不可恢复
+        degraded_pending_.store(true, std::memory_order_release);
+        consecutive_bypass_count_ = 0;  // 重置，避免每帧重复置位
+      }
+    } else if (result->status == ProcessStatus::kOk) {
+      consecutive_bypass_count_ = 0;  // 恢复，清计数
+    }
+    // kError（adapter 直接报或上方升级）：保持 degraded_pending_ 已置。
+  }
   // ② 原始副本：in -> back_->original（per-sensor 拷贝，全 Phase 线程安全，架构
   // §3.4）
   std::memcpy(back_->original.get(), in, n * sizeof(float));

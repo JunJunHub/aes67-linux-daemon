@@ -83,6 +83,11 @@ dist/
 .DS_Store
 Thumbs.db
 
+
+# Python env
+.venv/
+
+
 # Claude Code
 # 只提交共享规则和团队 skills；其他 .claude 本地配置继续忽略。
 CLAUDE.md
@@ -119,6 +124,10 @@ AGENTS.md
 # Daemon run test
 status.json
 MergingRavennaALSA.mod
+
+# noise test
+noise-testset/
+noise_models/
 
 # Logs
 *.log

@@ -643,7 +643,7 @@ class NoiseManager {
     void run(NoiseManager* mgr, uint8_t sink_id);
   };
   std::map<uint8_t, std::shared_ptr<SinkQueue>> sink_queues_;
-  std::mutex
+  mutable std::mutex
       sink_queues_mutex_;  // 保护 sink_queues_ map（add/remove vs dispatch）
   void start_sink_thread_(uint8_t sink_id);
   void stop_sink_thread_(uint8_t sink_id);

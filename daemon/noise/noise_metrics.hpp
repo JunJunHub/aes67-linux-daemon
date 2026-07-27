@@ -60,6 +60,22 @@ enum class AlertLevel : uint8_t {
   Critical = 3,
 };
 
+// AlertLevel -> 字符串（review M6 DRY：消除 noise_http/noise_manager
+// 内联重复）。
+inline const char* alert_level_to_string(AlertLevel level) {
+  switch (level) {
+    case AlertLevel::Info:
+      return "info";
+    case AlertLevel::Warning:
+      return "warning";
+    case AlertLevel::Critical:
+      return "critical";
+    case AlertLevel::None:
+    default:
+      return "none";
+  }
+}
+
 // Spec4 T4：告警事件（arch §C 新增告警事件 JSON）。
 // raise/clear 时 push 到 alert_history_ + alert_broadcaster_。
 // raised_at_ms 用 NoiseMetrics::frame_counter_（与 snapshot.timestamp_ms

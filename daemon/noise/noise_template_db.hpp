@@ -123,6 +123,7 @@ class NoiseTemplateDB {
 
   // Spec3 Task 5：按 id 查找模板详情。未找到返回 nullptr。
   const Template* get_template(uint32_t template_id) const;
+  Template* get_template(uint32_t template_id);
 
   // Spec4 T1（D-S4.7）：返回模板 WAV 文件的完整路径。
   //   wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
@@ -190,7 +191,11 @@ class NoiseTemplateDB {
                                 TemplateFeatureType feature_type,
                                 const std::array<float, 128>& vggish_embedding);
   const Template* get_template_nolock_(uint32_t template_id) const;
+  Template* get_template_nolock_(uint32_t template_id);
   bool remove_template_nolock_(uint32_t template_id);
+  // 序列化 + 写入（不加锁，由 save() 和 add_template_from_wav 在 unique_lock
+  // 保护下调用，消除内联 save 重复 — review M5 DRY）。
+  bool save_nolock_(const std::string& dir) const;
 };
 
 }  // namespace noise

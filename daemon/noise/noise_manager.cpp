@@ -582,22 +582,7 @@ void NoiseManager::on_period_end() {
       if (has_alert_subscribers) {
         // 组装 SSE 事件 JSON（arch §C 告警事件格式）。
         // raise/clear 仅在状态转换时发生（罕见），JSON 组装可接受。
-        const char* level_str = "none";
-        switch (ev->level) {
-          case AlertLevel::Info:
-            level_str = "info";
-            break;
-          case AlertLevel::Warning:
-            level_str = "warning";
-            break;
-          case AlertLevel::Critical:
-            level_str = "critical";
-            break;
-          case AlertLevel::None:
-          default:
-            level_str = "none";
-            break;
-        }
+        const char* level_str = alert_level_to_string(ev->level);
         std::ostringstream ss;
         ss << "data: {\"sensor_id\": " << static_cast<unsigned>(id)
            << ", \"level\": \"" << level_str << "\"" << ", \"rule\": \""
@@ -1821,10 +1806,7 @@ void NoiseManager::stop_all_sink_threads_() {
 }
 
 bool NoiseManager::has_sink_queue_for_test(uint8_t sink_id) const {
-  // const 方法但需加锁（mutable mutex 不存在 -> 用 const_cast 绕过）。
-  // 测试钩子，非关键路径。
-  auto* self = const_cast<NoiseManager*>(this);
-  std::lock_guard<std::mutex> lock(self->sink_queues_mutex_);
+  std::lock_guard<std::mutex> lock(sink_queues_mutex_);
   return sink_queues_.find(sink_id) != sink_queues_.end();
 }
 

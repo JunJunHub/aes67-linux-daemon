@@ -109,21 +109,7 @@ inline const char* bool_str(bool b) {
   return b ? "true" : "false";
 }
 
-// Spec6 T1：AlertLevel -> JSON 小写字符串（与 /alerts 路由 + SSE
-// 事件格式一致）。
-inline const char* alert_level_to_string(AlertLevel level) {
-  switch (level) {
-    case AlertLevel::Info:
-      return "info";
-    case AlertLevel::Warning:
-      return "warning";
-    case AlertLevel::Critical:
-      return "critical";
-    case AlertLevel::None:
-    default:
-      return "none";
-  }
-}
+// alert_level_to_string 定义在 noise_metrics.hpp（review M6 DRY）。
 
 // 单个 NoiseMetricsSnapshot 字段追加到 stream（不含外层 {}）。
 // indent 是每行前缀（如 "  " 或 "    "），用于嵌套场景的对齐。
@@ -951,7 +937,7 @@ void register_noise_template_routes(httplib::Server& svr,
                     static_cast<std::streamsize>(wav.content.size()));
           out.close();
           if (out.good()) {
-            auto* t = const_cast<Template*>(template_db.get_template(id));
+            auto* t = template_db.get_template(id);
             if (t)
               t->wav_file = wav_name;
           }
@@ -1120,22 +1106,7 @@ void register_noise_sse_routes(httplib::Server& svr, NoiseManager& mgr) {
       if (!first)
         ss << ",";
       first = false;
-      const char* level_str = "none";
-      switch (e.event.level) {
-        case AlertLevel::Info:
-          level_str = "info";
-          break;
-        case AlertLevel::Warning:
-          level_str = "warning";
-          break;
-        case AlertLevel::Critical:
-          level_str = "critical";
-          break;
-        case AlertLevel::None:
-        default:
-          level_str = "none";
-          break;
-      }
+      const char* level_str = alert_level_to_string(e.event.level);
       ss << "\n    {"
          << "\n      \"sensor_id\": " << static_cast<unsigned>(e.sensor_id)
          << ",\n      \"level\": \"" << level_str << "\""

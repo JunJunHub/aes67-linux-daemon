@@ -23,6 +23,7 @@
 
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -52,7 +53,8 @@ struct AlertHistoryRecord {
 // 表：
 //   metrics_history(sensor_id, timestamp_ms, <NoiseMetricsSnapshot 全字段>)
 //     - 复合索引 (sensor_id, timestamp_ms) 支持时间范围查询
-//   alerts_history(sensor_id, timestamp_ms, level, rule, message, is_active)
+//   alerts_history(sensor_id, timestamp_ms, level, rule, message,
+//                  raised_at_ms, is_active)
 //     - 索引 (timestamp_ms) 支持全局时间范围查询
 // WAL 模式 + 单写线程（housekeeper）。
 class NoiseStore {
@@ -77,13 +79,15 @@ class NoiseStore {
 
   // 时间范围查询（HTTP 控制线程调用，wall-clock ms）。
   // query_metrics：指定 sensor_id 的指标历史，按 timestamp_ms 升序。
-  // query_alerts：所有 sensor 的告警历史，按 timestamp_ms 升序。
-  // from > to 或无记录 -> 返回空 vector。
+  // query_alerts：所有 sensor（或 sensor_id 有值时仅该 sensor）的告警历史，
+  //   按 timestamp_ms 升序。from > to 或无记录 -> 返回空 vector。
   std::vector<MetricsHistoryRecord> query_metrics(uint8_t sensor_id,
                                                   uint64_t from_ms,
                                                   uint64_t to_ms) const;
-  std::vector<AlertHistoryRecord> query_alerts(uint64_t from_ms,
-                                               uint64_t to_ms) const;
+  std::vector<AlertHistoryRecord> query_alerts(
+      uint64_t from_ms,
+      uint64_t to_ms,
+      std::optional<uint8_t> sensor_id = std::nullopt) const;
 
   // 过期保留清理：DELETE WHERE timestamp_ms < now - retention_hours。
   // 返回删除行数。housekeeper 定时调用。retention_hours=0 删除所有历史记录。

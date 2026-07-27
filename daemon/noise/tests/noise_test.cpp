@@ -3860,6 +3860,8 @@ struct Spec6HistoryEnv {
     store = std::make_shared<noise::NoiseStore>(db_path, retention_hours, 1);
     mgr.set_noise_store(store);
     noise::register_noise_sensor_routes(svr, mgr);
+    // Spec6 M7：注册告警路由（含 alerts/history + alerts/history/export）。
+    noise::register_noise_sse_routes(svr, mgr);
     port = svr.bind_to_any_port("127.0.0.1");
     BOOST_REQUIRE_GT(port, 0);
     svr_thread = std::thread([this]() { svr.listen_after_bind(); });
@@ -4072,6 +4074,131 @@ BOOST_AUTO_TEST_CASE(feature_type_vggish_in_template_response) {
   svr.stop();
   svr_thread.join();
   std::filesystem::remove_all(d);
+}
+
+// Spec6 final review M4：raised_at_ms 持久化（不被 timestamp_ms 覆盖）。
+// 触发 alert -> SQLite alerts_history 有记录，raised_at_ms 是原始帧计数
+// （与墙钟 timestamp_ms 不同）。
+BOOST_AUTO_TEST_CASE(alerts_history_persists_raised_at_ms) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_raised_at.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);  // loud -> raise
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_alerts(), 1u);
+  // 直接查 SQLite 验证 raised_at_ms 未被覆盖。
+  auto records = env.store->query_alerts(0, static_cast<uint64_t>(INT64_MAX));
+  BOOST_REQUIRE_GE(records.size(), 1u);
+  // raised_at_ms 是帧计数（小整数），timestamp_ms 是墙钟毫秒（大整数）。
+  // 二者不应相等（M4 修复前 query_alerts 用 timestamp_ms 覆盖 raised_at_ms）。
+  BOOST_CHECK_NE(records[0].event.raised_at_ms, records[0].timestamp_ms);
+  // raised_at_ms 应 > 0（帧计数，feed_one_period 后至少 1）。
+  BOOST_CHECK_GT(records[0].event.raised_at_ms, 0u);
+  // is_active=true（raise 事件）。
+  BOOST_CHECK(records[0].event.is_active);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history?from=&to=
+// 返回范围内记录。
+BOOST_AUTO_TEST_CASE(alerts_history_query_by_time_range) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_range.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  uint64_t t0 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  feed_one_period(env.mgr, 0, 0.5f);  // loud -> raise
+  uint64_t t1 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  std::string q =
+      "/api/noise/alerts/history?from=" + std::to_string(t0 - 1000) +
+      "&to=" + std::to_string(t1 + 1000);
+  auto r = cli.Get(q.c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  // JSON 数组（以 [ 开头）。
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"raised_at_ms\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"is_active\"") != std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history?sensor_id= 过滤。
+BOOST_AUTO_TEST_CASE(alerts_history_query_by_sensor_id) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_sensor_filter.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  env.mgr.add_sensor(1, 1, cfg);
+  // 两个 sensor 都 raise。
+  feed_one_period(env.mgr, 0, 0.5f);
+  feed_one_period(env.mgr, 1, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  // 无过滤 -> 至少 2 条。
+  auto r_all =
+      cli.Get("/api/noise/alerts/history?from=0&to=9223372036854775807");
+  BOOST_REQUIRE(r_all);
+  BOOST_CHECK_EQUAL(r_all->status, 200);
+  // 过滤 sensor_id=0 -> 仅 sensor 0 的告警。
+  auto r_filtered = cli.Get(
+      "/api/noise/alerts/history?from=0&to=9223372036854775807&sensor_id=0");
+  BOOST_REQUIRE(r_filtered);
+  BOOST_CHECK_EQUAL(r_filtered->status, 200);
+  BOOST_CHECK(r_filtered->body.find("\"sensor_id\": 0") != std::string::npos);
+  // 过滤后不应含 sensor_id 1 的记录。
+  BOOST_CHECK(r_filtered->body.find("\"sensor_id\": 1") == std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history/export?format=json。
+BOOST_AUTO_TEST_CASE(alerts_history_export_json) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_export_json.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/alerts/history/export?format=json");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"timestamp_ms\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"raised_at_ms\"") != std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history/export?format=csv。
+BOOST_AUTO_TEST_CASE(alerts_history_export_csv) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_export_csv.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/alerts/history/export?format=csv");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms,level,rule,message,"
+                           "raised_at_ms,is_active") != std::string::npos);
+  // Content-Disposition 触发下载。
+  auto cd = r->headers.find("Content-Disposition");
+  BOOST_CHECK(cd != r->headers.end());
+  if (cd != r->headers.end())
+    BOOST_CHECK(cd->second.find("noise_alerts.csv") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iterator>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -333,6 +334,43 @@ std::string history_records_to_csv(
        << csv_escape(alert_level_to_string(s.alert_level)) << ","
        << (s.plugin_degraded ? 1 : 0) << "," << csv_escape(s.l3_match_type)
        << "," << s.l3_similarity << "\n";
+  }
+  return ss.str();
+}
+
+// Spec6 final review M7：AlertHistoryRecord 序列化（JSON 数组 + CSV）。
+// 字段：sensor_id, timestamp_ms, level, rule, message, raised_at_ms,
+// is_active。
+std::string alerts_records_to_json_array(
+    const std::vector<AlertHistoryRecord>& records) {
+  std::stringstream ss;
+  ss << "[";
+  for (size_t i = 0; i < records.size(); ++i) {
+    if (i > 0)
+      ss << ",";
+    const auto& r = records[i];
+    ss << "\n  {\n"
+       << "    \"sensor_id\": " << static_cast<unsigned>(r.sensor_id) << ",\n"
+       << "    \"timestamp_ms\": " << r.timestamp_ms << ",\n"
+       << "    \"level\": \"" << alert_level_to_string(r.event.level) << "\",\n"
+       << "    \"rule\": \"" << escape_json(r.event.rule) << "\",\n"
+       << "    \"message\": \"" << escape_json(r.event.message) << "\",\n"
+       << "    \"raised_at_ms\": " << r.event.raised_at_ms << ",\n"
+       << "    \"is_active\": " << bool_str(r.event.is_active) << "\n  }";
+  }
+  ss << "\n]\n";
+  return ss.str();
+}
+
+std::string alerts_records_to_csv(
+    const std::vector<AlertHistoryRecord>& records) {
+  std::stringstream ss;
+  ss << "sensor_id,timestamp_ms,level,rule,message,raised_at_ms,is_active\n";
+  for (const auto& r : records) {
+    ss << static_cast<unsigned>(r.sensor_id) << "," << r.timestamp_ms << ","
+       << csv_escape(alert_level_to_string(r.event.level)) << ","
+       << csv_escape(r.event.rule) << "," << csv_escape(r.event.message) << ","
+       << r.event.raised_at_ms << "," << (r.event.is_active ? 1 : 0) << "\n";
   }
   return ss.str();
 }
@@ -1109,6 +1147,90 @@ void register_noise_sse_routes(httplib::Server& svr, NoiseManager& mgr) {
     }
     ss << "\n  ]\n}\n";
     res.set_content(ss.str(), "application/json");
+  });
+
+  // Spec6 final review M7：GET /api/noise/alerts/history - 查询持久化告警历史。
+  // 全局（跨 sensor），?from=&to= 可选（缺省全量保留窗口），?sensor_id=
+  // 可选过滤。 返回 JSON 数组（区别于 /alerts 的 { "alerts": [...] } 包装，与
+  // /history/export 风格一致）。
+  svr.Get("/api/noise/alerts/history", [&mgr](const Request& req,
+                                              Response& res) {
+    auto store = mgr.get_noise_store();
+    if (!store) {
+      res.status = 404;
+      res.set_content("history persistence not configured", "text/plain");
+      return;
+    }
+    uint64_t from_ms = 0, to_ms = 0;
+    bool ranged = parse_time_range(req, from_ms, to_ms);
+    if (!ranged) {
+      from_ms = 0;
+      to_ms = static_cast<uint64_t>(INT64_MAX);
+    }
+    std::optional<uint8_t> sensor_filter;
+    if (req.has_param("sensor_id")) {
+      try {
+        int v = std::stoi(req.get_param_value("sensor_id"));
+        if (v < 0 || v > 255) {
+          res.status = 400;
+          res.set_content("sensor_id out of range (0-255)", "text/plain");
+          return;
+        }
+        sensor_filter = static_cast<uint8_t>(v);
+      } catch (...) {
+        res.status = 400;
+        res.set_content("invalid sensor_id", "text/plain");
+        return;
+      }
+    }
+    auto records = store->query_alerts(from_ms, to_ms, sensor_filter);
+    res.set_content(alerts_records_to_json_array(records), "application/json");
+  });
+
+  // Spec6 final review M7：GET /api/noise/alerts/history/export -
+  // 导出告警历史。 ?format=json|csv（缺省 json）。CSV 返回 text/csv 下载。
+  svr.Get("/api/noise/alerts/history/export", [&mgr](const Request& req,
+                                                     Response& res) {
+    auto store = mgr.get_noise_store();
+    if (!store) {
+      res.status = 404;
+      res.set_content("history persistence not configured", "text/plain");
+      return;
+    }
+    uint64_t from_ms = 0, to_ms = 0;
+    bool ranged = parse_time_range(req, from_ms, to_ms);
+    if (!ranged) {
+      from_ms = 0;
+      to_ms = static_cast<uint64_t>(INT64_MAX);
+    }
+    std::optional<uint8_t> sensor_filter;
+    if (req.has_param("sensor_id")) {
+      try {
+        int v = std::stoi(req.get_param_value("sensor_id"));
+        if (v < 0 || v > 255) {
+          res.status = 400;
+          res.set_content("sensor_id out of range (0-255)", "text/plain");
+          return;
+        }
+        sensor_filter = static_cast<uint8_t>(v);
+      } catch (...) {
+        res.status = 400;
+        res.set_content("invalid sensor_id", "text/plain");
+        return;
+      }
+    }
+    auto records = store->query_alerts(from_ms, to_ms, sensor_filter);
+    std::string fmt = "json";
+    if (req.has_param("format"))
+      fmt = req.get_param_value("format");
+    if (fmt == "csv") {
+      res.set_header("Content-Disposition",
+                     "attachment; filename=\"noise_alerts.csv\"");
+      res.set_content(alerts_records_to_csv(records), "text/csv");
+    } else {
+      res.set_content(alerts_records_to_json_array(records),
+                      "application/json");
+    }
   });
 }
 

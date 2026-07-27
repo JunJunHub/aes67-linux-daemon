@@ -806,6 +806,113 @@ paths:
               schema:
                 $ref: "#/components/schemas/SseAlertStream"
 
+  /api/noise/alerts/history:
+    get:
+      tags: [Noise Sensor]
+      summary: 查询持久化告警历史
+      description: |
+        查询 SQLite 持久化的告警历史（Spec6 final review M7）。全局（跨所有 sensor），
+        支持 from + to 时间范围过滤（墙钟毫秒）与 sensor_id 可选过滤。
+        区别于 GET /api/noise/alerts（返回内存 ring 最近事件），本端点查询 SQLite
+        全量持久化历史，覆盖更长保留期（受 noise_history_retention_hours 约束）。
+        返回 JSON 数组（与 /history/export 风格一致，无外层包装对象）。
+      operationId: getNoiseAlertsHistory
+      parameters:
+        - name: from
+          in: query
+          description: 起始时间戳（毫秒，Unix epoch）。缺省时无下界。
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: to
+          in: query
+          description: 结束时间戳（毫秒，Unix epoch）。缺省时无上界。
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: sensor_id
+          in: query
+          description: 可选，按传感器 ID 过滤（0-255）。缺省时返回所有 sensor 的告警。
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 255
+      responses:
+        "200":
+          description: 成功返回告警历史数组
+          content:
+            application/json:
+              schema:
+                type: array
+                description: 持久化告警历史记录数组（按时间顺序）
+                items:
+                  $ref: "#/components/schemas/AlertHistoryRecord"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/noise/alerts/history/export:
+    get:
+      tags: [Noise Sensor]
+      summary: 导出持久化告警历史
+      description: |
+        导出 SQLite 持久化的告警历史（Spec6 final review M7）。支持 JSON 数组与 CSV
+        两种格式。from/to/sensor_id 可选（缺省时导出全部保留期内的记录）。用于离线
+        分析或归档。
+      operationId: exportNoiseAlertsHistory
+      parameters:
+        - name: from
+          in: query
+          description: 起始时间戳（毫秒，Unix epoch）。缺省时无下界。
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: to
+          in: query
+          description: 结束时间戳（毫秒，Unix epoch）。缺省时无上界。
+          required: false
+          schema:
+            type: integer
+            format: int64
+        - name: sensor_id
+          in: query
+          description: 可选，按传感器 ID 过滤（0-255）。
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 255
+        - name: format
+          in: query
+          description: 导出格式。json（默认）= JSON 数组；csv = CSV 下载。
+          required: false
+          schema:
+            type: string
+            enum: [json, csv]
+            default: json
+      responses:
+        "200":
+          description: 导出成功（format=json 返回 application/json 数组；
+            format=csv 返回 text/csv）
+          content:
+            application/json:
+              schema:
+                type: array
+                description: 持久化告警历史记录数组
+                items:
+                  $ref: "#/components/schemas/AlertHistoryRecord"
+            text/csv:
+              schema:
+                type: string
+                description: |
+                  CSV 文本。首行表头：sensor_id,timestamp_ms,level,rule,message,
+                  raised_at_ms,is_active。其后每条记录一行。
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   # ──────────────────────────────────────────────
   # 噪声模板库
   # ──────────────────────────────────────────────
@@ -2233,6 +2340,48 @@ components:
           description: |
             true=raise 事件（告警触发/升级），false=clear 事件（告警解除）。
             仅在状态转换时产出事件。
+          example: true
+
+    AlertHistoryRecord:
+      type: object
+      description: |
+        持久化告警历史记录（Spec6 final review M7）。SQLite alerts_history 表行，
+        由 housekeeper 从 pending 队列批量写入。GET /api/noise/alerts/history 与
+        GET /api/noise/alerts/history/export 返回。对应 C++ AlertHistoryRecord
+        （noise_history.hpp L45）。
+        区别于 AlertEvent（内存 ring 事件）：本记录含墙钟 timestamp_ms（持久化
+        时间戳）+ 帧计数 raised_at_ms（告警原始触发时间），二者不同源。
+      required: [sensor_id, timestamp_ms, level, rule, message, raised_at_ms, is_active]
+      properties:
+        sensor_id:
+          type: integer
+          description: 触发告警的传感器 ID
+          example: 0
+        timestamp_ms:
+          type: integer
+          format: int64
+          description: 墙钟时间戳（毫秒，Unix epoch），housekeeper 写入 SQLite 时的时间。
+          example: 1722079200000
+        level:
+          $ref: "#/components/schemas/AlertLevel"
+        rule:
+          type: string
+          description: 触发规则名
+          example: "noise_level_dbfs"
+        message:
+          type: string
+          description: 人可读的告警描述
+          example: "noise level -28.5 dBFS exceeds threshold -30.0 dBFS"
+        raised_at_ms:
+          type: integer
+          format: int64
+          description: |
+            告警原始触发时间戳（帧计数，与 AlertEvent.raised_at_ms 同源）。
+            非 wall-clock；是 NoiseMetrics::frame_counter_ 值。
+          example: 128000
+        is_active:
+          type: boolean
+          description: true=raise 事件，false=clear 事件。
           example: true
 
     # ──────────────────────────────────────────

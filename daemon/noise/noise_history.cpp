@@ -126,6 +126,7 @@ constexpr const char* kCreateAlertsSql =
     "level INTEGER,"
     "rule TEXT,"
     "message TEXT,"
+    "raised_at_ms INTEGER,"
     "is_active INTEGER)";
 
 }  // namespace
@@ -164,6 +165,30 @@ void NoiseStore::init_schema() {
   exec_simple(db_, "PRAGMA synchronous=NORMAL;");
   exec_simple(db_, kCreateMetricsSql);
   exec_simple(db_, kCreateAlertsSql);
+  // Spec6 final review M4：已有 DB（raised_at_ms 列不存在）补列。
+  // ALTER TABLE ADD COLUMN 是幂等的（SQLite 对已存在列返回错误，exec_simple
+  // 记日志但不影响后续）。用 PRAGMA table_info 检查列是否存在更干净。
+  {
+    sqlite3_stmt* col_stmt = nullptr;
+    bool has_raised_at = false;
+    if (sqlite3_prepare_v2(db_, "PRAGMA table_info(alerts_history)", -1,
+                           &col_stmt, nullptr) == SQLITE_OK) {
+      while (sqlite3_step(col_stmt) == SQLITE_ROW) {
+        const unsigned char* name = sqlite3_column_text(col_stmt, 1);
+        if (name && std::strcmp(reinterpret_cast<const char*>(name),
+                                "raised_at_ms") == 0) {
+          has_raised_at = true;
+          break;
+        }
+      }
+      sqlite3_finalize(col_stmt);
+    }
+    if (!has_raised_at) {
+      exec_simple(db_,
+                  "ALTER TABLE alerts_history ADD COLUMN raised_at_ms "
+                  "INTEGER");
+    }
+  }
   // 复合索引：(sensor_id, timestamp_ms) 支持按 sensor 时间范围查询。
   exec_simple(db_,
               "CREATE INDEX IF NOT EXISTS idx_metrics_sensor_time "
@@ -258,8 +283,8 @@ void NoiseStore::insert_alerts(const std::vector<AlertHistoryRecord>& records) {
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
       "INSERT INTO alerts_history "
-      "(sensor_id,timestamp_ms,level,rule,message,is_active) "
-      "VALUES (?,?,?,?,?,?)";
+      "(sensor_id,timestamp_ms,level,rule,message,raised_at_ms,is_active) "
+      "VALUES (?,?,?,?,?,?,?)";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
     std::cerr << "NoiseStore: prepare alerts insert failed: "
               << sqlite3_errmsg(db_) << "\n";
@@ -272,7 +297,9 @@ void NoiseStore::insert_alerts(const std::vector<AlertHistoryRecord>& records) {
     sqlite3_bind_int(stmt, 3, static_cast<int>(r.event.level));
     sqlite3_bind_text(stmt, 4, r.event.rule.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 5, r.event.message.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 6, r.event.is_active ? 1 : 0);
+    sqlite3_bind_int64(stmt, 6,
+                       static_cast<sqlite3_int64>(r.event.raised_at_ms));
+    sqlite3_bind_int(stmt, 7, r.event.is_active ? 1 : 0);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
       std::cerr << "NoiseStore: alerts insert step failed: "
                 << sqlite3_errmsg(db_) << "\n";
@@ -372,17 +399,31 @@ std::vector<MetricsHistoryRecord> NoiseStore::query_metrics(
   return out;
 }
 
-std::vector<AlertHistoryRecord> NoiseStore::query_alerts(uint64_t from_ms,
-                                                         uint64_t to_ms) const {
+std::vector<AlertHistoryRecord> NoiseStore::query_alerts(
+    uint64_t from_ms,
+    uint64_t to_ms,
+    std::optional<uint8_t> sensor_id) const {
   std::vector<AlertHistoryRecord> out;
   if (!db_ || from_ms > to_ms)
     return out;
   std::lock_guard<std::mutex> lock(mutex_);
   sqlite3_stmt* stmt = nullptr;
-  const char* sql =
-      "SELECT sensor_id,timestamp_ms,level,rule,message,is_active "
-      "FROM alerts_history WHERE timestamp_ms>=? AND timestamp_ms<=? "
-      "ORDER BY timestamp_ms ASC";
+  // Spec6 final review M4：SELECT raised_at_ms 列（不再用 timestamp_ms 覆盖）。
+  // M7：sensor_id 有值时加 WHERE sensor_id=? 过滤。
+  const char* sql = nullptr;
+  if (sensor_id) {
+    sql =
+        "SELECT sensor_id,timestamp_ms,level,rule,message,raised_at_ms,"
+        "is_active FROM alerts_history "
+        "WHERE timestamp_ms>=? AND timestamp_ms<=? AND sensor_id=? "
+        "ORDER BY timestamp_ms ASC";
+  } else {
+    sql =
+        "SELECT sensor_id,timestamp_ms,level,rule,message,raised_at_ms,"
+        "is_active FROM alerts_history "
+        "WHERE timestamp_ms>=? AND timestamp_ms<=? "
+        "ORDER BY timestamp_ms ASC";
+  }
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
     std::cerr << "NoiseStore: prepare alerts query failed: "
               << sqlite3_errmsg(db_) << "\n";
@@ -390,6 +431,8 @@ std::vector<AlertHistoryRecord> NoiseStore::query_alerts(uint64_t from_ms,
   }
   sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(from_ms));
   sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(to_ms));
+  if (sensor_id)
+    sqlite3_bind_int(stmt, 3, *sensor_id);
   while (sqlite3_step(stmt) == SQLITE_ROW) {
     AlertHistoryRecord r;
     r.sensor_id = static_cast<uint8_t>(sqlite3_column_int(stmt, 0));
@@ -399,9 +442,9 @@ std::vector<AlertHistoryRecord> NoiseStore::query_alerts(uint64_t from_ms,
       r.event.rule = reinterpret_cast<const char*>(t);
     if (const unsigned char* t = sqlite3_column_text(stmt, 4))
       r.event.message = reinterpret_cast<const char*>(t);
-    r.event.is_active = sqlite3_column_int(stmt, 5) != 0;
+    r.event.raised_at_ms = static_cast<uint64_t>(sqlite3_column_int64(stmt, 5));
+    r.event.is_active = sqlite3_column_int(stmt, 6) != 0;
     r.event.sensor_id = r.sensor_id;
-    r.event.raised_at_ms = r.timestamp_ms;
     out.push_back(std::move(r));
   }
   sqlite3_finalize(stmt);

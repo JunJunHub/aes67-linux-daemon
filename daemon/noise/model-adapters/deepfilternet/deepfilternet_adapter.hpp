@@ -101,12 +101,14 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   // spec_orig: 输出帧原始复谱（kNbDf bins，= *window[2] 即中间帧）。
   // spec_out: 输出（kNbDf bins，调用者预分配）。
   // Spec6 T3：window 改为 const std::vector<Complex>* 指针数组（避免拷贝）。
-  static void apply_df_op(
-      const std::vector<const std::vector<fft::Complex>*>& window,
-      const float* coefs,
-      float gain_alpha,
-      const std::vector<fft::Complex>& spec_orig,
-      std::vector<fft::Complex>& spec_out);
+  // Spec6 final review I1：签名改为裸指针+size（零 per-frame heap，兼容
+  // std::array 成员与测试侧 std::vector 两种调用路径）。
+  static void apply_df_op(const std::vector<fft::Complex>* const* window,
+                          size_t window_size,
+                          const float* coefs,
+                          float gain_alpha,
+                          const std::vector<fft::Complex>& spec_orig,
+                          std::vector<fft::Complex>& spec_out);
 
  private:
   bool process_one_frame_(float& lsnr_out);
@@ -139,10 +141,15 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   std::vector<float> synthesis_mem_;  // ISTFT 输出重叠缓冲（480）
   std::vector<float> mean_norm_state_;  // feat_erb 的指数均值状态（kNbErb）
   std::vector<float> unit_norm_state_;  // feat_spec 的指数均值状态（kNbDf）
-  // 深度滤波历史复谱系数：存最近 kDfOrder + kDfLookahead 帧的 nb_df 频点复谱，
-  // 供 non-causal 卷积 [i-2..i+2] 使用。Sliding window：每帧 push 当前 spec
-  // 到 back，erase front，push placeholder。
-  std::vector<std::vector<fft::Complex>> df_spec_history_;
+  // 深度滤波历史复谱系数：存最近 kDfHistorySize = kDfOrder + kDfLookahead = 7
+  // 帧的 nb_df 频点复谱，供 non-causal 卷积 [i-2..i+2] 使用。
+  // Spec6 final review I2：改为 ring buffer（预分配 std::array，零 per-frame
+  // heap）。head_ 指向最旧（logical[0]），logical[i] = phys[(head_+i)%size]。
+  // 每帧写 spec_ 到 logical[back=size-1]，读 window[2..6]=logical[2..6]，
+  // 然后 head_ = (head_+1)%size（等价 erase front + push back）。
+  static constexpr size_t kDfHistorySize = kDfOrder + kDfLookahead;  // 7
+  std::array<std::vector<fft::Complex>, kDfHistorySize> df_spec_history_;
+  size_t df_spec_history_head_{0};  // 最旧 slot 的物理索引（logical[0]）
   // Spec6 T2（D-S6.6）+ T3：non-causal deep-filter 延迟缓冲。T3 改为预分配
   // ring buffer（kDfLookahead+1 个 slot），替代 deque<push/pop> 的 per-frame
   // heap 分配。每帧写入当前 slot（覆盖最旧），size > kDfLookahead 时取最旧做
@@ -183,6 +190,10 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   std::vector<fft::Complex> spec_e_;      // 应用 DF 后复谱 [kFreq]
   std::vector<fft::Complex> df_out_;      // apply_df_op 输出 [kNbDf]
   std::array<float, kFft> time_block_{};  // ISTFT 输出时域块
+  // Spec6 final review I1：apply_df_op window 指针数组改预分配成员（零
+  // per-frame heap）。process_one_frame_ 每帧填指针（不分配），传 data()+size()
+  // 给 apply_df_op。
+  std::array<const std::vector<fft::Complex>*, kDfOrder> window_ptrs_{};
 };
 
 }  // namespace noise

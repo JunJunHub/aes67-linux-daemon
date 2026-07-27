@@ -207,8 +207,11 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
         kUnitNormInitMin + static_cast<float>(i) *
                                (kUnitNormInitMax - kUnitNormInitMin) /
                                static_cast<float>(kNbDf - 1);
-  df_spec_history_.assign(kDfOrder + kDfLookahead,
-                          std::vector<fft::Complex>(kNbDf));
+  // Spec6 final review I2：df_spec_history_ 改 ring buffer（预分配 std::array，
+  // 零 per-frame heap）。init 预分配每个 slot 的 vector 容量。
+  for (auto& v : df_spec_history_)
+    v.assign(kNbDf, fft::Complex(0, 0));
+  df_spec_history_head_ = 0;
 
   spec_.resize(kFreq);
   feat_erb_.resize(kNbErb);      // [1,1,1,32]
@@ -239,8 +242,10 @@ void DeepFilterNetAdapter::reset() {
   std::fill(analysis_mem_.begin(), analysis_mem_.end(), 0.0f);
   std::fill(synthesis_mem_.begin(), synthesis_mem_.end(), 0.0f);
   // norm state 不重置（libdf reset 仅清 analysis/synthesis mem）。
+  // Spec6 final review I2：ring buffer 状态重置（清内容 + 归零 head）。
   for (auto& v : df_spec_history_)
     std::fill(v.begin(), v.end(), fft::Complex(0, 0));
+  df_spec_history_head_ = 0;
   // Spec6 T3：ring buffer 状态重置。
   df_delay_idx_ = 0;
   df_delay_count_ = 0;
@@ -413,8 +418,13 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
     // （window[2] = t-2 = 输出帧，spec_orig = window[2]）。
     // Spec6 T3：DelayedFrame + df_out + window 改预分配成员（零 per-frame
     // heap）。df_delay_buf_ 用 ring buffer + index 替代 deque<push/pop>。
+    // Spec6 final review I2：df_spec_history_ 改 ring buffer，零 per-frame
+    // heap。 back() = logical[kDfHistorySize-1] = phys[(head_+size-1)%size]。
+    auto& hist_back =
+        df_spec_history_[(df_spec_history_head_ + kDfHistorySize - 1) %
+                         kDfHistorySize];
     for (size_t f = 0; f < kNbDf; ++f)
-      df_spec_history_.back()[f] = spec_[f];
+      hist_back[f] = spec_[f];
     // 写入 ring buffer 当前 slot（覆盖最旧）。
     DelayedFrame& slot = df_delay_ring_[df_delay_idx_];
     std::copy(coefs, coefs + kNbDf * kDfOrder * 2, slot.coefs.data());
@@ -431,14 +441,16 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
       //   [t-6, t-5, t-4, t-3, t-2, t-1, t]
       // non-causal window = history[2..6] = [t-4, t-3, t-2, t-1, t]
       // spec_orig = history[4] = t-2（输出帧的原始 spec，仅前 96 频点）
-      // Spec6 T3：window 改用 history 指针引用（零 per-frame heap）。
-      std::vector<const std::vector<fft::Complex>*> window_ptrs(kDfOrder);
+      // Spec6 final review I1：window_ptrs_ 改预分配成员数组（零 per-frame
+      // heap）。logical[i] = phys[(head_+i)%size]。
       for (size_t o = 0; o < kDfOrder; ++o)
-        window_ptrs[o] = &df_spec_history_[2 + o];
+        window_ptrs_[o] =
+            &df_spec_history_[(df_spec_history_head_ + 2 + o) % kDfHistorySize];
       // spec_e: bins 0..95 用深度滤波，96..481 用 ERB 掩蔽版（delayed
       // spec_m）。
-      apply_df_op(window_ptrs, delayed_frame.coefs.data(), delayed_frame.gain,
-                  *window_ptrs[2], df_out_);
+      apply_df_op(window_ptrs_.data(), window_ptrs_.size(),
+                  delayed_frame.coefs.data(), delayed_frame.gain,
+                  *window_ptrs_[2], df_out_);
       for (size_t f = 0; f < kNbDf; ++f)
         spec_e_[f] = df_out_[f];
       // 余频点（96..481）用 delayed frame 的 ERB 掩蔽版。
@@ -470,9 +482,10 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
       out_ring_tail_ = (out_ring_tail_ + 1) % kOutRingCap;
       ++out_ring_count_;
     }
-    // 滑窗 history：丢弃最旧，push 占位（下帧填）。
-    df_spec_history_.erase(df_spec_history_.begin());
-    df_spec_history_.push_back(std::vector<fft::Complex>(kNbDf));
+    // Spec6 final review I2：ring buffer 推进 head（等价 erase front + push
+    // back），零 per-frame heap。下帧 back() = 当前 logical[0]（被覆盖前的最旧
+    // slot），写入前被覆盖，无需清零。
+    df_spec_history_head_ = (df_spec_history_head_ + 1) % kDfHistorySize;
     return true;
   } catch (...) {
     // ONNX 失败：保持 history 与 delay_buf 同步（两者都不前进），匹配
@@ -518,7 +531,7 @@ size_t DeepFilterNetAdapter::process(const float* in,
     // in->out passthrough，但失败 hop 的对应输入 in_delay_ 需对齐（lookahead
     // 缓冲 + 48k 流式），故用 silence 安全降级（sanitize 完整 + 10 帧界 +
     // 最终切 passthrough，不喂下游错误样本）。真实 memcpy passthrough 延后
-    // spec6。
+    // 后续 spec。
     // Spec6 T3 review Important #4：passthrough 改预分配 ring slot（零 heap）。
     std::array<float, kHop>& passthrough_slot = out_ring_[out_ring_tail_];
     passthrough_slot.fill(0.0f);
@@ -626,8 +639,11 @@ std::string DeepFilterNetAdapter::get_param(const std::string& /*key*/) const {
 // 单元测试直接验证卷积逻辑（无需 ONNX 模型）。
 // Spec6 T3：window 改为 const std::vector<Complex>* 指针数组（避免拷贝
 // vector）， spec_out 改为引用（调用者预分配）。
+// Spec6 final review I1：签名改为裸指针+size（零 per-frame heap，兼容
+// std::array 成员与测试侧 std::vector 两种调用路径）。
 void DeepFilterNetAdapter::apply_df_op(
-    const std::vector<const std::vector<fft::Complex>*>& window,
+    const std::vector<fft::Complex>* const* window,
+    size_t window_size,
     const float* coefs,
     float gain_alpha,
     const std::vector<fft::Complex>& spec_orig,

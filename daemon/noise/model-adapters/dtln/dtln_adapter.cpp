@@ -145,9 +145,9 @@ uint32_t DtlnAdapter::native_sample_rate() const {
 
 uint32_t DtlnAdapter::algorithmic_latency_samples() const {
   // DTLN 算法延迟 = 1 帧 @16k = 512 样本 = 32ms。换算到输入域（48k）：
-  // 512*(48000/16000)=1536。重采样器额外 <<2ms（arch §3.1）未折入
-  // （与 T1 Resampler::output_latency 延后处理一致）。kConvergenceMargin
-  // (50ms) 覆盖此未折入量，保守不致欠报。
+  // 512*(48000/16000)=1536。resampler 延迟由 DenoiseProcessor::switch_plugin
+  // 在 cb 上报时折入（plugin_latency + resampler_latency），本方法仅返回
+  // plugin 自身延迟。kConvergenceMargin (50ms) 覆盖收敛余量，保守不致欠报。
   return 1536;
 }
 bool DtlnAdapter::supports_vad() const {
@@ -290,7 +290,7 @@ size_t DtlnAdapter::process(const float* in,
     // 输入经 down_ 重采样入 in_fifo16_，失败 hop 的对应输入需 48k->16k
     // 重采样延迟输入 in_delay48_，复杂），故失败帧用 silence 安全降级（sanitize
     // 完整 + 10 帧界 + 最终切 passthrough，不喂下游 错误样本）。真实 memcpy
-    // passthrough 延后 spec6。
+    // passthrough 延后后续 spec。
     failed = true;
     // 无条件 push kHop 个 0（不依赖 in_fifo16_ 状态；原条件 !in_fifo16_.empty()
     // 在 fifo 空时提前停 -> 输出 < kHop -> 流率失配 rate glitch）。

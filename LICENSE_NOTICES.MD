@@ -46,6 +46,7 @@
 | Freeware Advanced Audio Coder, libfaac | LGPL | `WITH_STREAMER=ON` 时用于 AAC streamer | 按 LGPL 保留许可文本，提供库源码获取方式，并确保用户可以替换/重新链接 LGPL 组件。还需单独评估 AAC 编码相关专利/地区风险。 | `README.md`；`daemon/CMakeLists.txt` |
 | ALSA library, libasound | LGPL | `WITH_STREAMER=ON` 时用于音频采集/播放接口 | 按 LGPL 处理动态链接和许可文本；避免把 LGPL 库静态合入不可替换的闭源产物。 | `daemon/CMakeLists.txt` |
 | systemd library, libsystemd | LGPL | `WITH_SYSTEMD=ON` 时用于 notify/watchdog | 按 LGPL 处理动态链接、许可文本和源码获取方式。 | `daemon/CMakeLists.txt` |
+| SQLite library, libsqlite3 | Public Domain | `WITH_NOISE=ON` 时用于噪声历史持久化（NoiseStore，`noise.sqlite`） | SQLite 处于公有领域（Public Domain），无开源义务。分发时建议保留版权声明（https://www.sqlite.org/copyright.html）。 | `debian-packages.sh`；`daemon/CMakeLists.txt` |
 
 ## WebUI npm 依赖
 

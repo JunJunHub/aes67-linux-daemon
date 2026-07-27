@@ -295,6 +295,25 @@ std::string history_records_to_json_array(
 }
 
 // CSV 导出：首行表头 + 每条记录一行。列 = 关键标量字段（UI 绘图常用）。
+// Spec6 final review M1：RFC 4180 字符串转义（双引号包裹 + 内部引号双写），
+// 防止含逗号/换行/引号的字段（如 l3_match_type 模板 label）破坏 CSV 结构。
+std::string csv_escape(const std::string& field) {
+  // 若字段不含特殊字符（逗号、双引号、换行、回车），无需转义。
+  if (field.find_first_of(",\"\n\r") == std::string::npos)
+    return field;
+  std::string out;
+  out.reserve(field.size() + 2);
+  out += '"';
+  for (char c : field) {
+    if (c == '"')
+      out += "\"\"";
+    else
+      out += c;
+  }
+  out += '"';
+  return out;
+}
+
 std::string history_records_to_csv(
     const std::vector<MetricsHistoryRecord>& records) {
   std::stringstream ss;
@@ -305,13 +324,15 @@ std::string history_records_to_csv(
   for (const auto& r : records) {
     const auto& s = r.snapshot;
     ss << static_cast<unsigned>(r.sensor_id) << "," << r.timestamp_ms << ","
-       << s.noise_level_dbfs << "," << noise_type_to_string(s.noise_type) << ","
+       << s.noise_level_dbfs << ","
+       << csv_escape(noise_type_to_string(s.noise_type)) << ","
        << s.noise_type_confidence << "," << s.estimated_snr_db << ","
        << s.spectral_flatness << "," << s.hum_strength_db << ","
        << (s.denoise_enabled ? 1 : 0) << "," << s.noise_reduction_db << ","
-       << (s.is_alerting ? 1 : 0) << "," << alert_level_to_string(s.alert_level)
-       << "," << (s.plugin_degraded ? 1 : 0) << "," << s.l3_match_type << ","
-       << s.l3_similarity << "\n";
+       << (s.is_alerting ? 1 : 0) << ","
+       << csv_escape(alert_level_to_string(s.alert_level)) << ","
+       << (s.plugin_degraded ? 1 : 0) << "," << csv_escape(s.l3_match_type)
+       << "," << s.l3_similarity << "\n";
   }
   return ss.str();
 }
@@ -408,6 +429,9 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
             if (req.has_param("format"))
               fmt = req.get_param_value("format");
             if (fmt == "csv") {
+              // Spec6 final review M2：Content-Disposition 触发浏览器下载行为。
+              res.set_header("Content-Disposition",
+                             "attachment; filename=\"noise_history.csv\"");
               res.set_content(history_records_to_csv(records), "text/csv");
             } else {
               res.set_content(history_records_to_json_array(records),

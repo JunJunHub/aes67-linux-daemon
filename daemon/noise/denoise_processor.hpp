@@ -145,8 +145,11 @@ class DenoiseProcessor {
   };
 
   RcuPtr<PluginSlot> rcu_ptr_;  // 原子插槽 + 静止点回收
-  PluginSlot* pinned_{
-      nullptr};  // 本周期裸指针快照（RT 持有，on_period_end 置空）
+  // Spec6 final review I5：pinned_ 改 std::atomic<PluginSlot*>（消除 barrier
+  // 超时时的 data race UB）。on_period_begin 写（capture 线程），process 读
+  // （per-sink 线程），on_period_end 置空（capture 线程）。retire queue 保证
+  // slot 生命周期，relaxed 序即可（指针值原子性 + retire grace 期足够）。
+  std::atomic<PluginSlot*> pinned_{nullptr};
   RetireQueue<PluginSlot> retire_list_;  // 旧 slot 延迟释放队列
   PluginConfig current_config_;
   LatencyChangeCb latency_change_cb_;  // init-only

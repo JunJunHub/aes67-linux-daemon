@@ -72,15 +72,18 @@ bool DenoiseProcessor::set_param(const std::string& key,
 }
 
 void DenoiseProcessor::on_period_begin() {
-  pinned_ = rcu_ptr_.load();  // 永不为空（构造即 publish PassthroughPlugin）
+  // Spec6 final review I5：atomic store（消除 barrier 超时时的 data race UB）。
+  pinned_.store(rcu_ptr_.load(), std::memory_order_relaxed);
 }
 
 size_t DenoiseProcessor::process(const float* in,
                                  size_t n_in,
                                  DenoiseResult* result) {
+  // Spec6 final review I5：atomic load 一次，整 process() 复用同一 slot 快照。
+  PluginSlot* pinned = pinned_.load(std::memory_order_relaxed);
   // ① 降噪：plugin 写 back_->denoised（IDenoisePlugin 单输出契约，§2.2）
-  size_t n = pinned_->plugin->process(in, n_in, back_->denoised.get(),
-                                      max_frame_, result);
+  size_t n = pinned->plugin->process(in, n_in, back_->denoised.get(),
+                                     max_frame_, result);
   // Spec5 T2：消费 result->status（D-S5.5 失败降级）。
   // adapter 在 Run 异常时置 kBypass + 直通；连续 kBypass 达阈值升级 kError
   // + 置 degraded_pending_（控制线程 housekeeper 据此切 passthrough + 告警）。
@@ -106,10 +109,10 @@ size_t DenoiseProcessor::process(const float* in,
   back_->frame_count = n;
   // ④ 静音过渡：对本 slot 的 mute 单调递减（仅 RT 写，min 上限保证永不为负）
   //    仅静音降噪路（denoised），original/noise 保留以供分析/SSE
-  if (pinned_->mute_remaining > 0) {
-    size_t mute = std::min(pinned_->mute_remaining, n);
+  if (pinned->mute_remaining > 0) {
+    size_t mute = std::min(pinned->mute_remaining, n);
     std::memset(back_->denoised.get(), 0, mute * sizeof(float));
-    pinned_->mute_remaining -= mute;
+    pinned->mute_remaining -= mute;
   }
   return n;
 }
@@ -143,7 +146,8 @@ void DenoiseProcessor::on_period_end() {
   // 宽松描述，以本节单线程 swap + §11 风险17 的"period 回调内 memcpy
   // front"为准。
   std::swap(front_, back_);
-  pinned_ = nullptr;  // 释放本周期裸指针（Taste 决策1，不再持 shared_ptr）
+  // Spec6 final review I5：atomic store nullptr（释放本周期裸指针）。
+  pinned_.store(nullptr, std::memory_order_relaxed);
   rcu_ptr_.advance_epoch();  // 通知 housekeeper：一个静止点已过
 }
 

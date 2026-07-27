@@ -132,8 +132,11 @@ inline void Fft(std::vector<Complex>& a, int sign) {
 inline void Rfft(const float* real, size_t n, Complex* out, size_t out_size) {
   (void)out_size;  // 调用者保证 >= n/2+1
   thread_local std::vector<Complex> a;
-  if (a.size() < n)
-    a.resize(n);
+  // Spec6 合并后修复：每次 resize 到 n（缩小不 realloc，capacity 保持零
+  // heap；扩大首次 realloc 后稳定）。原 if(size<n) 只扩不缩，Fft(a,-1) 用
+  // a.size()（历史最大），若前次调用用更大 N 污染 thread_local，后续小 N
+  // FFT 用错误长度 -> round-trip 误差 ~0.01。
+  a.resize(n);
   for (size_t i = 0; i < n; ++i)
     a[i] = Complex(real[i], 0.0f);
   Fft(a, -1);
@@ -153,8 +156,9 @@ inline void Irfft(const Complex* spec,
                   size_t out_size) {
   (void)out_size;  // 调用者保证 >= n_out
   thread_local std::vector<Complex> full;
-  if (full.size() < n_out)
-    full.resize(n_out);
+  // Spec6 合并后修复：每次 resize 到 n_out（同 Rfft 理由，防 thread_local
+  // 污染；Fft(full,+1) 用 full.size()=n_out 正确）。
+  full.resize(n_out);
   std::fill(full.begin(), full.begin() + n_out, Complex(0, 0));
   for (size_t k = 0; k < nbins && k < n_out; ++k)
     full[k] = spec[k];

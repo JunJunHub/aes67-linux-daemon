@@ -3973,9 +3973,31 @@ BOOST_AUTO_TEST_CASE(history_export_csv) {
   auto r = cli.Get("/api/noise/sensor/0/history/export?format=csv");
   BOOST_REQUIRE(r);
   BOOST_CHECK_EQUAL(r->status, 200);
-  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms") != std::string::npos);
-  // 至少一行数据（CSV 行尾换行）。
-  BOOST_CHECK(r->body.find("\n") != std::string::npos);
+
+  // T1#2: 验证 CSV header 完整（15 字段）。
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms,noise_level_dbfs,"
+                           "noise_type,noise_type_confidence,estimated_snr_db,"
+                           "spectral_flatness,hum_strength_db,denoise_enabled,"
+                           "noise_reduction_db,is_alerting,alert_level,"
+                           "plugin_degraded,l3_match_type,l3_similarity") !=
+              std::string::npos);
+
+  // T1#2: 解析数据行，验证字段数（15 字段 = 14 逗号）+ sensor_id=0。
+  std::istringstream iss(r->body);
+  std::string line;
+  std::getline(iss, line);  // skip header
+  bool has_data = false;
+  while (std::getline(iss, line)) {
+    if (line.empty())
+      continue;
+    has_data = true;
+    size_t commas = std::count(line.begin(), line.end(), ',');
+    BOOST_CHECK_EQUAL(commas, 14u);
+    // 第一个字段是 sensor_id，应为 0。
+    BOOST_CHECK_EQUAL(line.find("0,"), 0u);
+    break;
+  }
+  BOOST_CHECK(has_data);
 }
 
 // T1: 过期记录被后台清理（NoiseStore 单元）。
@@ -4513,6 +4535,9 @@ BOOST_AUTO_TEST_CASE(xrun_degradation) {
   BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 2u);
 }
 
+// T3#9: mallinfo2 验证 Rfft/Irfft 零堆分配（glibc 2.33+）。
+#include <malloc.h>
+
 // T3: Rfft/Irfft 不返 vector（输出参数，调用者预分配 buffer）。
 // 验证 API 签名：输出参数形式，不返回 vector。
 BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
@@ -4522,7 +4547,15 @@ BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
   for (size_t i = 0; i < N; ++i)
     input[i] = 0.1f * std::sin(2.0f * 3.14159f * 100.0f * i / N);
   std::vector<noise::fft::Complex> spec(N / 2 + 1);
+  std::vector<float> output(N);
+
+  // T3#9: mallinfo2 验证 Rfft/Irfft 调用本身零堆分配（buffer 预分配在记录前）。
+  struct mallinfo2 before = mallinfo2();
   noise::fft::Rfft(input, N, spec.data(), spec.size());
+  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
+  struct mallinfo2 after = mallinfo2();
+  BOOST_CHECK_EQUAL(after.uordblks, before.uordblks);
+
   BOOST_REQUIRE_EQUAL(spec.size(), N / 2 + 1);
   // 100Hz 正弦 -> 在 bin 100 有峰值。
   // 验证非全零（变换有效）。
@@ -4535,12 +4568,9 @@ BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
   }
   BOOST_CHECK(has_nonzero);
 
-  // Irfft：输出参数形式（spec, nbins, n_out, out, out_size）。
-  std::vector<float> output(N);
-  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
-  BOOST_REQUIRE_EQUAL(output.size(), N);
   // irfft(rfft(x)) ≈ x（数值误差 < 1e-4 绝对，近零值用绝对比较避免相对误差
   // 放大）。
+  BOOST_REQUIRE_EQUAL(output.size(), N);
   for (size_t i = 0; i < N; ++i) {
     float diff = std::abs(output[i] - input[i]);
     BOOST_CHECK_LT(diff, 1e-4f);
@@ -4557,18 +4587,22 @@ BOOST_AUTO_TEST_CASE(dtln_dfn_no_per_frame_heap) {
   synth::speech_like(in, 480);
   float out[480];
   noise::DenoiseResult r;
-  // 连续 process 10 帧，验证输出一致（直通模式，每帧应相同）。
   std::vector<float> first_out(480);
+
+  // 预热 1 帧（触发 thread_local scratch 首次分配）。
+  dtln.process(in, 480, out, 480, &r);
+  std::copy(out, out + 480, first_out.begin());
+
+  // T3#10: mallinfo2 验证稳态 process 零堆分配。
+  struct mallinfo2 before = mallinfo2();
   for (int f = 0; f < 10; ++f) {
     size_t n = dtln.process(in, 480, out, 480, &r);
     BOOST_REQUIRE_EQUAL(n, 480u);
-    if (f == 0)
-      std::copy(out, out + 480, first_out.begin());
-    else {
-      for (size_t i = 0; i < 480; ++i)
-        BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
-    }
+    for (size_t i = 0; i < 480; ++i)
+      BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
   }
+  struct mallinfo2 after = mallinfo2();
+  BOOST_CHECK_EQUAL(after.uordblks, before.uordblks);
 }
 
 // T3: TemplateDB seqlock 读（capture 线程无锁读，HTTP 写时读 retry）。

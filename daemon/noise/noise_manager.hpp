@@ -164,6 +164,12 @@ class NoiseManager {
   bool get_ref_overflow_for_test(uint8_t comparator_id,
                                  size_t& ref_overflow,
                                  size_t& cmp_overflow) const;
+  // Spec6 T2 测试钩子：获取 comparator 累计写入样本数（ref/cmp 各一路）。
+  // 用于验证 48k 路由（native≠48k 时 total_written 应反映 48k 样本数，
+  // 非原生帧数）。
+  bool get_ref_total_written_for_test(uint8_t comparator_id,
+                                      size_t& ref_total,
+                                      size_t& cmp_total) const;
   // 测试钩子：comparison 线程是否在运行。
   bool is_comparison_thread_running_for_test() const {
     return comparison_running_.load(std::memory_order_relaxed);
@@ -388,6 +394,17 @@ class NoiseManager {
   // 测试钩子：等待 history housekeeper 完成一次 flush（最多 timeout_ms）。
   bool wait_history_flush_done_for_test(uint32_t timeout_ms = 2000);
 
+  // Spec6 T2：注册降噪总延迟变更转发回调（plugin + resampler）。
+  // init-only（同 set_ptp_status_forward_callback 模式）。消费者为
+  // PcmCaptureService 做播放延迟补偿。add_sensor 时每个 sensor 的
+  // DenoiseProcessor::set_latency_change_cb 经此 forward 到外部消费者。
+  // cb 为空时（默认）不上报（测试默认路径）。
+  using LatencyForwardCallback =
+      std::function<void(uint8_t sensor_id, uint32_t latency_samples)>;
+  void set_latency_forward_callback(LatencyForwardCallback cb) {
+    latency_forward_cb_ = std::move(cb);
+  }
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -433,6 +450,8 @@ class NoiseManager {
   std::shared_ptr<NoiseTemplateDB> template_db_;
   // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
   std::shared_ptr<NoiseStore> noise_store_;
+  // Spec6 T2：降噪总延迟变更转发回调（init-only，运行期不改）。
+  LatencyForwardCallback latency_forward_cb_;
   // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
   // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
   // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，

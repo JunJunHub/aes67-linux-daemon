@@ -193,6 +193,13 @@ void PcmCaptureService::set_ptp_status_forward_callback(
   ptp_status_forward_cb_ = std::move(cb);
 }
 
+void PcmCaptureService::set_latency_change_callback(LatencyChangeCallback cb) {
+  // Spec6 T2：消费者接线。init-only（同 set_capture_joined_callback 模式）。
+  // 实际播放延迟补偿逻辑后续 task 接线（此处先存储 cb，可被
+  // NoiseManager 经 forward cb 调用）。
+  latency_change_cb_ = std::move(cb);
+}
+
 bool PcmCaptureService::on_sink_add(uint8_t /*id*/) {
   return true;
 }

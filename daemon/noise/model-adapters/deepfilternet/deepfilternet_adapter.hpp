@@ -19,6 +19,12 @@
 // 状态 + 深度滤波应用已实现（忠实移植 libdf）。简化版跳 postfilter（R-S5.3）。
 // 详见 .cpp。数值正确性已对照 onnxruntime Python 参考验证（dtln_denoises 类
 // 比测试 dfn_denoises_nonstation，无模型时 SKIP）。
+//
+// Spec6 T2（D-S6.6）：深度滤波重写为 non-causal [i-2..i+2]（对照
+// DeepFilterNet/df/modules.py DfOp/spec_pad/assign_df）。coef[0] 配最旧帧，
+// alpha blend `spec_f = spec_f*alpha + spec*(1-alpha)`。延迟 (coefs, gain,
+// mask) kDfLookahead=2 帧以对齐 non-causal window。modules.py 未 vendored，
+// 实现依据 spec 设计描述 + 测试（行为权威定义）。
 #ifndef NOISE_MODEL_ADAPTERS_DEEPFILTERNET_DEEPFILTERNET_ADAPTER_HPP_
 #define NOISE_MODEL_ADAPTERS_DEEPFILTERNET_DEEPFILTERNET_ADAPTER_HPP_
 
@@ -70,17 +76,7 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   bool set_param(const std::string& key, const std::string& value) override;
   std::string get_param(const std::string& key) const override;
 
- private:
-  bool process_one_frame_(float& lsnr_out);
-  void init_erb_fb_();
-  void init_window_();
-
-  std::unique_ptr<Ort::Session> enc_;
-  std::unique_ptr<Ort::Session> df_dec_;
-  std::unique_ptr<Ort::Session> erb_dec_;
-  bool initialized_{false};
-
-  // DFN 参数（config.ini）。
+  // DFN 模型常量（Spec6 T2 移至 public：测试 apply_df_op_for_test 需引用）。
   static constexpr uint32_t kSr = 48000;
   static constexpr size_t kFft = 960;            // fft_size
   static constexpr size_t kHop = 480;            // hop_size
@@ -90,6 +86,35 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   static constexpr size_t kDfOrder = 5;
   static constexpr size_t kDfLookahead = 2;
   static constexpr size_t kConvCh = 64;
+
+  // Spec6 T2：DFN deep-filter 操作（non-causal + alpha blend）。
+  // 实现 DfOp + assign_df（对照 DeepFilterNet/df/modules.py）：
+  //   - non-causal window [i-2..i+2]（5 帧，lookahead=2）
+  //   - coef[0] 配最旧帧（window[0]）
+  //   - alpha blend: spec_f = spec_f*alpha + spec_orig*(1-alpha)
+  //     alpha = clamp(gain_alpha, 0, 1)
+  // window: 5 帧 [oldest..newest]，每帧 kNbDf 复频点。
+  // coefs: [kNbDf * kDfOrder * 2] = 960 floats（re,im per order per bin）。
+  //   coefs[f*10 + o*2 + 0]=re_o, [+1]=im_o；o=0 配 window[0]（最旧）。
+  // gain_alpha: alpha 来源（df_dec 输出 gain[0]）。
+  // spec_orig: 输出帧原始复谱（kNbDf bins，= window[2] 即中间帧）。
+  // spec_out: 输出（kNbDf bins）。
+  static void apply_df_op_for_test(
+      const std::vector<std::vector<fft::Complex>>& window,
+      const float* coefs,
+      float gain_alpha,
+      const std::vector<fft::Complex>& spec_orig,
+      std::vector<fft::Complex>& spec_out);
+
+ private:
+  bool process_one_frame_(float& lsnr_out);
+  void init_erb_fb_();
+  void init_window_();
+
+  std::unique_ptr<Ort::Session> enc_;
+  std::unique_ptr<Ort::Session> df_dec_;
+  std::unique_ptr<Ort::Session> erb_dec_;
+  bool initialized_{false};
 
   // ERB 滤波器组：每 ERB band 包含的频点数（sum == kFreq=481）。
   std::vector<size_t> erb_;
@@ -112,10 +137,21 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   std::vector<float> synthesis_mem_;  // ISTFT 输出重叠缓冲（480）
   std::vector<float> mean_norm_state_;  // feat_erb 的指数均值状态（kNbErb）
   std::vector<float> unit_norm_state_;  // feat_spec 的指数均值状态（kNbDf）
-  // 深度滤波历史复谱系数：kNbDf 个频点 × kDfOrder 阶，每帧滑窗。
-  // spec_df_buf_[t][f] = 复谱（real,imag interleaved 或 Complex）。存最近
-  // kDfOrder + lookahead 帧的 nb_df 频点复谱，供深度滤波卷积。
+  // 深度滤波历史复谱系数：存最近 kDfOrder + kDfLookahead 帧的 nb_df 频点复谱，
+  // 供 non-causal 卷积 [i-2..i+2] 使用。Sliding window：每帧 push 当前 spec
+  // 到 back，erase front，push placeholder。
   std::vector<std::vector<fft::Complex>> df_spec_history_;
+  // Spec6 T2（D-S6.6）：non-causal deep-filter 延迟缓冲。每帧 push 当前帧的
+  // (coefs, gain, spec_m) 副本，size > kDfLookahead 时 pop 最旧项做 non-causal
+  // 卷积（用 history[2..6] = [i-2..i+2] window + delayed coefs/gain/spec_m）。
+  // 延迟 kDfLookahead=2 帧对齐未来帧到达后输出。每帧 heap 分配（T3 RT refactor
+  // 待办：改预分配成员，见 spec6-plan T3 §3.6）。
+  struct DelayedFrame {
+    std::vector<float> coefs;          // [kNbDf * kDfOrder * 2] = 960
+    float gain{0.0f};                  // df_dec gain[0]
+    std::vector<fft::Complex> spec_m;  // ERB-masked spec [kFreq] = 481
+  };
+  std::deque<DelayedFrame> df_delay_buf_;
   // 当前帧产出因 lookahead=2 延迟：缓冲 lookahead+1 帧的频谱 + 输出，
   // 待未来帧到达后对齐输出。
   std::deque<std::vector<float>> out_frame_buf_;  // 待输出时域帧（每帧 kHop）

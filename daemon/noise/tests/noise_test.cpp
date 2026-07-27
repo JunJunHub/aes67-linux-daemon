@@ -4072,3 +4072,191 @@ BOOST_AUTO_TEST_CASE(feature_type_vggish_in_template_response) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T2：DFN non-causal + RefComparator 48k + resampler latency ──────
+#include "denoise_processor.hpp"
+#include "model-adapters/deepfilternet/deepfilternet_adapter.hpp"
+#include "ref_comparator.hpp"
+#include "resampler.hpp"
+
+BOOST_AUTO_TEST_SUITE(spec6_t2_tests)
+
+// 辅助：构造一个 DFN deep-filter window（5 帧，每帧 kNbDf=96 复频点）。
+// frame_values 是 5 个标量值，每帧所有频点设为同一值（便于验证卷积选择）。
+static std::vector<std::vector<noise::fft::Complex>> make_df_window(
+    const std::vector<float>& frame_values) {
+  std::vector<std::vector<noise::fft::Complex>> window(
+      noise::DeepFilterNetAdapter::kDfOrder);
+  for (size_t o = 0; o < noise::DeepFilterNetAdapter::kDfOrder; ++o) {
+    window[o].assign(noise::DeepFilterNetAdapter::kNbDf,
+                     noise::fft::Complex(frame_values[o], 0.0f));
+  }
+  return window;
+}
+
+// 辅助：构造 coefs 数组（kNbDf * kDfOrder * 2 = 960 floats）。
+// order_values 是 5 个复数值（re,im 交替），每帧所有频点同一值。
+static std::vector<float> make_df_coefs(
+    const std::vector<std::pair<float, float>>& order_values) {
+  const size_t kNbDf = noise::DeepFilterNetAdapter::kNbDf;
+  const size_t kDfOrder = noise::DeepFilterNetAdapter::kDfOrder;
+  std::vector<float> coefs(kNbDf * kDfOrder * 2, 0.0f);
+  for (size_t f = 0; f < kNbDf; ++f) {
+    for (size_t o = 0; o < kDfOrder; ++o) {
+      coefs[f * 10 + o * 2 + 0] = order_values[o].first;   // re
+      coefs[f * 10 + o * 2 + 1] = order_values[o].second;  // im
+    }
+  }
+  return coefs;
+}
+
+// T2: DFN deep-filter non-causal window [i-2..i+2]。
+// 设 coefs[2]（中间帧）=1，其余=0，gain=1（alpha=1，纯 deep filter）。
+// 输出应 = window[2]（中间帧 = 输出帧 i），验证 window 使用 [i-2..i+2]
+// 而非纯因果 [i, i-1, ..., i-4]。
+BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
+  // window: [1.0, 2.0, 3.0, 4.0, 5.0]（oldest..newest）
+  auto window = make_df_window({1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
+  // coefs: o=2 -> (1, 0)，其余 (0, 0)
+  auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
+  // spec_orig = window[2] = 3.0（中间帧，alpha blend 的 spec_orig）
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(3.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  // gain=1 -> alpha=1 -> spec_out = spec_f (pure deep filter, no blend)
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 1.0f,
+                                                    spec_orig, spec_out);
+  // 验证：spec_f = coefs[2]*window[2] = 1*3 = 3.0
+  // alpha=1 -> spec_out = spec_f = 3.0
+  BOOST_REQUIRE_EQUAL(spec_out.size(), noise::DeepFilterNetAdapter::kNbDf);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 3.0f, 1e-4f);
+  // 如果是纯因果（o=0 配最新帧），coefs[2] 配 window[2] 也会过。
+  // 用 coefs[0] 验证：non-causal 下 o=0 配最旧帧（window[0]），
+  // 因果下 o=0 配最新帧（window[4]）。
+  auto coefs2 = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs2.data(), 1.0f,
+                                                    spec_orig, spec_out);
+  // non-causal: o=0 配 window[0]=1.0 -> spec_f=1.0 -> spec_out=1.0
+  // causal: o=0 配 window[4]=5.0 -> spec_f=5.0 -> spec_out=5.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 1.0f, 1e-4f);
+}
+
+// T2: DFN coef[0] 配最旧帧（non-causal mapping）。
+// coefs[0]=1, 其余=0, gain=1。输出应 = window[0]（最旧 = i-2）。
+BOOST_AUTO_TEST_CASE(dfn_coef_mapping_oldest_first) {
+  auto window = make_df_window({10.0f, 20.0f, 30.0f, 40.0f, 50.0f});
+  auto coefs = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(30.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 1.0f,
+                                                    spec_orig, spec_out);
+  // coef[0] 配最旧帧 window[0]=10.0 -> spec_out=10.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 10.0f, 1e-4f);
+  // 验证 coef[4] 配最新帧 window[4]=50.0
+  auto coefs4 = make_df_coefs({{0, 0}, {0, 0}, {0, 0}, {0, 0}, {1, 0}});
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs4.data(), 1.0f,
+                                                    spec_orig, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 50.0f, 1e-4f);
+}
+
+// T2: DFN assign_df alpha blend：spec_f = spec_f*alpha + spec*(1-alpha)。
+// 设 coefs[2]=1（选中间帧），gain=0.3（alpha=0.3）。
+// spec_f = 1 * window[2] = 30.0
+// spec_out = 30*0.3 + spec_orig*0.7 = 9 + 21 = 30.0（巧合，spec_orig=30）
+// 用不同 spec_orig 验证：spec_orig=0 -> spec_out = 30*0.3 = 9.0
+BOOST_AUTO_TEST_CASE(dfn_assign_df_alpha_blend) {
+  auto window = make_df_window({0.0f, 0.0f, 30.0f, 0.0f, 0.0f});
+  auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
+  // spec_orig = 0 -> spec_out = spec_f * alpha + 0 * (1-alpha) = 30*0.3 = 9.0
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(0.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.3f,
+                                                    spec_orig, spec_out);
+  // alpha=0.3 -> spec_out = 30*0.3 + 0*0.7 = 9.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 9.0f, 1e-4f);
+  // spec_orig = 100 -> spec_out = 30*0.3 + 100*0.7 = 9 + 70 = 79.0
+  const std::vector<noise::fft::Complex> spec_orig2(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(100.0f, 0.0f));
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.3f,
+                                                    spec_orig2, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 79.0f, 1e-4f);
+  // gain=0 -> alpha=0 -> spec_out = spec_f*0 + spec_orig*1 = spec_orig
+  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.0f,
+                                                    spec_orig2, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 100.0f, 1e-4f);
+}
+
+// T2: RefComparator native≠48k 时收 48k chunk（非原生帧）。
+// 创建 44.1k sensor + ref_comparator，喂 N 帧原生（44.1k）。
+// comparator 的 total_written 应反映 48k resampled 样本数（≠ N）。
+BOOST_AUTO_TEST_CASE(ref_comparator_48k_route_native_not_48k) {
+  // 用 44.1k 采样率的 stub（native ≠ 48k 触发入口重采样）。
+  struct Bridge44100 : public NoiseAudioBridgeStub {
+    uint32_t get_sample_rate() const override { return 44100; }
+  };
+  Bridge44100 bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.plugin_name = "passthrough";  // 不需 ONNX
+  BOOST_REQUIRE(mgr.add_sensor(0, 0, cfg));
+  BOOST_REQUIRE(mgr.add_sensor(1, 1, cfg));
+  // 配置 ref_comparator（ref_sink=0, cmp_sink=1）
+  uint8_t cid = mgr.add_ref_comparator(0, 1);
+  BOOST_REQUIRE_NE(cid, 0u);
+  // 喂足够多的帧触发 resampler 产出 48k chunk。
+  // 44.1k -> 48k：每 441 native 样本 -> ~480 48k 样本
+  // 喂 10 * 441 = 4410 native -> ~4800 48k samples
+  mgr.on_period_begin();
+  float buf[441];
+  for (int i = 0; i < 441; ++i)
+    buf[i] = 0.1f * static_cast<float>(i) / 441.0f;
+  for (int f = 0; f < 10; ++f)
+    mgr.on_frame(0, buf, 441);
+  for (int f = 0; f < 10; ++f)
+    mgr.on_frame(1, buf, 441);
+  mgr.on_period_end();
+  // 验证 comparator 收到的样本数 > 0（48k chunk 已路由）
+  size_t ref_total = 0, cmp_total = 0;
+  BOOST_REQUIRE(mgr.get_ref_total_written_for_test(cid, ref_total, cmp_total));
+  BOOST_TEST_MESSAGE("44.1k route: ref_total=" << ref_total
+                                               << " cmp_total=" << cmp_total
+                                               << " (fed 4410 each)");
+  // 4410 native -> ~4800 48k。验证 total_written ≠ 4410（不是原生帧）
+  // 且 > 0（48k chunk 已路由）。
+  BOOST_CHECK_GT(ref_total, 0u);
+  BOOST_CHECK_GT(cmp_total, 0u);
+  // native 4410 -> 48k 应为 ~4800（resampler 比例 48/44.1≈1.088）。
+  // 验证 total_written 不等于原生帧数（4410），证明走了 48k 重采样。
+  BOOST_CHECK_NE(ref_total, 4410u);
+  BOOST_CHECK_NE(cmp_total, 4410u);
+  // 清理
+  BOOST_CHECK(mgr.remove_ref_comparator(cid));
+}
+
+// T2: algorithmic_latency_samples 含 resampler 延迟。
+// DenoiseProcessor::switch_plugin 时 cb 收到 plugin_latency +
+// resampler_latency。
+BOOST_AUTO_TEST_CASE(resampler_latency_in_algorithmic_latency) {
+  noise::DenoiseProcessor proc;
+  uint32_t reported_latency = 0;
+  proc.set_latency_change_cb(
+      [&reported_latency](uint32_t l) { reported_latency = l; });
+  // 设 resampler 延迟 = 100（模拟非 48k 的 SpeexDSP 延迟）
+  proc.set_resampler_latency(100);
+  // switch 到 passthrough（latency=0）-> cb 收 0 + 100 = 100
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 100u);
+  // 设 resampler 延迟 = 0（模拟 48k passthrough）-> cb 收 0 + 0 = 0
+  proc.set_resampler_latency(0);
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 0u);
+  // 设 resampler 延迟 = 200 -> cb 收 0 + 200 = 200
+  proc.set_resampler_latency(200);
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 200u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

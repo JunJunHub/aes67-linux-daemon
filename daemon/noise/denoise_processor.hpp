@@ -63,8 +63,9 @@ class DenoiseProcessor {
   // kDegradationThreshold(10) -> 升级为 kError + 置 degraded_pending_。
   // 控制线程 housekeeper（on_period_end 经 NoiseManager）检查 degraded_pending_
   // -> switch_plugin("passthrough") + 上报告警。RT 仅置原子标志，实际切换在
-  // 控制线程（switch_plugin 含 RcuPtr publish + retire，非 RT 安全；on_period_end
-  // 非每帧紧路径，罕见故障下可接受，旧 slot 经 retire 延迟回收避免 RT 析构）。
+  // 控制线程（switch_plugin 含 RcuPtr publish + retire，非 RT
+  // 安全；on_period_end 非每帧紧路径，罕见故障下可接受，旧 slot 经 retire
+  // 延迟回收避免 RT 析构）。
   bool degraded_pending() const {
     return degraded_pending_.load(std::memory_order_acquire);
   }
@@ -114,6 +115,11 @@ class DenoiseProcessor {
   using LatencyChangeCb = std::function<void(uint32_t)>;
   // init-only：运行期不再改，避免 std::function 读写竞态。
   void set_latency_change_cb(LatencyChangeCb cb);
+  // Spec6 T2：注入入口 Resampler 延迟（per-sensor，add_sensor 时由
+  // NoiseManager 调用）。switch_plugin 时 cb 上报的总延迟 =
+  // plugin->algorithmic_latency_samples() + resampler_latency_。
+  // native==48k 时 Resampler 为 passthrough、output_latency()=0，不影响。
+  void set_resampler_latency(uint32_t latency) { resampler_latency_ = latency; }
 
  private:
   // 三路输出缓冲（front/back 双缓冲，构造时按 max_frame_
@@ -145,6 +151,10 @@ class DenoiseProcessor {
   RetireQueue<PluginSlot> retire_list_;  // 旧 slot 延迟释放队列
   PluginConfig current_config_;
   LatencyChangeCb latency_change_cb_;  // init-only
+  // Spec6 T2：入口 Resampler 延迟（per-sensor，set_resampler_latency 注入）。
+  // switch_plugin 时加到 plugin latency 上报给 cb 消费者（PcmCaptureService
+  // 做播放延迟补偿）。native==48k 时为 0。
+  uint32_t resampler_latency_{0};
   // 双缓冲（BL1）：front 供 Streamer/SSE 读，back 供 RT process
   // 写，on_period_end swap。
   std::unique_ptr<DenoiseBuffer> front_;
@@ -161,7 +171,7 @@ class DenoiseProcessor {
   static constexpr size_t kConvergenceMargin = 2400;
   // Spec5 T2：连续 kBypass 阈值，达此升级为 kError（D-S5.5）。
   static constexpr size_t kDegradationThreshold = 10;
-  size_t consecutive_bypass_count_{0};  // RT 线程写（process）
+  size_t consecutive_bypass_count_{0};         // RT 线程写（process）
   std::atomic<bool> degraded_pending_{false};  // RT 写，控制线程读+清
 };
 

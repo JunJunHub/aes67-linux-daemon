@@ -113,6 +113,21 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   const uint32_t native_rate = bridge_.get_sample_rate();
   ctx.resampler = std::make_shared<Resampler>(native_rate, kPipelineRateHz);
   ctx.resample_fifo = std::make_shared<std::deque<float>>();
+  // Spec6 T2：resampler 延迟折入 algorithmic_latency_samples 上报
+  // （DenoiseProcessor::switch_plugin 时 cb 收 plugin_latency +
+  // resampler_latency）。native==48k 时 output_latency()=0，不影响现有账。
+  ctx.denoise->set_resampler_latency(
+      static_cast<uint32_t>(ctx.resampler->output_latency()));
+  // Spec6 T2：wire DenoiseProcessor::set_latency_change_cb 经
+  // latency_forward_cb_ 转发到 PcmCaptureService（消费者，播放延迟补偿）。
+  // cb 为空时（测试默认）不上报。init-only：cb 在 add_sensor 时设置一次，
+  // 运行期不再改（避免 std::function 读写竞态，同
+  // set_capture_joined_callback）。
+  const uint8_t sid = sensor_id;
+  ctx.denoise->set_latency_change_cb([this, sid](uint32_t latency) {
+    if (latency_forward_cb_)
+      latency_forward_cb_(sid, latency);
+  });
   // Spec3 Task 4：保存原始 cfg 供 save_status 序列化（arch §7.4）。
   ctx.cfg = cfg;
 
@@ -292,11 +307,16 @@ void NoiseManager::on_frame(uint8_t sink_id,
     // 滤波状态跨 on_frame 连续），输出进 per-sensor FIFO，按 48k 480-样本 chunk
     // 逐个喂入 ①②③④（一个 on_frame 可能 emit 0/1/N 个 chunk；period_begin/end
     // 仍每 ALSA period 一次，metrics 在 on_period_end 聚合，变长 chunk
-    // 不影响）。 注意：RefComparator 路由（on_frame 末尾，原生帧）不变，仍每
-    // on_frame 一次。
+    // 不影响）。
+    // Spec6 T2：RefComparator 路由改 48k chunk（同 ①②③④ 链路的 48k 帧源），
+    // 使 comparator 始终收 48k 帧（native≠48k 时不再因原生帧导致 delay_ms
+    // 数值失准）。passthrough 路径：route native（=48k）；resample 路径：
+    // route 每个 48k chunk。
     if (!ctx.resampler || ctx.resampler->is_passthrough()) {
       // 48k 直通：不经 SpeexDSP / FIFO，直接处理输入帧（与 Spec4 行为一致）。
       process_pipeline_chunk(ctx, frames, frame_size);
+      // RefComparator 收 48k 帧（= native，passthrough）。
+      route_to_ref_comparators(sink_id, frames, frame_size);
     } else {
       // native≠48k：resample native chunk -> per-sensor FIFO -> 喂 48k 480
       // chunk。
@@ -314,29 +334,12 @@ void NoiseManager::on_frame(uint8_t sink_id,
         std::copy(fifo.begin(), fifo.begin() + kPipelineFrame, chunk);
         fifo.erase(fifo.begin(), fifo.begin() + kPipelineFrame);
         process_pipeline_chunk(ctx, chunk, kPipelineFrame);
+        // RefComparator 收 48k chunk（resampled），与 ①②③④ 同源。
+        route_to_ref_comparators(sink_id, chunk, kPipelineFrame);
       }
     }
     break;
   }
-
-  // Spec4 T5：RefComparator 帧路由（arch §6.3.2 L1513）。
-  // on_frame 末尾，ADDITIVE 不改 ①②③④。若 sink_id 是某 RefComparator 的
-  // ref/cmp 源，调 write_ref/write_cmp（memcpy 快，不计 RT 重活，风险 9）。
-  // 查找用 ref_routing_ map（sink_id -> {comparator_id, role}）。
-  // 持 ref_mutex_（~0.5μs memcpy，与 NoiseMetrics::collect 同模式，不影响
-  // RT 预算）。一个 sink 可同时是多个 comparator 的输入，遍历所有匹配路由。
-  // Spec5 T1：路由仍用原生帧（frame_size），每 on_frame 一次，不变。
-  //
-  // 已知限制（reviewer 标 Important，controller 决策显式延后，非 silently
-  // closed）： T1 解除了 on_frame 的 48k 限制，使 native≠48k 可达此路径，但
-  // RefComparator 构造用默认 sample_rate=48000（见 add_ref_comparator 的
-  // make_shared<RefComparator>）， delay_ms 按此换算（ref_comparator.cpp
-  // delay_samples*1000/sample_rate_）。故 native≠48k 时 comparator 吃原生帧却按
-  // 48k 算 delay_ms -> 数值失准（44.1k 偏低 ~8.4%）。修复需设计 comparator 的
-  // 48k 流喂入语义（频率/缓冲），当前 native≠48k +comparator
-  // 组合无测试场景，延后到 spec6（3.6 RT refactor）或独立 fix task。
-  // passthrough 路径（native==48k，全部已测生产）字节一致 Spec4，不受影响。
-  route_to_ref_comparators(sink_id, frames, frame_size);
 }
 
 void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
@@ -1061,6 +1064,21 @@ bool NoiseManager::get_ref_overflow_for_test(uint8_t comparator_id,
     return false;
   ref_overflow = it->comparator->ref_overflow_count();
   cmp_overflow = it->comparator->cmp_overflow_count();
+  return true;
+}
+
+bool NoiseManager::get_ref_total_written_for_test(uint8_t comparator_id,
+                                                  size_t& ref_total,
+                                                  size_t& cmp_total) const {
+  std::lock_guard<std::mutex> lock(ref_mutex_);
+  auto it = std::find_if(ref_comparators_.begin(), ref_comparators_.end(),
+                         [comparator_id](const RefComparatorEntry& e) {
+                           return e.id == comparator_id;
+                         });
+  if (it == ref_comparators_.end() || !it->comparator)
+    return false;
+  ref_total = it->comparator->total_ref_written_for_test();
+  cmp_total = it->comparator->total_cmp_written_for_test();
   return true;
 }
 

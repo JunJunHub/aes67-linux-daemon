@@ -2,28 +2,18 @@
 // DeepFilterNet3 适配器实现 + 静态注册（"deepfilternet"）。
 // 架构依据：docs/noise/denoise-plugin-architecture.md §3.3。
 //
-// **当前实现状态（Spec5 T2）**：
+// **当前实现状态（Spec6 T2）**：
 // init() 加载 enc/df_dec/erb_dec 三子图并校验签名，构造 ERB 滤波器组与
 // vorbis 窗。process() 完整实现 libDF 的逐帧流式信号处理（STFT/特征/norm
 // 状态/三子图编排/深度滤波应用/ISTFT overlap-add/lookahead 缓冲）。
 //
-// **DFN deep-filter correctness debt（reviewer 标 Important，controller 决策
-// 延后+标注，非 silently closed）**：本实现对齐 libDF/src/lib.rs，但 lib.rs 是
-// bare STFT/ISTFT round-trip（无 df/mask 应用），真实深度滤波神经网络逻辑在
-// Python DeepFilterNet/df/modules.py 的 DfOp + spec_pad。对照参考，本实现有 3
-// 处 fidelity 偏差（见下方 6b 深度滤波处详注）：
-//   (a) 因果性反转：参考 spec_pad(df_order=5, lookahead=2) 对输出帧 i 卷积
-//       [i-2, i+2]（2 future 帧），本实现纯因果（current + 4 past），2 帧
-//       未来依赖结构缺失；
-//   (b) coef-to-frame 映射反转：参考 coef[0] 配最旧帧，本实现 coef[0]
-//   配最新帧； (c) 缺 assign_df alpha blend：参考 spec_f*alpha +
-//   spec*(1-alpha)，本实现
-//       纯乘替换 spec_e = (re,im)*gain。
-// 影响：DFN deep-filter 路径 fidelity 降级（ERB mask + global gain 仍工作，故
-// dfn_denoises_nonstation >8dB pass），非崩溃（try/catch + sanitize 保证无 bad
-// samples 喂下游）。修复需对照 modules.py 重写 df 卷积（non-causal window +
-// buffer future frames + coef mapping + alpha blend），应作为独立 DFN 修正
-// task。 在真实 DFN 部署或声称 parity 前必须修。
+// **Spec6 T2（D-S6.6）DFN deep-filter non-causal 重写**：
+// 对照 DeepFilterNet/df/modules.py DfOp + spec_pad + assign_df（non-causal
+// window [i-2..i+2] + coef[0] 配最旧帧 + alpha blend）。modules.py 未 vendored
+// 于本 worktree，实现依据 spec §T2 设计描述 + 测试（行为权威定义，见
+// apply_df_op_for_test）。延迟 (coefs, gain, mask) kDfLookahead=2 帧以对齐
+// non-causal window，warmup=0（延迟由 df_delay_buf_ 提供，总算法延迟不变 =
+// hop*(1+kDfLookahead)=1440）。真实 DFN 模型 fidelity 验证需模型（CI skip）。
 #include "deepfilternet_adapter.hpp"
 
 #include <algorithm>
@@ -242,6 +232,7 @@ void DeepFilterNetAdapter::reset() {
   // norm state 不重置（libdf reset 仅清 analysis/synthesis mem）。
   for (auto& v : df_spec_history_)
     std::fill(v.begin(), v.end(), fft::Complex(0, 0));
+  df_delay_buf_.clear();  // Spec6 T2：清空 non-causal delay buffer
   out_frame_buf_.clear();
   in_fifo_.clear();
   out_fifo_.clear();
@@ -396,73 +387,81 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
         bcsum += erb_[b];
       }
     }
-    // 6b. 深度滤波：spec_e[0:96] = df_op(df_spec_history, coefs)。
-    // 滑窗 df_spec_history_（最新帧在尾），复 FIR 卷积 order=5。
-    // 更新 history：push 当前 spec（前 96 频点），pop 最旧。
-    //
-    // DFN deep-filter correctness debt（详见文件头"DFN deep-filter correctness
-    // debt"，reviewer 标 Important，controller 决策延后）：本卷积为纯因果
-    // （current + 4 past），但参考 DeepFilterNet/df/modules.py 的 DfOp +
-    // spec_pad(df_order=5, lookahead=2) 是非因果 [i-2, i+2]（2 future 帧）。
-    // 此处 (a) 因果性反转 + (b) coef[0] 配最新帧（参考配最旧帧）+
-    // (c) L417 纯乘 spec_e=...*gain 缺 assign_df 的 spec_f*alpha+spec*(1-alpha)
-    // blend。ERB mask + global gain 仍工作故降噪有效，但 df 路径 fidelity
-    // 降级。 修复需对照 modules.py 重写（buffer future frames + coef mapping +
-    // alpha）。
+    // 6b. Spec6 T2（D-S6.6）：non-causal deep-filter。
+    // 对照 DeepFilterNet/df/modules.py DfOp + spec_pad + assign_df：
+    //   - non-causal window [i-2..i+2]（5 帧，lookahead=2）
+    //   - coef[0] 配最旧帧（window[0]），coef[4] 配最新帧（window[4]）
+    //   - alpha blend: spec_f = spec_f*alpha + spec_orig*(1-alpha)
+    // 延迟 (coefs, gain, spec_m) kDfLookahead=2 帧：处理帧 t 时，
+    // df_delay_buf_ 中 delayed 项是帧 t-2 的 (coefs, gain, spec_m)，用
+    // history[2..6] = [t-4, t-3, t-2, t-1, t] 做 non-causal 卷积
+    // （window[2] = t-2 = 输出帧，spec_orig = window[2]）。
+    // 每帧 heap 分配（T3 RT refactor 待办：改预分配成员，见 spec6-plan T3）。
     for (size_t f = 0; f < kNbDf; ++f)
       df_spec_history_.back()[f] = spec_[f];
-    std::vector<fft::Complex> spec_e(kFreq);
-    for (size_t f = 0; f < kNbDf; ++f) {
-      // coefs[f*10 + o*2 + 0]=re_o, [+1]=im_o；sum_o coefs[o]*history[o]。
-      // history 索引：最新帧对应 o=0，越旧 o 越大（时序因果卷积，见上方
-      // debt）。
-      float re_out = 0.0f, im_out = 0.0f;
-      for (size_t o = 0; o < kDfOrder; ++o) {
-        const float cr = coefs[f * 10 + o * 2 + 0];
-        const float ci = coefs[f * 10 + o * 2 + 1];
-        const auto& s = df_spec_history_[df_spec_history_.size() - 1 - o][f];
-        // 复乘 (cr+i*ci)*(sr+i*si) = (cr*sr-ci*si) + i*(cr*si+ci*sr)
-        re_out += cr * s.real() - ci * s.imag();
-        im_out += cr * s.imag() + ci * s.real();
-      }
-      spec_e[f] = fft::Complex(re_out, im_out) * gain[0];
+    {
+      DelayedFrame delayed;
+      delayed.coefs.assign(coefs, coefs + kNbDf * kDfOrder * 2);
+      delayed.gain = gain[0];
+      delayed.spec_m = std::move(spec_m);
+      df_delay_buf_.push_back(std::move(delayed));
     }
-    // 余频点（96..481）用 ERB 掩蔽版。
-    for (size_t f = kNbDf; f < kFreq; ++f)
-      spec_e[f] = spec_m[f];
-
+    // 如果 delay buf 满（> kDfLookahead），pop 最旧项做 non-causal 卷积。
+    if (df_delay_buf_.size() > kDfLookahead) {
+      DelayedFrame delayed_frame = std::move(df_delay_buf_.front());
+      df_delay_buf_.pop_front();
+      // history 当前布局（back() 已填 spec_）：
+      //   [t-6, t-5, t-4, t-3, t-2, t-1, t]
+      // non-causal window = history[2..6] = [t-4, t-3, t-2, t-1, t]
+      // spec_orig = history[4] = t-2（输出帧的原始 spec，仅前 96 频点）
+      std::vector<std::vector<fft::Complex>> window(kDfOrder);
+      for (size_t o = 0; o < kDfOrder; ++o)
+        window[o] = df_spec_history_[2 + o];
+      // spec_e: bins 0..95 用深度滤波，96..481 用 ERB 掩蔽版（delayed
+      // spec_m）。
+      std::vector<fft::Complex> spec_e(kFreq);
+      std::vector<fft::Complex> df_out;
+      apply_df_op_for_test(window, delayed_frame.coefs.data(),
+                           delayed_frame.gain, window[2], df_out);
+      for (size_t f = 0; f < kNbDf; ++f)
+        spec_e[f] = df_out[f];
+      // 余频点（96..481）用 delayed frame 的 ERB 掩蔽版。
+      for (size_t f = kNbDf; f < kFreq; ++f)
+        spec_e[f] = delayed_frame.spec_m[f];
+      // ── 7. 合成 ISTFT（libdf frame_synthesis）──
+      auto time_block = fft::Irfft(spec_e.data(), kFreq, kFft);
+      for (size_t i = 0; i < kFft; ++i)
+        time_block[i] *= window_[i];
+      std::vector<float> out_frame(kHop, 0.0f);
+      for (size_t i = 0; i < kHop; ++i)
+        out_frame[i] = time_block[i] + synthesis_mem_[i];
+      const size_t split = synthesis_mem_.size() - kHop;
+      if (split == 0) {
+        for (size_t i = 0; i < kHop; ++i)
+          synthesis_mem_[i] = time_block[kHop + i];
+      } else {
+        std::rotate(synthesis_mem_.begin(), synthesis_mem_.begin() + kHop,
+                    synthesis_mem_.end());
+        for (size_t i = 0; i < split; ++i)
+          synthesis_mem_[i] += time_block[kHop + i];
+        for (size_t i = split; i < synthesis_mem_.size(); ++i)
+          synthesis_mem_[i] = time_block[kHop + i];
+      }
+      out_frame_buf_.push_back(std::move(out_frame));
+    }
     // 滑窗 history：丢弃最旧，push 占位（下帧填）。
     df_spec_history_.erase(df_spec_history_.begin());
     df_spec_history_.push_back(std::vector<fft::Complex>(kNbDf));
-
-    // ── 7. 合成 ISTFT（libdf frame_synthesis）──
-    auto time_block = fft::Irfft(spec_e.data(), kFreq, kFft);
-    // apply window + overlap-add
-    for (size_t i = 0; i < kFft; ++i)
-      time_block[i] *= window_[i];
-    std::vector<float> out_frame(kHop, 0.0f);
-    for (size_t i = 0; i < kHop; ++i)
-      out_frame[i] = time_block[i] + synthesis_mem_[i];
-    // 更新 synthesis_mem：rotate left + 累加/覆盖 time_block 后半。
-    const size_t split =
-        synthesis_mem_.size() - kHop;  // 0（kFft-kHop==kHop==480）
-    // synthesis_mem size = 480 = kHop，split=0：整段用 time_block[480..960)
-    // 覆盖。
-    if (split == 0) {
-      for (size_t i = 0; i < kHop; ++i)
-        synthesis_mem_[i] = time_block[kHop + i];
-    } else {
-      // hop < fft/2 时（此处不适用）的通用 overlap-add。
-      std::rotate(synthesis_mem_.begin(), synthesis_mem_.begin() + kHop,
-                  synthesis_mem_.end());
-      for (size_t i = 0; i < split; ++i)
-        synthesis_mem_[i] += time_block[kHop + i];
-      for (size_t i = split; i < synthesis_mem_.size(); ++i)
-        synthesis_mem_[i] = time_block[kHop + i];
-    }
-    out_frame_buf_.push_back(std::move(out_frame));
     return true;
   } catch (...) {
+    // ONNX 失败：仍 push spec_ 到 history + 滑窗（保持 history 对齐），
+    // 但不 push delay buf（delay buf 1 帧短，下帧补；silence 由 caller
+    // push 对齐输出计数）。D-S5.5 偏差：silence 降级保留（真实 memcpy
+    // passthrough 延后，T2 不改 failure handling）。
+    for (size_t f = 0; f < kNbDf; ++f)
+      df_spec_history_.back()[f] = spec_[f];
+    df_spec_history_.erase(df_spec_history_.begin());
+    df_spec_history_.push_back(std::vector<fft::Complex>(kNbDf));
     return false;
   }
 }
@@ -507,10 +506,12 @@ size_t DeepFilterNetAdapter::process(const float* in,
     out_frame_buf_.push_back(std::move(passthrough));
   }
 
-  // lookahead=2：缓冲 df_lookahead+1 帧后才输出对齐帧。
-  // out_frame_buf_ 中前 lookahead 帧是 warmup（哑/延迟），稳定后逐帧输出。
-  const size_t warmup = kDfLookahead;
-  while (out_frame_buf_.size() > warmup) {
+  // Spec6 T2：non-causal deep-filter 的 lookahead 延迟由 df_delay_buf_ 提供
+  // （process_one_frame_ 中 size > kDfLookahead 才产出），无需额外的
+  // out_frame_buf_ warmup。总算法延迟 = STFT overlap (1 hop) + df_delay_buf
+  // lookahead (2 hops) = 3 hops = 1440 samples（与 algorithmic_latency_samples
+  // 一致）。
+  while (!out_frame_buf_.empty()) {
     auto frame = std::move(out_frame_buf_.front());
     out_frame_buf_.pop_front();
     for (size_t i = 0; i < kHop; ++i)
@@ -590,6 +591,43 @@ bool DeepFilterNetAdapter::set_param(const std::string& key,
 
 std::string DeepFilterNetAdapter::get_param(const std::string& /*key*/) const {
   return "";
+}
+
+// Spec6 T2（D-S6.6）：DFN deep-filter 操作（non-causal + alpha blend）。
+// 实现 DfOp + assign_df（对照 DeepFilterNet/df/modules.py）：
+//   - non-causal window [i-2..i+2]（5 帧，lookahead=2）
+//   - coef[0] 配最旧帧（window[0]），coef[4] 配最新帧（window[4]）
+//   - alpha blend: spec_f = spec_f*alpha + spec_orig*(1-alpha)
+//     alpha = clamp(gain_alpha, 0, 1)
+// 此静态方法为纯函数（无实例状态），供 process_one_frame_ 内部调用 +
+// 单元测试直接验证卷积逻辑（无需 ONNX 模型）。
+void DeepFilterNetAdapter::apply_df_op_for_test(
+    const std::vector<std::vector<fft::Complex>>& window,
+    const float* coefs,
+    float gain_alpha,
+    const std::vector<fft::Complex>& spec_orig,
+    std::vector<fft::Complex>& spec_out) {
+  // alpha = clamp(gain, 0, 1)（assign_df alpha blend）。
+  const float alpha = (gain_alpha < 0.0f)   ? 0.0f
+                      : (gain_alpha > 1.0f) ? 1.0f
+                                            : gain_alpha;
+  spec_out.assign(kNbDf, fft::Complex(0.0f, 0.0f));
+  for (size_t f = 0; f < kNbDf; ++f) {
+    // non-causal 卷积：sum_o coefs[o] * window[o][f]
+    // o=0 配 window[0]（最旧 = i-2），o=4 配 window[4]（最新 = i+2）。
+    float re_out = 0.0f, im_out = 0.0f;
+    for (size_t o = 0; o < kDfOrder; ++o) {
+      const float cr = coefs[f * 10 + o * 2 + 0];
+      const float ci = coefs[f * 10 + o * 2 + 1];
+      const auto& s = window[o][f];  // o=0=oldest
+      // 复乘 (cr+i*ci)*(sr+i*si) = (cr*sr-ci*si) + i*(cr*si+ci*sr)
+      re_out += cr * s.real() - ci * s.imag();
+      im_out += cr * s.imag() + ci * s.real();
+    }
+    // assign_df alpha blend: spec_f = spec_f*alpha + spec*(1-alpha)。
+    const fft::Complex spec_f(re_out, im_out);
+    spec_out[f] = spec_f * alpha + spec_orig[f] * (1.0f - alpha);
+  }
 }
 
 }  // namespace noise

@@ -34,7 +34,8 @@ bool DenoiseProcessor::switch_plugin(const std::string& name) {
   uint32_t latency = new_plugin->algorithmic_latency_samples();
   // 静音计数随新 slot 走：控制线程发布前置 mute，RT 线程发布后仅递减
   // 自己 pin 到的 slot（仅 RT 写该字段，无 check-then-act
-  // 竞态、无无符号下溢）。
+  // 竞态、无无符号下溢）。mute 用 plugin 自身延迟（不含 resampler 延迟）：
+  // mute 是 plugin 收敛静音，与入口 resampler 无关。
   auto new_slot = std::make_shared<PluginSlot>(std::move(new_plugin),
                                                latency + kConvergenceMargin);
   // RcuPtr::publish 返回旧 slot 的 shared_ptr（控制线程侧持有）。
@@ -44,8 +45,11 @@ bool DenoiseProcessor::switch_plugin(const std::string& name) {
   // RetireQueue<T> API 无 push 方法，正确签名为
   // retire(std::shared_ptr<T>, uint64_t retire_epoch)（见 rcu_ptr.hpp）。
   retire_list_.retire(std::move(old), rcu_ptr_.epoch());
+  // Spec6 T2：cb 上报总延迟 = plugin latency + resampler latency。
+  // 消费者（PcmCaptureService）据此做播放延迟补偿。native==48k 时
+  // resampler_latency_ 为 0（passthrough），不影响现有延迟账。
   if (latency_change_cb_)
-    latency_change_cb_(latency);
+    latency_change_cb_(latency + resampler_latency_);
   return true;
 }
 

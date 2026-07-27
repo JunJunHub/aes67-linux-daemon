@@ -266,6 +266,18 @@ int main(int argc, char* argv[]) {
       noise_bridge->set_period_lifecycle_callbacks(
           [noise_manager]() { noise_manager->on_period_begin(); },
           [noise_manager]() { noise_manager->on_period_end(); });
+      // Spec6 T2：降噪总延迟变更转发到 PcmCaptureService（消费者，播放延迟
+      // 补偿）。add_sensor 时每个 sensor 的 DenoiseProcessor 经此 forward
+      // 上报 plugin_latency + resampler_latency。实际播放延迟补偿逻辑后续
+      // task 接线（此处先 wire cb + 存储）。
+      pcm_capture->set_latency_change_callback(
+          [](uint8_t /*sensor_id*/, uint32_t /*latency_samples*/) {
+            // TODO: 实际播放延迟补偿（后续 task）
+          });
+      noise_manager->set_latency_forward_callback(
+          [pcm_capture](uint8_t sensor_id, uint32_t latency_samples) {
+            pcm_capture->on_latency_change(sensor_id, latency_samples);
+          });
       // init() 须在两个 forward callback 装配之后调用：init() 会直接调
       // on_ptp_status_change（用缓存的 status），此时 forward cb 须已就绪，
       // 否则 FAKE_DRIVER 下唯一的 ""->"unlocked" 触发时 cb 为 null ->

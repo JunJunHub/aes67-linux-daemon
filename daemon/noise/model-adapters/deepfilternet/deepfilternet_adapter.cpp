@@ -490,8 +490,8 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
   } catch (...) {
     // ONNX 失败：保持 history 与 delay_buf 同步（两者都不前进），匹配
     // pre-T2 行为（1b7bbd4）。non-causal window 在失败帧处保留旧 spec，
-    // 不劣于 pre-T2 causal 同路径；failure 路径已降级（D-S5.5 silence）。
-    // T2 不改 failure handling（见 spec6-plan T2 约束）。
+    // 不劣于 pre-T2 causal 同路径；failure 路径输出 orig（D-S5.5
+    // passthrough，见 process() 输出阶段 effective_dry_wet=0）。
     return false;
   }
 }
@@ -527,11 +527,8 @@ size_t DeepFilterNetAdapter::process(const float* in,
       continue;
     }
     failed = true;
-    // D-S5.5 偏差（reviewer final Important #2，文档化接受）：理想 memcpy
-    // in->out passthrough，但失败 hop 的对应输入 in_delay_ 需对齐（lookahead
-    // 缓冲 + 48k 流式），故用 silence 安全降级（sanitize 完整 + 10 帧界 +
-    // 最终切 passthrough，不喂下游错误样本）。真实 memcpy passthrough 延后
-    // 后续 spec。
+    // D-S5.5：失败 hop 填 silence 占位（保持流率），输出阶段 dry_wet 降为
+    // 0.0 使该段输出 = orig（in_delay_ 对齐），等价 memcpy passthrough。
     // Spec6 T3 review Important #4：passthrough 改预分配 ring slot（零 heap）。
     std::array<float, kHop>& passthrough_slot = out_ring_[out_ring_tail_];
     passthrough_slot.fill(0.0f);
@@ -553,6 +550,11 @@ size_t DeepFilterNetAdapter::process(const float* in,
     --out_ring_count_;
   }
 
+  // D-S5.5：ONNX 失败时 dry_wet 降为 0.0，输出 = orig（memcpy passthrough）。
+  // in_delay_ 与 out_fifo_ 同步 pop（算法延迟对齐），失败 hop 的 silence
+  // 对应位置的 in_delay_ 样本即原始输入，混合系数归零即等价 memcpy
+  // passthrough。
+  const float effective_dry_wet = failed ? 0.0f : dry_wet;
   size_t n_out = std::min(out_fifo_.size(), n_out_max);
   for (size_t i = 0; i < n_out; ++i) {
     float denoised = out_fifo_.front();
@@ -562,7 +564,8 @@ size_t DeepFilterNetAdapter::process(const float* in,
       orig = in_delay_.front();
       in_delay_.pop_front();
     }
-    out[i] = sanitize(dry_wet * denoised + (1.0f - dry_wet) * orig);
+    out[i] = sanitize(effective_dry_wet * denoised +
+                      (1.0f - effective_dry_wet) * orig);
   }
 
   if (result) {

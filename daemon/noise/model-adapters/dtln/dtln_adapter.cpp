@@ -285,13 +285,10 @@ size_t DtlnAdapter::process(const float* in,
       continue;
     }
     // Run 失败：置 kBypass。DenoiseProcessor 计连续 kBypass -> kError -> 切
-    // passthrough。 D-S5.5 偏差（reviewer final Important
-    // #2，文档化接受）：理想 memcpy in->out passthrough，但 DTLN 跨采样率（48k
-    // 输入经 down_ 重采样入 in_fifo16_，失败 hop 的对应输入需 48k->16k
-    // 重采样延迟输入 in_delay48_，复杂），故失败帧用 silence 安全降级（sanitize
-    // 完整 + 10 帧界 + 最终切 passthrough，不喂下游 错误样本）。真实 memcpy
-    // passthrough 延后后续 spec。
+    // passthrough。
     failed = true;
+    // D-S5.5：失败 hop 填 silence 占位（保持流率），输出阶段 dry_wet 降为
+    // 0.0 使该段输出 = orig（in_delay48_ 对齐），等价 memcpy passthrough。
     // 无条件 push kHop 个 0（不依赖 in_fifo16_ 状态；原条件 !in_fifo16_.empty()
     // 在 fifo 空时提前停 -> 输出 < kHop -> 流率失配 rate glitch）。
     for (size_t i = 0; i < kHop; ++i)
@@ -316,6 +313,11 @@ size_t DtlnAdapter::process(const float* in,
   }
 
   // 5. 输出：取 min(out_fifo48_.size(), n_out_max)，dry_wet 混合 + sanitize。
+  // D-S5.5：ONNX 失败时 dry_wet 降为 0.0，输出 = orig（memcpy passthrough）。
+  // in_delay48_ 与 out_fifo48_ 同步 pop（算法延迟对齐），失败 hop 的 silence
+  // 对应位置的 in_delay48_ 样本即原始输入，混合系数归零即等价 memcpy
+  // passthrough。
+  const float effective_dry_wet = failed ? 0.0f : dry_wet;
   size_t n_out = std::min(out_fifo48_.size(), n_out_max);
   for (size_t i = 0; i < n_out; ++i) {
     float denoised = out_fifo48_.front();
@@ -325,7 +327,7 @@ size_t DtlnAdapter::process(const float* in,
       orig = in_delay48_.front();
       in_delay48_.pop_front();
     }
-    float s = dry_wet * denoised + (1.0f - dry_wet) * orig;
+    float s = effective_dry_wet * denoised + (1.0f - effective_dry_wet) * orig;
     out[i] = sanitize(s);
   }
 

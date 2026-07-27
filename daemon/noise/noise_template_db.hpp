@@ -5,16 +5,21 @@
 // HTTP/磁盘持久化)。
 //
 // 决策 1(仅内存 store):本文件不涉及 HTTP API 与磁盘持久化,那是 Spec3 的职责。
-// 线程安全：Spec6 T3 seqlock（HTTP 写少，capture 读多）。write 序列 + read
-// retry，capture 线程读 match_vggish 无锁（仅 atomic load sequence），HTTP
-// 线程写（add/remove/update）持 seqlock 互斥并递增序列号。
+// 线程安全：Spec6 T3 review Critical #1 修复——shared_mutex 替代 seqlock。
+// seqlock 对 std::vector<Template>（含 std::string 成员）不安全：vector copy
+// 非 atomic，写者 push_back/erase 期间读者 snapshot = templates_ 拷贝 string
+// 成员是 UB。shared_mutex 正确且简单：读者 shared_lock（~25ns，capture 读多），
+// 写者 unique_lock（HTTP 控制线程写少）。读频率（每 period 模板查找）不足以
+// 证明 lock-free 复杂性。
 #ifndef NOISE_NOISE_TEMPLATE_DB_HPP_
 #define NOISE_NOISE_TEMPLATE_DB_HPP_
 
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -166,18 +171,18 @@ class NoiseTemplateDB {
   // 匹配阈值(arch §3.3.5 L540):> 0.75 判为该模板的噪声类型。
   static constexpr float kMatchThreshold = 0.75f;
 
-  // Spec6 T3：seqlock 替代 recursive_mutex（D-S6.4）。
-  // - HTTP 写（add/remove/update/load/save）：持 write_mutex_ 互斥（写者间
-  //   串行），seq_ 偶数 -> seq_++（奇，写中）-> mutate -> seq_++（偶，写完）。
-  // - capture 读（match_vggish）：无锁读，retry until seq 偶且稳定。
-  // - add_template_from_wav 持 write_mutex_ 调 add_template/get_template/save/
-  //   remove_template：这些方法不再各自加锁（改为内部无锁私有实现），
-  //   避免 reentrant 死锁（seqlock 不可重入）。
-  // RT 安全：capture 读无锁，仅 atomic load seq_ + retry，无阻塞。
-  mutable std::atomic<uint32_t> seq_{0};
-  mutable std::mutex write_mutex_;  // 仅写者间互斥（不阻塞读者）
+  // Spec6 T3 review Critical #1：shared_mutex 替代 seqlock。
+  // seqlock 对含 std::string 成员的 std::vector<Template> 不安全（vector copy
+  // 非 atomic，写者 mutate 期间读者拷贝 string 是 UB）。shared_mutex 正确：
+  // - HTTP 写（add/remove/update/load/save）：unique_lock（写者间串行 +
+  //   排斥读者）。
+  // - capture 读（match/match_vggish/list_templates）：shared_lock（多读者
+  //   并发，~25ns，不阻塞其他读者）。
+  // - add_template_from_wav 持 unique_lock 调 nolock_ 内部实现（避免重入
+  //   死锁，同 seqlock 版本的约束）。
+  mutable std::shared_mutex mutex_;
 
-  // 内部无锁实现（写者持 write_mutex_ 后调用）。
+  // 内部无锁实现（写者持 unique_lock 后调用）。
   uint32_t add_template_nolock_(const std::string& name,
                                 const std::array<float, 32>& bark_features,
                                 const std::string& description,

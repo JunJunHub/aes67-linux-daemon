@@ -368,6 +368,13 @@ void PcmCaptureService::capture_loop() {
         snd_pcm_wait(handle, 1000);
         continue;
       }
+      // Spec6 T3 review Important #2：xrun 检测。-EPIPE = ALSA
+      // underrun/overrun。 snd_pcm_recover 恢复 ALSA 状态，同时通知
+      // NoiseManager 跳过本 period 降噪处理（直通）。xrun_cb_ 为 init-only
+      // 回调，capture 线程只读调用。
+      if (n == -EPIPE && xrun_cb_) {
+        xrun_cb_();
+      }
       snd_pcm_recover(handle, n, 1);
       continue;
     }

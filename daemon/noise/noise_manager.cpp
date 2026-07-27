@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -309,7 +310,7 @@ void NoiseManager::on_period_begin() {
   for (auto& [sid, queue] : sink_queues_) {
     (void)sid;
     queue->processed_count.store(0, std::memory_order_relaxed);
-    queue->expected_count = 0;
+    queue->expected_count.store(0, std::memory_order_relaxed);
   }
 }
 
@@ -346,7 +347,7 @@ void NoiseManager::on_frame(uint8_t sink_id,
   {
     std::lock_guard<std::mutex> qlock(queue->mutex);
     queue->pending.push_back(std::move(entry));
-    ++queue->expected_count;
+    queue->expected_count.fetch_add(1, std::memory_order_relaxed);
   }
   queue->cv.notify_one();
 }
@@ -481,20 +482,36 @@ void NoiseManager::on_period_end() {
   }
   // Spec6 T3（D-S6.4）：per-sink 线程 barrier。等待所有 per-sink 线程完成
   // 当前 period 的帧处理（processed_count >= expected_count），再执行
-  // denoise/metrics on_period_end（swap/collect）。barrier 用 spin-wait
-  // （per-sink 处理 ~μs 级，period 预算 ~128ms，可接受）。
+  // denoise/metrics on_period_end（swap/collect）。
+  // Spec6 T3 review Important #6：barrier 加超时。ONNX 推理 1-10ms 或被抢占时，
+  // 无界 spin-wait 会永久阻塞 capture 线程。超时后跳过该 sink 的
+  // on_period_end（不 swap/collect），避免与仍在运行的 per-sink 线程竞争。
+  // 超时 500ms：生产 period ~128ms，1-2 帧/period，500ms >> 正常处理时间；
+  // 测试 20 帧/period RNNoise 也 <500ms。超时仅对真正的 hang 生效。
+  std::set<uint8_t> timed_out_sinks;
   {
-    std::vector<std::shared_ptr<SinkQueue>> queues;
+    std::vector<std::pair<uint8_t, std::shared_ptr<SinkQueue>>> queues;
     {
       std::lock_guard<std::mutex> lock(sink_queues_mutex_);
       for (auto& [sid, q] : sink_queues_) {
-        (void)sid;
-        queues.push_back(q);
+        queues.emplace_back(sid, q);
       }
     }
-    for (auto& q : queues) {
-      const size_t expected = q->expected_count;
+    constexpr auto kBarrierTimeout = std::chrono::milliseconds(500);
+    for (auto& [sid, q] : queues) {
+      const size_t expected = q->expected_count.load(std::memory_order_relaxed);
+      if (expected == 0)
+        continue;
+      auto deadline = std::chrono::steady_clock::now() + kBarrierTimeout;
       while (q->processed_count.load(std::memory_order_acquire) < expected) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+          std::cerr << "NoiseManager: per-sink barrier timeout (sink="
+                    << static_cast<int>(sid) << ", expected=" << expected
+                    << ", processed=" << q->processed_count.load()
+                    << ") -- skipping on_period_end for this sink" << std::endl;
+          timed_out_sinks.insert(sid);
+          break;
+        }
         std::this_thread::yield();
       }
     }
@@ -506,7 +523,10 @@ void NoiseManager::on_period_end() {
   // 快照 + ctx.denoise->get_output()（previous period front，刚被 swap）。
   {
     for (auto& [id, ctx] : *pinned_table_) {
-      (void)id;
+      // Spec6 T3 review Important #6：跳过 barrier 超时的 sink -- 其 per-sink
+      // 线程可能仍在 process/collect，调 on_period_end（swap/collect）会竞争。
+      if (timed_out_sinks.count(id) > 0)
+        continue;
       if (ctx.denoise)
         ctx.denoise->on_period_end();
       if (ctx.metrics)

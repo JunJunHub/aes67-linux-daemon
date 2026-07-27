@@ -72,6 +72,12 @@ class PcmCaptureService
     if (latency_change_cb_)
       latency_change_cb_(sensor_id, latency_samples);
   }
+  // Spec6 T3 review Important #2：注册 xrun 回调。init-only（同
+  // set_capture_joined_callback 模式）。capture_loop 在 snd_pcm_readi 返回
+  // -EPIPE 时调用此回调通知 NoiseManager 置 xrun_pending_，使下一个 period
+  // 跳过降噪处理（直通）。snd_pcm_recover 仍执行以恢复 ALSA 状态。
+  using XrunCallback = std::function<void()>;
+  void set_xrun_callback(XrunCallback cb) { xrun_cb_ = std::move(cb); }
 
   ProviderToken register_provider(FrameProvider provider);
   void unregister_provider(ProviderToken token);
@@ -144,6 +150,8 @@ class PcmCaptureService
   PtpStatusForwardCallback ptp_status_forward_cb_;
   // Spec6 T2：降噪总延迟变更回调（init-only，运行期不改）。
   LatencyChangeCallback latency_change_cb_;
+  // Spec6 T3 review Important #2：xrun 回调（init-only，运行期不改）。
+  XrunCallback xrun_cb_;
   // 测试用 fake 参数
   uint32_t test_rate_{48000};
   uint8_t test_channels_{2};

@@ -404,6 +404,12 @@ class NoiseManager {
   }
   bool wait_housekeeper_done_for_test(uint32_t timeout_ms = 2000);
 
+  // Spec6 T3 review Important #2：生产 xrun 信号入口。PcmCaptureService 在
+  // snd_pcm_readi 返回 -EPIPE 后调用此方法置 xrun_pending_，on_period_begin
+  // 检测到后跳过本 period 处理（直通）。同 set_xrun_for_test 但为生产 API
+  // （语义更清晰：signal 而非 set+clear 对）。
+  void signal_xrun() { xrun_pending_.store(true, std::memory_order_relaxed); }
+
   // Spec6 T3：xrun 测试钩子。模拟 ALSA xrun（on_pcm_frame 检测到时跳过本
   // period 处理，直通）。
   void set_xrun_for_test(bool xrun) { xrun_pending_.store(xrun); }
@@ -626,7 +632,10 @@ class NoiseManager {
     std::deque<SinkQueueEntry> pending;
     std::atomic<bool> stop{false};
     std::atomic<size_t> processed_count{0};  // period barrier 用
-    size_t expected_count{0};                // 本 period 预期帧数
+    // Spec6 T3 review Important #7：atomic 化（barrier 读无锁，写在
+    // on_frame 持 queue->mutex）。当前单 capture 线程设计下本安全，
+    // atomic 使不变式显式且防未来回归。
+    std::atomic<size_t> expected_count{0};  // 本 period 预期帧数
     std::thread thread;
     // per-sink resample scratch（per-sink 独立，无共享可变状态）。
     std::vector<float> resample_scratch;

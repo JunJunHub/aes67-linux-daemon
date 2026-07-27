@@ -155,9 +155,15 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   std::array<DelayedFrame, kDfLookahead + 1> df_delay_ring_;
   size_t df_delay_idx_{0};    // 下一个写入位置
   size_t df_delay_count_{0};  // 已写入但未消费的帧数
-  // 当前帧产出因 lookahead=2 延迟：缓冲 lookahead+1 帧的频谱 + 输出，
-  // 待未来帧到达后对齐输出。
-  std::deque<std::vector<float>> out_frame_buf_;  // 待输出时域帧（每帧 kHop）
+  // Spec6 T3 review Important #3/#4：out_frame_buf_ 改预分配 ring buffer，
+  // 替代 deque<vector<float>> 的 per-frame heap 分配。每帧写入当前 slot
+  // （覆盖最旧），consumer 从 head 读。capacity 足够大（32 >> 任何单次
+  // process() 调用可能产生的帧数，pipeline chunk = kHop = 1 hop）。
+  static constexpr size_t kOutRingCap = 32;
+  std::array<std::array<float, kHop>, kOutRingCap> out_ring_{};
+  size_t out_ring_head_{0};   // 下一个读取位置
+  size_t out_ring_tail_{0};   // 下一个写入位置
+  size_t out_ring_count_{0};  // 当前帧数
 
   // 48k 输入/输出 FIFO + 延迟线（同 DTLN 的流式结构）。
   std::deque<float> in_fifo_;

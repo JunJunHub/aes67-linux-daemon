@@ -75,13 +75,10 @@ uint32_t NoiseTemplateDB::add_template(
     const std::array<float, 32>& bark_features,
     const std::string& description,
     const std::string& wav_file) {
-  // Spec6 T3：seqlock write section（HTTP 控制线程，写少）。
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);  // odd: write in progress
-  uint32_t id = add_template_nolock_(name, bark_features, description, wav_file,
-                                     TemplateFeatureType::Bark, {});
-  seq_.fetch_add(1, std::memory_order_acq_rel);  // even: write done
-  return id;
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock（HTTP 控制线程写）。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return add_template_nolock_(name, bark_features, description, wav_file,
+                              TemplateFeatureType::Bark, {});
 }
 
 // Spec5 T3（D-S5.8）：按特征类型添加模板。
@@ -92,12 +89,9 @@ uint32_t NoiseTemplateDB::add_template(
     TemplateFeatureType feature_type,
     const std::array<float, 32>& bark_features,
     const std::array<float, 128>& vggish_embedding) {
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
-  uint32_t id = add_template_nolock_(name, bark_features, description, wav_file,
-                                     feature_type, vggish_embedding);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
-  return id;
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return add_template_nolock_(name, bark_features, description, wav_file,
+                              feature_type, vggish_embedding);
 }
 
 uint32_t NoiseTemplateDB::add_template_nolock_(
@@ -121,21 +115,15 @@ uint32_t NoiseTemplateDB::add_template_nolock_(
 
 std::pair<uint32_t, float> NoiseTemplateDB::match(
     const std::array<float, 32>& bark_spectrum) {
-  // Spec6 T3：seqlock read section（capture 线程，读多）。
-  // retry until seq even and stable（无 torn read）。
-  std::vector<Template> snapshot;
-  uint32_t s1, s2;
-  do {
-    s1 = seq_.load(std::memory_order_acquire);
-    snapshot = templates_;
-    s2 = seq_.load(std::memory_order_acquire);
-  } while (s1 != s2 || (s1 & 1u));
-  if (snapshot.empty()) {
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock（capture 线程读）。
+  // 直接遍历 templates_，无需 snapshot 拷贝（锁保证一致性）。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
+  if (templates_.empty()) {
     return {0, 0.0f};
   }
   uint32_t best_id = 0;
   float best_sim = 0.0f;
-  for (const auto& t : snapshot) {
+  for (const auto& t : templates_) {
     // Spec5 T3：L2 仅扫 bark 模板，vggish 模板交 L3。
     if (t.feature_type == TemplateFeatureType::Vggish)
       continue;
@@ -155,19 +143,11 @@ std::pair<uint32_t, float> NoiseTemplateDB::match(
 // Spec5 T3（D-S5.8）：L3 VGGish 嵌入 kNN 检索。
 std::pair<uint32_t, float> NoiseTemplateDB::match_vggish(
     const std::array<float, 128>& embedding) const {
-  // Spec6 T3：seqlock read section（capture 线程，无锁读）。
-  // templates_ 为 vector<Template>，写者 push_back/erase 可能触发 reallocation
-  // -> 读侧 snapshot 拷贝期间 torn -> seqlock retry。
-  std::vector<Template> snapshot;
-  uint32_t s1, s2;
-  do {
-    s1 = seq_.load(std::memory_order_acquire);
-    snapshot = templates_;
-    s2 = seq_.load(std::memory_order_acquire);
-  } while (s1 != s2 || (s1 & 1u));
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock（capture 线程读）。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
   uint32_t best_id = 0;
   float best_sim = 0.0f;
-  for (const auto& t : snapshot) {
+  for (const auto& t : templates_) {
     if (t.feature_type != TemplateFeatureType::Vggish)
       continue;
     float sim = cosine_similarity_128(embedding, t.vggish_embedding);
@@ -183,11 +163,8 @@ std::pair<uint32_t, float> NoiseTemplateDB::match_vggish(
 }
 
 bool NoiseTemplateDB::remove_template(uint32_t template_id) {
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
-  bool ok = remove_template_nolock_(template_id);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
-  return ok;
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return remove_template_nolock_(template_id);
 }
 
 bool NoiseTemplateDB::remove_template_nolock_(uint32_t template_id) {
@@ -204,40 +181,24 @@ bool NoiseTemplateDB::remove_template_nolock_(uint32_t template_id) {
 
 std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
     const {
-  // seqlock read section。
-  std::vector<Template> snapshot;
-  uint32_t s1, s2;
-  do {
-    s1 = seq_.load(std::memory_order_acquire);
-    snapshot = templates_;
-    s2 = seq_.load(std::memory_order_acquire);
-  } while (s1 != s2 || (s1 & 1u));
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
   std::vector<std::pair<uint32_t, std::string>> result;
-  result.reserve(snapshot.size());
-  for (const auto& t : snapshot) {
+  result.reserve(templates_.size());
+  for (const auto& t : templates_) {
     result.emplace_back(t.template_id, t.name);
   }
   return result;
 }
 
 const Template* NoiseTemplateDB::get_template(uint32_t template_id) const {
-  // seqlock read section。返回指向 snapshot 的指针（snapshot 为局部变量，
-  // 调用方需在使用期间持有副本或仅读取返回值）。原 recursive_mutex 版本
-  // 返回指向 templates_ 内元素的指针，在锁释放后仍可能被并发写失效。
-  // seqlock 版本同样存在此风险（snapshot 拷贝后原 vector 可能被改），
-  // 但 snapshot 拷贝保证了本次读的一致性。返回 snapshot 内指针：snapshot
-  // 在函数返回后析构 -> 悬垂指针。
-  // 修正：get_template 仅在 HTTP 控制线程调用（非 capture 线程），且调用方
-  // 需在 write_mutex_ 保护下使用（add_template_from_wav 持锁调 get_template
-  // -> nolock_ 版本）。public get_template 在 seqlock 下改为返回 nullptr
-  // （不安全返回悬垂指针），外部调用方改用 list_templates 或 get_template
-  // 的拷贝语义。但既有代码（noise_http.cpp）用 get_template 返回指针读字段
-  // -> 需保持返回指针语义。
-  // 折衷：返回指向 templates_ 内元素的指针（非 snapshot），调用方约定在
-  // write_mutex_ 保护下使用（HTTP 控制线程串行调用，无并发写）。
-  // seqlock 不保护此路径（仅 capture 读路径用 seqlock），HTTP 读路径靠
-  // write_mutex_ 串行化（HTTP 控制线程不与自身并发）。
-  std::lock_guard<std::mutex> wl(write_mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock。
+  // get_template 仅在 HTTP 控制线程调用（非 capture 线程），返回指向
+  // templates_ 内元素的指针。调用方约定在 mutex_ 保护下使用（HTTP 控制线程
+  // 串行调用，无并发写）。shared_mutex unique_lock 保证写者间互斥 +
+  // 排斥读者，返回的指针在锁释放后仍有效（直到下一次写操作 mutate
+  // templates_）。 HTTP 控制线程不与自身并发，故指针安全。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   return get_template_nolock_(template_id);
 }
 
@@ -253,8 +214,7 @@ const Template* NoiseTemplateDB::get_template_nolock_(
 bool NoiseTemplateDB::update_template(uint32_t template_id,
                                       const std::string& new_label,
                                       const std::string& new_description) {
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   bool ok = false;
   for (auto& t : templates_) {
     if (t.template_id == template_id) {
@@ -270,7 +230,6 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
       break;
     }
   }
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   return ok;
 }
 
@@ -284,9 +243,8 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
 bool NoiseTemplateDB::save(const std::string& dir) const {
   if (dir.empty())
     return false;
-  // Spec6 T3：seqlock write section（HTTP 控制线程）。
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   // 序列化 templates_ 为 JSON（arch §7.5 格式）：
   // { "templates": [ { "id": 1, "label": "test", "bark_spectrum": [...],
   //                    "description": "...", "wav_file": "...",
@@ -329,21 +287,18 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
   ss << "\n  ]\n}\n";
   std::string path = dir + "/templates.json";
   bool ok = write_atomic(path, ss.str());
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   return ok;
 }
 
 bool NoiseTemplateDB::load(const std::string& dir) {
   if (dir.empty())
     return false;
-  std::lock_guard<std::mutex> wl(write_mutex_);
-  seq_.fetch_add(1, std::memory_order_acq_rel);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   dir_ = dir;
   std::string path = dir + "/templates.json";
   bool exists = std::filesystem::exists(path);
   bool ok = false;
   if (!exists) {
-    seq_.fetch_add(1, std::memory_order_acq_rel);
     return false;  // 首次启动，无文件
   }
   try {
@@ -351,7 +306,6 @@ bool NoiseTemplateDB::load(const std::string& dir) {
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) {
       std::cerr << "NoiseTemplateDB::load: cannot open " << path << std::endl;
-      seq_.fetch_add(1, std::memory_order_acq_rel);
       return false;
     }
     boost::property_tree::read_json(in, pt);
@@ -419,7 +373,6 @@ bool NoiseTemplateDB::load(const std::string& dir) {
     std::cerr << "NoiseTemplateDB::load: error: " << e.what() << std::endl;
     ok = false;
   }
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   return ok;
 }
 
@@ -427,8 +380,8 @@ bool NoiseTemplateDB::load(const std::string& dir) {
 // wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
 // 否则返回 dir_ + "/" + wav_file。未找到模板 -> 返回空串。
 std::string NoiseTemplateDB::get_wav_path(uint32_t template_id) const {
-  // HTTP 控制线程调用（非 capture 线程），持 write_mutex_ 串行化。
-  std::lock_guard<std::mutex> wl(write_mutex_);
+  // HTTP 控制线程调用（非 capture 线程），持 unique_lock 串行化。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   const Template* t = get_template_nolock_(template_id);
   if (t == nullptr)
     return "";
@@ -521,8 +474,9 @@ bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
 uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
                                                 const std::string& description,
                                                 const std::string& wav_bytes) {
-  // Spec6 T3：seqlock write section + nolock_ 内部实现（避免重入死锁）。
-  std::lock_guard<std::mutex> wl(write_mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock + nolock_ 内部实现
+  // （避免重入死锁，同 seqlock 版本约束）。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   if (dir_.empty())
     return 0;
   // 1. 解析 WAV -> float PCM
@@ -534,11 +488,8 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   auto bark =
       compute_bark_spectrum(samples.data(), samples.size(), sample_rate);
   // 3. 先 add_template 占位获取 id（wav_file 后填）。
-  // 进入 write section（seq_ 奇）。
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   uint32_t id = add_template_nolock_(label, bark, description, "",
                                      TemplateFeatureType::Bark, {});
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   if (id == 0)
     return 0;
   // 4. 写 WAV 文件到 dir_/template-<id>.wav
@@ -549,9 +500,7 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   std::ofstream out(wav_path, std::ios::binary);
   if (!out.is_open()) {
     // 写文件失败：回滚内存中的 add_template。
-    seq_.fetch_add(1, std::memory_order_acq_rel);
     remove_template_nolock_(id);
-    seq_.fetch_add(1, std::memory_order_acq_rel);
     return 0;
   }
   out.write(wav_bytes.data(), static_cast<std::streamsize>(wav_bytes.size()));
@@ -562,19 +511,15 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   if (!out.good()) {
     std::error_code rm_ec;
     std::filesystem::remove(wav_path, rm_ec);
-    seq_.fetch_add(1, std::memory_order_acq_rel);
     remove_template_nolock_(id);
-    seq_.fetch_add(1, std::memory_order_acq_rel);
     return 0;
   }
-  // 5. 更新 wav_file 字段 + save（nolock_ 路径，save 内部不再加锁但更新
-  // seq_ 保持一致性）。save 的 seqlock 由 save() 自身管理，但 save 已持
-  // write_mutex_ 会死锁 -> 直接内联 save 逻辑（nolock_）。
-  seq_.fetch_add(1, std::memory_order_acq_rel);
+  // 5. 更新 wav_file 字段 + save（nolock_ 路径，不调 save() 因会再次加
+  // mutex_ 死锁 -> 直接内联 save 逻辑）。
   if (auto* t = const_cast<Template*>(get_template_nolock_(id))) {
     t->wav_file = wav_name;
   }
-  // 内联 save 序列化（不调 save()，因 save() 会再次加 write_mutex_）。
+  // 内联 save 序列化（不调 save()，因 save() 会再次加 mutex_）。
   {
     std::ostringstream ss;
     ss << "{\n  \"templates\": [";
@@ -615,7 +560,6 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
                 << std::endl;
     }
   }
-  seq_.fetch_add(1, std::memory_order_acq_rel);
   return id;
 }
 

@@ -278,6 +278,12 @@ int main(int argc, char* argv[]) {
           [pcm_capture](uint8_t sensor_id, uint32_t latency_samples) {
             pcm_capture->on_latency_change(sensor_id, latency_samples);
           });
+      // Spec6 T3 review Important #2：xrun 检测 wiring。PcmCaptureService 在
+      // snd_pcm_readi 返回 -EPIPE 时调用此回调 -> NoiseManager::signal_xrun
+      // 置 xrun_pending_，下一个 period on_period_begin 检测到后跳过降噪
+      // 处理（直通）。snd_pcm_recover 仍执行恢复 ALSA 状态。
+      pcm_capture->set_xrun_callback(
+          [noise_manager]() { noise_manager->signal_xrun(); });
       // init() 须在两个 forward callback 装配之后调用：init() 会直接调
       // on_ptp_status_change（用缓存的 status），此时 forward cb 须已就绪，
       // 否则 FAKE_DRIVER 下唯一的 ""->"unlocked" 触发时 cb 为 null ->

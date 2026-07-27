@@ -244,7 +244,10 @@ void DeepFilterNetAdapter::reset() {
   // Spec6 T3：ring buffer 状态重置。
   df_delay_idx_ = 0;
   df_delay_count_ = 0;
-  out_frame_buf_.clear();
+  // Spec6 T3 review Important #4：out ring buffer 重置（零 heap）。
+  out_ring_head_ = 0;
+  out_ring_tail_ = 0;
+  out_ring_count_ = 0;
   in_fifo_.clear();
   out_fifo_.clear();
   in_delay_.clear();
@@ -447,11 +450,11 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
                  time_block_.size());
       for (size_t i = 0; i < kFft; ++i)
         time_block_[i] *= window_[i];
-      // Spec6 T3：out_frame 复用 time_block_ 前 kHop（原 out_frame 临时 vector
-      // 改为直接 push back 到 out_frame_buf_）。
-      std::vector<float> out_frame(kHop, 0.0f);
+      // Spec6 T3 review Important #3/#4：out_frame 改预分配 ring buffer slot，
+      // 零 per-frame heap。直接写入 out_ring_[tail_]，然后推进 tail。
+      std::array<float, kHop>& out_slot = out_ring_[out_ring_tail_];
       for (size_t i = 0; i < kHop; ++i)
-        out_frame[i] = time_block_[i] + synthesis_mem_[i];
+        out_slot[i] = time_block_[i] + synthesis_mem_[i];
       const size_t split = synthesis_mem_.size() - kHop;
       if (split == 0) {
         for (size_t i = 0; i < kHop; ++i)
@@ -464,7 +467,8 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
         for (size_t i = split; i < synthesis_mem_.size(); ++i)
           synthesis_mem_[i] = time_block_[kHop + i];
       }
-      out_frame_buf_.push_back(std::move(out_frame));
+      out_ring_tail_ = (out_ring_tail_ + 1) % kOutRingCap;
+      ++out_ring_count_;
     }
     // 滑窗 history：丢弃最旧，push 占位（下帧填）。
     df_spec_history_.erase(df_spec_history_.begin());
@@ -515,20 +519,25 @@ size_t DeepFilterNetAdapter::process(const float* in,
     // 缓冲 + 48k 流式），故用 silence 安全降级（sanitize 完整 + 10 帧界 +
     // 最终切 passthrough，不喂下游错误样本）。真实 memcpy passthrough 延后
     // spec6。
-    std::vector<float> passthrough(kHop, 0.0f);
-    out_frame_buf_.push_back(std::move(passthrough));
+    // Spec6 T3 review Important #4：passthrough 改预分配 ring slot（零 heap）。
+    std::array<float, kHop>& passthrough_slot = out_ring_[out_ring_tail_];
+    passthrough_slot.fill(0.0f);
+    out_ring_tail_ = (out_ring_tail_ + 1) % kOutRingCap;
+    ++out_ring_count_;
   }
 
   // Spec6 T2：non-causal deep-filter 的 lookahead 延迟由 df_delay_buf_ 提供
   // （process_one_frame_ 中 size > kDfLookahead 才产出），无需额外的
-  // out_frame_buf_ warmup。总算法延迟 = STFT overlap (1 hop) + df_delay_buf
+  // out_ring_ warmup。总算法延迟 = STFT overlap (1 hop) + df_delay_buf
   // lookahead (2 hops) = 3 hops = 1440 samples（与 algorithmic_latency_samples
   // 一致）。
-  while (!out_frame_buf_.empty()) {
-    auto frame = std::move(out_frame_buf_.front());
-    out_frame_buf_.pop_front();
+  // Spec6 T3 review Important #4：drain ring buffer -> out_fifo_（零 heap）。
+  while (out_ring_count_ > 0) {
+    const std::array<float, kHop>& frame = out_ring_[out_ring_head_];
     for (size_t i = 0; i < kHop; ++i)
       out_fifo_.push_back(frame[i]);
+    out_ring_head_ = (out_ring_head_ + 1) % kOutRingCap;
+    --out_ring_count_;
   }
 
   size_t n_out = std::min(out_fifo_.size(), n_out_max);
@@ -554,21 +563,22 @@ size_t DeepFilterNetAdapter::process(const float* in,
 
 size_t DeepFilterNetAdapter::flush(float* out, size_t n_out_max) {
   // lookahead=2：补 kDfLookahead 帧零样本触发残余输出。
+  // Spec6 T3 review Important #3：zero 改栈数组（零 heap）。
   for (size_t i = 0; i < kDfLookahead; ++i) {
-    std::vector<float> zero(kHop, 0.0f);
-    for (auto s : zero)
-      in_fifo_.push_back(s);
+    for (size_t j = 0; j < kHop; ++j)
+      in_fifo_.push_back(0.0f);
     float lsnr = 0.0f;
     if (!process_one_frame_(lsnr)) {
       break;
     }
   }
-  // 排空 out_frame_buf_。
-  while (!out_frame_buf_.empty()) {
-    auto frame = std::move(out_frame_buf_.front());
-    out_frame_buf_.pop_front();
+  // 排空 ring buffer -> out_fifo_（Spec6 T3 review Important #4：零 heap）。
+  while (out_ring_count_ > 0) {
+    const std::array<float, kHop>& frame = out_ring_[out_ring_head_];
     for (size_t i = 0; i < kHop; ++i)
       out_fifo_.push_back(frame[i]);
+    out_ring_head_ = (out_ring_head_ + 1) % kOutRingCap;
+    --out_ring_count_;
   }
   const float dry_wet =
       bits_to_float(dry_wet_bits_.load(std::memory_order_relaxed));
@@ -626,7 +636,12 @@ void DeepFilterNetAdapter::apply_df_op(
   const float alpha = (gain_alpha < 0.0f)   ? 0.0f
                       : (gain_alpha > 1.0f) ? 1.0f
                                             : gain_alpha;
-  spec_out.assign(kNbDf, fft::Complex(0.0f, 0.0f));
+  // Spec6 T3 review Important #5：生产路径调用者（process_one_frame_）在 init()
+  // 中预分配 df_out_（resize(kNbDf)），此处 fill 即可，零 realloc。测试路径
+  // 传入空 vector -> resize 一次（测试非 RT，可接受）。
+  if (spec_out.size() != kNbDf)
+    spec_out.resize(kNbDf);
+  std::fill(spec_out.begin(), spec_out.end(), fft::Complex(0.0f, 0.0f));
   for (size_t f = 0; f < kNbDf; ++f) {
     // non-causal 卷积：sum_o coefs[o] * window[o][f]
     // o=0 配 window[0]（最旧 = i-2），o=4 配 window[4]（最新 = i+2）。

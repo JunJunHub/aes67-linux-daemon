@@ -28,6 +28,7 @@
 #ifndef NOISE_MODEL_ADAPTERS_DEEPFILTERNET_DEEPFILTERNET_ADAPTER_HPP_
 #define NOISE_MODEL_ADAPTERS_DEEPFILTERNET_DEEPFILTERNET_ADAPTER_HPP_
 
+#include <array>
 #include <atomic>
 #include <complex>
 #include <cstdint>
@@ -93,17 +94,19 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   //   - coef[0] 配最旧帧（window[0]）
   //   - alpha blend: spec_f = spec_f*alpha + spec_orig*(1-alpha)
   //     alpha = clamp(gain_alpha, 0, 1)
-  // window: 5 帧 [oldest..newest]，每帧 kNbDf 复频点。
+  // window: 5 帧 [oldest..newest]，每帧 kNbDf 复频点（指针数组，避免拷贝）。
   // coefs: [kNbDf * kDfOrder * 2] = 960 floats（re,im per order per bin）。
   //   coefs[f*10 + o*2 + 0]=re_o, [+1]=im_o；o=0 配 window[0]（最旧）。
   // gain_alpha: alpha 来源（df_dec 输出 gain[0]）。
-  // spec_orig: 输出帧原始复谱（kNbDf bins，= window[2] 即中间帧）。
-  // spec_out: 输出（kNbDf bins）。
-  static void apply_df_op(const std::vector<std::vector<fft::Complex>>& window,
-                          const float* coefs,
-                          float gain_alpha,
-                          const std::vector<fft::Complex>& spec_orig,
-                          std::vector<fft::Complex>& spec_out);
+  // spec_orig: 输出帧原始复谱（kNbDf bins，= *window[2] 即中间帧）。
+  // spec_out: 输出（kNbDf bins，调用者预分配）。
+  // Spec6 T3：window 改为 const std::vector<Complex>* 指针数组（避免拷贝）。
+  static void apply_df_op(
+      const std::vector<const std::vector<fft::Complex>*>& window,
+      const float* coefs,
+      float gain_alpha,
+      const std::vector<fft::Complex>& spec_orig,
+      std::vector<fft::Complex>& spec_out);
 
  private:
   bool process_one_frame_(float& lsnr_out);
@@ -140,17 +143,18 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   // 供 non-causal 卷积 [i-2..i+2] 使用。Sliding window：每帧 push 当前 spec
   // 到 back，erase front，push placeholder。
   std::vector<std::vector<fft::Complex>> df_spec_history_;
-  // Spec6 T2（D-S6.6）：non-causal deep-filter 延迟缓冲。每帧 push 当前帧的
-  // (coefs, gain, spec_m) 副本，size > kDfLookahead 时 pop 最旧项做 non-causal
-  // 卷积（用 history[2..6] = [i-2..i+2] window + delayed coefs/gain/spec_m）。
-  // 延迟 kDfLookahead=2 帧对齐未来帧到达后输出。每帧 heap 分配（T3 RT refactor
-  // 待办：改预分配成员，见 spec6-plan T3 §3.6）。
+  // Spec6 T2（D-S6.6）+ T3：non-causal deep-filter 延迟缓冲。T3 改为预分配
+  // ring buffer（kDfLookahead+1 个 slot），替代 deque<push/pop> 的 per-frame
+  // heap 分配。每帧写入当前 slot（覆盖最旧），size > kDfLookahead 时取最旧做
+  // non-causal 卷积。
   struct DelayedFrame {
     std::vector<float> coefs;          // [kNbDf * kDfOrder * 2] = 960
     float gain{0.0f};                  // df_dec gain[0]
     std::vector<fft::Complex> spec_m;  // ERB-masked spec [kFreq] = 481
   };
-  std::deque<DelayedFrame> df_delay_buf_;
+  std::array<DelayedFrame, kDfLookahead + 1> df_delay_ring_;
+  size_t df_delay_idx_{0};    // 下一个写入位置
+  size_t df_delay_count_{0};  // 已写入但未消费的帧数
   // 当前帧产出因 lookahead=2 延迟：缓冲 lookahead+1 帧的频谱 + 输出，
   // 待未来帧到达后对齐输出。
   std::deque<std::vector<float>> out_frame_buf_;  // 待输出时域帧（每帧 kHop）
@@ -166,6 +170,13 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   std::vector<fft::Complex> spec_;
   std::vector<float> feat_erb_;   // [1,1,1,32]
   std::vector<float> feat_spec_;  // [1,2,1,96]
+  // Spec6 T3：process_one_frame_ 预分配成员（零 per-frame heap）。
+  std::array<float, kHop> input_{};       // 从 in_fifo_ 取的 kHop 样本
+  std::array<float, kFft> buf_{};         // STFT 分析缓冲
+  std::vector<fft::Complex> spec_m_;      // ERB 掩蔽后复谱 [kFreq]
+  std::vector<fft::Complex> spec_e_;      // 应用 DF 后复谱 [kFreq]
+  std::vector<fft::Complex> df_out_;      // apply_df_op 输出 [kNbDf]
+  std::array<float, kFft> time_block_{};  // ISTFT 输出时域块
 };
 
 }  // namespace noise

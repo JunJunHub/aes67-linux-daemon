@@ -58,14 +58,13 @@ class DenoiseProcessor {
     current_config_.onnx_model_dir = dir;
   }
 
-  // ── Spec5 T2：ONNX 失败降级（D-S5.5）──
+  // ── Spec5 T2 / Spec6 T3：ONNX 失败降级（D-S5.5 + D-S6.5）──
   // process() 内对 plugin 返回的 result->status 计数：连续 kBypass 达阈值
   // kDegradationThreshold(10) -> 升级为 kError + 置 degraded_pending_。
-  // 控制线程 housekeeper（on_period_end 经 NoiseManager）检查 degraded_pending_
-  // -> switch_plugin("passthrough") + 上报告警。RT 仅置原子标志，实际切换在
-  // 控制线程（switch_plugin 含 RcuPtr publish + retire，非 RT
-  // 安全；on_period_end 非每帧紧路径，罕见故障下可接受，旧 slot 经 retire
-  // 延迟回收避免 RT 析构）。
+  // Spec6 T3：控制线程 housekeeper（NoiseManager::housekeeper_loop）检查
+  // degraded_pending_ -> switch_plugin("passthrough") + 上报告警。RT 仅置
+  // 原子标志，实际切换在控制线程（switch_plugin 含 RcuPtr publish + retire，
+  // ONNX Session 析构不在 RT 线程）。
   bool degraded_pending() const {
     return degraded_pending_.load(std::memory_order_acquire);
   }

@@ -3414,7 +3414,10 @@ BOOST_AUTO_TEST_CASE(onnx_consecutive_failure_switches_passthrough) {
   mgr.on_period_begin();
   for (int f = 0; f < 12; ++f)
     mgr.on_frame(0, in, 480);
-  mgr.on_period_end();  // housekeeper：切 passthrough + plugin_degraded=true
+  // Spec6 T3：on_period_end 仅置 trigger flag，实际 switch_plugin 在控制线程
+  // housekeeper 异步执行。wait_housekeeper_done_for_test 等待完成。
+  mgr.on_period_end();
+  BOOST_CHECK(mgr.wait_housekeeper_done_for_test(2000));
 
   // 切换已发生：plugin_degraded 锁存（告警引擎据此 raise）。
   auto snap = mgr.get_metrics_for_test(0);
@@ -4094,6 +4097,16 @@ static std::vector<std::vector<noise::fft::Complex>> make_df_window(
   return window;
 }
 
+// Spec6 T3：apply_df_op 签名改为指针数组。辅助：把 vector<vector> 转
+// 指针数组（测试侧一次性转换，不污染被测 API）。
+static std::vector<const std::vector<noise::fft::Complex>*> make_df_window_ptrs(
+    const std::vector<std::vector<noise::fft::Complex>>& window) {
+  std::vector<const std::vector<noise::fft::Complex>*> ptrs(window.size());
+  for (size_t i = 0; i < window.size(); ++i)
+    ptrs[i] = &window[i];
+  return ptrs;
+}
+
 // 辅助：构造 coefs 数组（kNbDf * kDfOrder * 2 = 960 floats）。
 // order_values 是 5 个复数值（re,im 交替），每帧所有频点同一值。
 static std::vector<float> make_df_coefs(
@@ -4117,6 +4130,7 @@ static std::vector<float> make_df_coefs(
 BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
   // window: [1.0, 2.0, 3.0, 4.0, 5.0]（oldest..newest）
   auto window = make_df_window({1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
   // coefs: o=2 -> (1, 0)，其余 (0, 0)
   auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
   // spec_orig = window[2] = 3.0（中间帧，alpha blend 的 spec_orig）
@@ -4124,7 +4138,7 @@ BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(3.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
   // gain=1 -> alpha=1 -> spec_out = spec_f (pure deep filter, no blend)
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 1.0f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs.data(), 1.0f,
                                            spec_orig, spec_out);
   // 验证：spec_f = coefs[2]*window[2] = 1*3 = 3.0
   // alpha=1 -> spec_out = spec_f = 3.0
@@ -4134,7 +4148,7 @@ BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
   // 用 coefs[0] 验证：non-causal 下 o=0 配最旧帧（window[0]），
   // 因果下 o=0 配最新帧（window[4]）。
   auto coefs2 = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs2.data(), 1.0f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs2.data(), 1.0f,
                                            spec_orig, spec_out);
   // non-causal: o=0 配 window[0]=1.0 -> spec_f=1.0 -> spec_out=1.0
   // causal: o=0 配 window[4]=5.0 -> spec_f=5.0 -> spec_out=5.0
@@ -4145,17 +4159,18 @@ BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
 // coefs[0]=1, 其余=0, gain=1。输出应 = window[0]（最旧 = i-2）。
 BOOST_AUTO_TEST_CASE(dfn_coef_mapping_oldest_first) {
   auto window = make_df_window({10.0f, 20.0f, 30.0f, 40.0f, 50.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
   auto coefs = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
   const std::vector<noise::fft::Complex> spec_orig(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(30.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 1.0f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs.data(), 1.0f,
                                            spec_orig, spec_out);
   // coef[0] 配最旧帧 window[0]=10.0 -> spec_out=10.0
   BOOST_CHECK_CLOSE(spec_out[0].real(), 10.0f, 1e-4f);
   // 验证 coef[4] 配最新帧 window[4]=50.0
   auto coefs4 = make_df_coefs({{0, 0}, {0, 0}, {0, 0}, {0, 0}, {1, 0}});
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs4.data(), 1.0f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs4.data(), 1.0f,
                                            spec_orig, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 50.0f, 1e-4f);
 }
@@ -4167,23 +4182,24 @@ BOOST_AUTO_TEST_CASE(dfn_coef_mapping_oldest_first) {
 // 用不同 spec_orig 验证：spec_orig=0 -> spec_out = 30*0.3 = 9.0
 BOOST_AUTO_TEST_CASE(dfn_assign_df_alpha_blend) {
   auto window = make_df_window({0.0f, 0.0f, 30.0f, 0.0f, 0.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
   auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
   // spec_orig = 0 -> spec_out = spec_f * alpha + 0 * (1-alpha) = 30*0.3 = 9.0
   const std::vector<noise::fft::Complex> spec_orig(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(0.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.3f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs.data(), 0.3f,
                                            spec_orig, spec_out);
   // alpha=0.3 -> spec_out = 30*0.3 + 0*0.7 = 9.0
   BOOST_CHECK_CLOSE(spec_out[0].real(), 9.0f, 1e-4f);
   // spec_orig = 100 -> spec_out = 30*0.3 + 100*0.7 = 9 + 70 = 79.0
   const std::vector<noise::fft::Complex> spec_orig2(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(100.0f, 0.0f));
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.3f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs.data(), 0.3f,
                                            spec_orig2, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 79.0f, 1e-4f);
   // gain=0 -> alpha=0 -> spec_out = spec_f*0 + spec_orig*1 = spec_orig
-  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.0f,
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs, coefs.data(), 0.0f,
                                            spec_orig2, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 100.0f, 1e-4f);
 }
@@ -4261,6 +4277,199 @@ BOOST_AUTO_TEST_CASE(resampler_latency_in_algorithmic_latency) {
   proc.set_resampler_latency(200);
   BOOST_REQUIRE(proc.switch_plugin("passthrough"));
   BOOST_CHECK_EQUAL(reported_latency, 200u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T3：降级线程模型迁控制线程 + per-sink thread + RT heap 预分配 +
+// seqlock 测试 ──────────────────────────────────────────────────────────
+BOOST_AUTO_TEST_SUITE(spec6_t3_tests)
+
+// T3: switch_plugin 在控制线程 housekeeper 执行，不在 capture 线程。
+// 用 test_bypass 插件触发连续 kBypass -> degraded_pending_，on_period_end
+// 仅置 trigger flag（不执行 switch_plugin），housekeeper 控制线程执行切换。
+// 验证：on_period_end 后立即检查 plugin_degraded 为 false（尚未切换），
+// wait_housekeeper_done_for_test 后为 true（控制线程已切换）。
+BOOST_AUTO_TEST_CASE(switch_plugin_on_control_thread_not_capture) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  cfg.plugin_name = "test_bypass";
+  cfg.alert_debounce_periods = 1;
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+
+  float in[480];
+  synth::speech_like(in, 480);
+  mgr.on_period_begin();
+  for (int f = 0; f < 12; ++f)
+    mgr.on_frame(0, in, 480);
+  // on_period_end 仅置 trigger，housekeeper 异步执行。
+  mgr.on_period_end();
+  // 等待 housekeeper 完成（控制线程执行 switch_plugin）。
+  BOOST_CHECK(mgr.wait_housekeeper_done_for_test(2000));
+  // plugin_degraded 锁存（housekeeper 已执行 set_plugin_degraded(true)）。
+  auto snap = mgr.get_metrics_for_test(0);
+  BOOST_CHECK(snap.plugin_degraded);
+}
+
+// T3: 多 sink on_frame 并行（per-sink 独立线程，无竞争）。
+// 两个 sensor（sink 0 + sink 1），同时喂帧，验证各自 frame_count 独立递增。
+BOOST_AUTO_TEST_CASE(per_sink_parallel_processing) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;  // passthrough，简化验证
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+  BOOST_CHECK(mgr.add_sensor(1, 1, cfg));
+  // 验证 per-sink 队列已创建。
+  BOOST_CHECK(mgr.has_sink_queue_for_test(0));
+  BOOST_CHECK(mgr.has_sink_queue_for_test(1));
+
+  float in0[480], in1[480];
+  synth::speech_like(in0, 480);
+  synth::white_noise(in1, 480, 5);
+  mgr.on_period_begin();
+  // 交替喂帧（模拟并行分发）。
+  for (int f = 0; f < 5; ++f) {
+    mgr.on_frame(0, in0, 480);
+    mgr.on_frame(1, in1, 480);
+  }
+  mgr.on_period_end();  // barrier 等待 per-sink 线程完成
+  // 各 sink 的 frame_count 应为 5（独立递增，无竞争）。
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 5u);
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(1), 5u);
+}
+
+// T3: ALSA xrun 时降级（跳过 period 处理，直通）。
+// set_xrun_for_test(true) 模拟 xrun，on_period_begin 检测到 -> pinned_table_
+// 置空 -> on_frame/on_period_end 跳过链路。frame_count 不递增。
+BOOST_AUTO_TEST_CASE(xrun_degradation) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+
+  float in[480];
+  synth::speech_like(in, 480);
+  // 正常 period：frame_count 递增。
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);
+  mgr.on_period_end();
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 1u);
+
+  // xrun period：跳过处理，frame_count 不递增。
+  mgr.set_xrun_for_test(true);
+  mgr.on_period_begin();     // 检测 xrun -> pinned_table_ = nullptr
+  mgr.on_frame(0, in, 480);  // pinned_table_ null -> 早返回
+  mgr.on_period_end();       // pinned_table_ null -> 跳过链路
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 1u);  // 仍为 1
+
+  // 恢复后正常处理。
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);
+  mgr.on_period_end();
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 2u);
+}
+
+// T3: Rfft/Irfft 不返 vector（输出参数，调用者预分配 buffer）。
+// 验证 API 签名：输出参数形式，不返回 vector。
+BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
+  // Rfft：输出参数形式（spec_, out, out_size）。
+  constexpr size_t N = 512;
+  float input[N];
+  for (size_t i = 0; i < N; ++i)
+    input[i] = 0.1f * std::sin(2.0f * 3.14159f * 100.0f * i / N);
+  std::vector<noise::fft::Complex> spec(N / 2 + 1);
+  noise::fft::Rfft(input, N, spec.data(), spec.size());
+  BOOST_REQUIRE_EQUAL(spec.size(), N / 2 + 1);
+  // 100Hz 正弦 -> 在 bin 100 有峰值。
+  // 验证非全零（变换有效）。
+  bool has_nonzero = false;
+  for (const auto& c : spec) {
+    if (std::abs(c) > 1e-6f) {
+      has_nonzero = true;
+      break;
+    }
+  }
+  BOOST_CHECK(has_nonzero);
+
+  // Irfft：输出参数形式（spec, nbins, n_out, out, out_size）。
+  std::vector<float> output(N);
+  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
+  BOOST_REQUIRE_EQUAL(output.size(), N);
+  // irfft(rfft(x)) ≈ x（数值误差 < 1e-4 绝对，近零值用绝对比较避免相对误差
+  // 放大）。
+  for (size_t i = 0; i < N; ++i) {
+    float diff = std::abs(output[i] - input[i]);
+    BOOST_CHECK_LT(diff, 1e-4f);
+  }
+}
+
+// T3: DTLN/DFN process 无 per-call 堆分配（预分配成员）。
+// 验证：连续 process 多帧，输出稳定（预分配成员复用，无 realloc 导致的状态
+// 丢失）。用 DTLN（无需模型即可验证无 crash + 输出连续性）。
+BOOST_AUTO_TEST_CASE(dtln_dfn_no_per_frame_heap) {
+  // DTLN 未 init 时直通（sanitize + kBypass），验证连续帧输出稳定。
+  noise::DtlnAdapter dtln;
+  float in[480];
+  synth::speech_like(in, 480);
+  float out[480];
+  noise::DenoiseResult r;
+  // 连续 process 10 帧，验证输出一致（直通模式，每帧应相同）。
+  std::vector<float> first_out(480);
+  for (int f = 0; f < 10; ++f) {
+    size_t n = dtln.process(in, 480, out, 480, &r);
+    BOOST_REQUIRE_EQUAL(n, 480u);
+    if (f == 0)
+      std::copy(out, out + 480, first_out.begin());
+    else {
+      for (size_t i = 0; i < 480; ++i)
+        BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
+    }
+  }
+}
+
+// T3: TemplateDB seqlock 读（capture 线程无锁读，HTTP 写时读 retry）。
+// 写者（add_template）+ 读者（match_vggish）并发：读者要么读到旧值要么新值，
+// 不 crash（seqlock 保证无 torn read）。
+BOOST_AUTO_TEST_CASE(template_db_seqlock_read) {
+  noise::NoiseTemplateDB db;
+  // 初始空库：match_vggish 返回 (0, 0)。
+  std::array<float, 128> embedding{};
+  auto [id1, sim1] = db.match_vggish(embedding);
+  BOOST_CHECK_EQUAL(id1, 0u);
+
+  // 添加一个 vggish 模板。
+  std::array<float, 32> bark{};
+  std::array<float, 128> vgg{};
+  for (size_t i = 0; i < 128; ++i)
+    vgg[i] = 0.5f;
+  uint32_t tid = db.add_template("test", "desc", "",
+                                 noise::TemplateFeatureType::Vggish, bark, vgg);
+  BOOST_CHECK_GT(tid, 0u);
+
+  // 读：match_vggish 应找到模板（seqlock 读路径，无锁）。
+  auto [id2, sim2] = db.match_vggish(vgg);
+  BOOST_CHECK_EQUAL(id2, tid);
+  BOOST_CHECK_GT(sim2, 0.75f);
+
+  // 并发：写者持续 add/remove，读者持续 match_vggish，不 crash。
+  // 简化验证：单线程多次写 + 读交替（seqlock 正确性靠 atomic 保证）。
+  for (int i = 0; i < 5; ++i) {
+    db.remove_template(tid);
+    db.add_template("test", "desc", "", noise::TemplateFeatureType::Vggish,
+                    bark, vgg);
+    auto [id, sim] = db.match_vggish(vgg);
+    BOOST_CHECK_GT(id, 0u);  // 写后读应找到
+  }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

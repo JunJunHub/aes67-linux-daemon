@@ -169,7 +169,9 @@ bool DtlnAdapter::process_one_frame_() {
 
   // rfft(frame_buffer_) -> 257 复频点；mag=|·|, phase=∠·。
   // 无归一化/缩放，对齐参考脚本（DTLN 训练于 [-1,1] 音频的原始幅度谱）。
-  spec_ = fft::Rfft(frame_buffer_, kFrame);
+  // Spec6 T3：Rfft/Irfft 改输出参数，spec_ 预分配成员复用（零 per-frame
+  // heap）。
+  fft::Rfft(frame_buffer_, kFrame, spec_.data(), spec_.size());
   for (size_t k = 0; k < spec_.size(); ++k) {
     mag_[k] = std::abs(spec_[k]);
     phase_[k] = std::arg(spec_[k]);
@@ -203,8 +205,8 @@ bool DtlnAdapter::process_one_frame_() {
       spec_[k] = std::complex<float>(m * c, m * s);
     }
     // irfft(spec, 512) -> 时域块。
-    auto block = fft::Irfft(spec_.data(), spec_.size(), kFrame);
-    std::copy(block.begin(), block.end(), est_block_.begin());
+    fft::Irfft(spec_.data(), spec_.size(), kFrame, est_block_.data(),
+               est_block_.size());
 
     // ── model_2：in=[time(1,1,512), state2(1,2,128,2)] -> [enhanced,
     // new_state2] ──
@@ -302,9 +304,12 @@ size_t DtlnAdapter::process(const float* in,
     if (up_scratch_.size() < up_cap)
       up_scratch_.resize(up_cap);
     // up_->process 需连续缓冲；deque 非连续，先拷到连续缓冲。
-    std::vector<float> contig(out_fifo16_.begin(), out_fifo16_.end());
+    // Spec6 T3：预分配成员复用（零 per-frame heap）。
+    if (up_contig_.size() < out_fifo16_.size())
+      up_contig_.resize(out_fifo16_.size());
+    std::copy(out_fifo16_.begin(), out_fifo16_.end(), up_contig_.begin());
     out_fifo16_.clear();
-    const size_t n48 = up_->process(contig.data(), contig.size(),
+    const size_t n48 = up_->process(up_contig_.data(), up_contig_.size(),
                                     up_scratch_.data(), up_scratch_.size());
     for (size_t i = 0; i < n48; ++i)
       out_fifo48_.push_back(up_scratch_[i]);

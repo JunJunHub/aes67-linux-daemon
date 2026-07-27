@@ -394,6 +394,24 @@ class NoiseManager {
   // 测试钩子：等待 history housekeeper 完成一次 flush（最多 timeout_ms）。
   bool wait_history_flush_done_for_test(uint32_t timeout_ms = 2000);
 
+  // Spec6 T3：降级 housekeeper 测试钩子。
+  // trigger：置 trigger flag + cv 唤醒（绕过 100ms 轮询）。
+  // wait_done：等待 housekeeper 完成一次 drain（最多 timeout_ms）。
+  void trigger_housekeeper_for_test() {
+    housekeeper_done_.store(false, std::memory_order_relaxed);
+    housekeeper_trigger_.store(true, std::memory_order_relaxed);
+    housekeeper_wake_cv_.notify_one();
+  }
+  bool wait_housekeeper_done_for_test(uint32_t timeout_ms = 2000);
+
+  // Spec6 T3：xrun 测试钩子。模拟 ALSA xrun（on_pcm_frame 检测到时跳过本
+  // period 处理，直通）。
+  void set_xrun_for_test(bool xrun) { xrun_pending_.store(xrun); }
+  bool is_xrun_pending_for_test() const { return xrun_pending_.load(); }
+
+  // Spec6 T3：per-sink 线程测试钩子。返回 per-sink 队列是否存在。
+  bool has_sink_queue_for_test(uint8_t sink_id) const;
+
   // Spec6 T2：注册降噪总延迟变更转发回调（plugin + resampler）。
   // init-only（同 set_ptp_status_forward_callback 模式）。消费者为
   // PcmCaptureService 做播放延迟补偿。add_sensor 时每个 sensor 的
@@ -412,13 +430,8 @@ class NoiseManager {
   RetireQueue<const SensorTable> retire_queue_;
   // period 顶部 load 的快照（裸指针），整 period 内复用，on_period_end 置空。
   const SensorTable* pinned_table_{nullptr};
-  // Spec5 T1：重采样 process() 输出暂存（capture
-  // 线程独占，单线程复用，无并发）。 per-sensor 复用同一暂存（native rate
-  // 全局一致，所有 sensor 重采样输出上界 相同）。首次 on_frame 按
-  // max_output_for_input(kPipelineFrame) 惰性 resize，
-  // 之后稳定不重新分配（warmup 后零分配）。不用 shared_ptr：属 NoiseManager 非
-  // SensorTable，不经 COW 复制。
-  std::vector<float> resample_scratch_;
+  // Spec6 T3：resample_scratch_ 移至 per-sink SinkQueue（per-sink 独立 buffer，
+  // 无共享可变状态）。同步 fallback 路径用 thread_local。
   NoiseAudioBridge& bridge_;  // #6: held for Task 2-3 FrameProvider
                               // registration (Spec3 wiring)
   std::mutex
@@ -567,6 +580,26 @@ class NoiseManager {
       uint64_t now_ms,
       const std::vector<AlertHistoryEntry>& alert_entries);
 
+  // ── Spec6 T3：降级 housekeeper 控制线程（D-S6.5）──
+  // on_period_end（capture 线程）只置 degraded_pending_ 标志（atomic），实际
+  // switch_plugin("passthrough") + drain_retire 在本 housekeeper 控制线程
+  // 执行。消除 capture 线程 Ort::Session teardown 风险（Spec5 T2 review
+  // Important #2）。线程模型同
+  // comparison_thread_/history_thread_：SCHED_OTHER， stop_ + trigger_ +
+  // cv，析构 join。 trigger_：on_period_end 检测到 degraded_pending_ 时置位 ->
+  // cv 唤醒 housekeeper 立即处理（不等轮询）。非触发时 ~100ms 轮询（兜底，避免
+  // flag 置位与 cv notify 竞态丢失）。
+  std::thread housekeeper_thread_;
+  std::mutex housekeeper_thread_mutex_;
+  std::atomic<bool> housekeeper_stop_{false};
+  std::atomic<bool> housekeeper_trigger_{false};  // on_period_end 置位
+  std::atomic<bool> housekeeper_done_{false};     // 测试钩子：完成信号
+  std::mutex housekeeper_wake_mutex_;
+  std::condition_variable housekeeper_wake_cv_;
+  void housekeeper_loop();
+  void start_housekeeper_thread();
+  void stop_housekeeper_thread();
+
   // Spec5 T1：①②③④ 链路体（参数化 pcm/n）。原 on_frame 内联的 ①②③④
   // 抽出为方法，使 on_frame 可对「48k 直通帧」与「重采样后的 48k 480-样本
   // chunk」复用同一链路（一个 on_frame 经重采样 FIFO 可能 emit 0/1/N 个
@@ -575,6 +608,48 @@ class NoiseManager {
   void process_pipeline_chunk(const SensorContext& ctx,
                               const float* pcm,
                               size_t n);
+
+  // ── Spec6 T3：per-sink 独立线程（D-S6.4）──
+  // on_frame 分发到 per-sink 队列，每 sink 独立线程处理（sink≤64，per-sink
+  // 线程简单，无共享可变状态）。on_period_end 等待所有 per-sink 线程完成
+  // 当前 period 的帧处理（barrier），再 swap/advance_epoch。
+  // 线程模型：每 sink 一个 std::thread，SCHED_OTHER（非 RT，但 on_frame 内
+  // 的 ①②③④ 链路本身非硬 RT；capture 线程仅做 S16->float + demux + dispatch）。
+  // per-sink queue 为 mutex + cv 保护的单帧 FIFO（每 period 帧数少，~1-2 帧）。
+  struct SinkQueueEntry {
+    std::vector<float> frames;  // 拷贝（per-sink 独立 buffer，无共享）
+    size_t frame_size{0};
+  };
+  struct SinkQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<SinkQueueEntry> pending;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> processed_count{0};  // period barrier 用
+    size_t expected_count{0};                // 本 period 预期帧数
+    std::thread thread;
+    // per-sink resample scratch（per-sink 独立，无共享可变状态）。
+    std::vector<float> resample_scratch;
+    // per-sink on_frame 处理（独立线程，无共享可变状态）。
+    void run(NoiseManager* mgr, uint8_t sink_id);
+  };
+  std::map<uint8_t, std::shared_ptr<SinkQueue>> sink_queues_;
+  std::mutex
+      sink_queues_mutex_;  // 保护 sink_queues_ map（add/remove vs dispatch）
+  void start_sink_thread_(uint8_t sink_id);
+  void stop_sink_thread_(uint8_t sink_id);
+  void stop_all_sink_threads_();
+  // on_frame 实际处理（per-sink 线程调用，原 on_frame 逻辑移此）。
+  // resample_scratch 为 per-sink 独立 buffer（无共享可变状态）。
+  void on_frame_impl_(uint8_t sink_id,
+                      const float* frames,
+                      size_t frame_size,
+                      std::vector<float>& resample_scratch);
+
+  // Spec6 T3：xrun 降级。capture 线程检测 ALSA xrun（PcmCaptureService
+  // readi 返回 -EPIPE 经 recover 后置 flag），on_pcm_frame 检查 flag -> 跳过
+  // 本 period 处理（直通，不喂 ①②③④）。测试钩子 set_xrun_for_test 模拟。
+  std::atomic<bool> xrun_pending_{false};
 };
 
 }  // namespace noise

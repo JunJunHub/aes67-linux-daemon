@@ -213,6 +213,15 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
   spec_.resize(kFreq);
   feat_erb_.resize(kNbErb);      // [1,1,1,32]
   feat_spec_.resize(2 * kNbDf);  // [1,2,1,96] = [re(96), im(96)]
+  // Spec6 T3：预分配 process_one_frame_ 暂存（零 per-frame heap）。
+  spec_m_.resize(kFreq);
+  spec_e_.resize(kFreq);
+  df_out_.resize(kNbDf);
+  // df_delay_ring_ 的 slot 预分配容量。
+  for (auto& slot : df_delay_ring_) {
+    slot.coefs.assign(kNbDf * kDfOrder * 2, 0.0f);
+    slot.spec_m.assign(kFreq, fft::Complex(0, 0));
+  }
 
   float dw = cfg.dry_wet;
   if (dw < 0.0f)
@@ -232,7 +241,9 @@ void DeepFilterNetAdapter::reset() {
   // norm state 不重置（libdf reset 仅清 analysis/synthesis mem）。
   for (auto& v : df_spec_history_)
     std::fill(v.begin(), v.end(), fft::Complex(0, 0));
-  df_delay_buf_.clear();  // Spec6 T2：清空 non-causal delay buffer
+  // Spec6 T3：ring buffer 状态重置。
+  df_delay_idx_ = 0;
+  df_delay_count_ = 0;
   out_frame_buf_.clear();
   in_fifo_.clear();
   out_fifo_.clear();
@@ -258,9 +269,9 @@ bool DeepFilterNetAdapter::supports_snr() const {
 
 bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
   // 从 in_fifo_ 取 kHop=480 样本。
-  std::vector<float> input(kHop);
+  // Spec6 T3：input_/buf_ 改预分配成员（零 per-frame heap）。
   for (size_t i = 0; i < kHop; ++i) {
-    input[i] = in_fifo_.front();
+    input_[i] = in_fifo_.front();
     in_fifo_.pop_front();
   }
 
@@ -269,15 +280,15 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
   try {
     // ── 1. 分析 STFT（libdf frame_analysis）──
     // buf = [analysis_mem * window[0:480] ; input * window[480:960]]
-    std::vector<float> buf(kFft, 0.0f);
     for (size_t i = 0; i < kFft - kHop; ++i)
-      buf[i] = analysis_mem_[i] * window_[i];
+      buf_[i] = analysis_mem_[i] * window_[i];
     for (size_t i = 0; i < kHop; ++i)
-      buf[kFft - kHop + i] = input[i] * window_[kFft - kHop + i];
+      buf_[kFft - kHop + i] = input_[i] * window_[kFft - kHop + i];
     // analysis_mem <- input（下帧的 prev）
-    std::copy(input.begin(), input.end(), analysis_mem_.begin());
+    std::copy(input_.begin(), input_.end(), analysis_mem_.begin());
     // rfft(buf) -> 481 复频点，* wnorm
-    spec_ = fft::Rfft(buf.data(), kFft);
+    // Spec6 T3：Rfft 改输出参数，spec_ 预分配成员复用。
+    fft::Rfft(buf_.data(), kFft, spec_.data(), spec_.size());
     for (auto& c : spec_)
       c *= wnorm_;
 
@@ -377,13 +388,14 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
 
     // ── 6. 应用回复谱 ──
     // 6a. ERB 掩蔽：spec_m = spec * interp_band_gain(m, erb_)（全 481 频点）。
-    std::vector<fft::Complex> spec_m = spec_;
+    // Spec6 T3：spec_m_ 改预分配成员（零 per-frame heap）。
+    std::copy(spec_.begin(), spec_.end(), spec_m_.begin());
     {
       size_t bcsum = 0;
       for (size_t b = 0; b < kNbErb; ++b) {
         const float g = m[b];
         for (size_t j = 0; j < erb_[b]; ++j)
-          spec_m[bcsum + j] *= g;
+          spec_m_[bcsum + j] *= g;
         bcsum += erb_[b];
       }
     }
@@ -396,56 +408,61 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
     // df_delay_buf_ 中 delayed 项是帧 t-2 的 (coefs, gain, spec_m)，用
     // history[2..6] = [t-4, t-3, t-2, t-1, t] 做 non-causal 卷积
     // （window[2] = t-2 = 输出帧，spec_orig = window[2]）。
-    // 每帧 heap 分配（T3 RT refactor 待办：改预分配成员，见 spec6-plan T3）。
+    // Spec6 T3：DelayedFrame + df_out + window 改预分配成员（零 per-frame
+    // heap）。df_delay_buf_ 用 ring buffer + index 替代 deque<push/pop>。
     for (size_t f = 0; f < kNbDf; ++f)
       df_spec_history_.back()[f] = spec_[f];
-    {
-      DelayedFrame delayed;
-      delayed.coefs.assign(coefs, coefs + kNbDf * kDfOrder * 2);
-      delayed.gain = gain[0];
-      delayed.spec_m = std::move(spec_m);
-      df_delay_buf_.push_back(std::move(delayed));
-    }
-    // 如果 delay buf 满（> kDfLookahead），pop 最旧项做 non-causal 卷积。
-    if (df_delay_buf_.size() > kDfLookahead) {
-      DelayedFrame delayed_frame = std::move(df_delay_buf_.front());
-      df_delay_buf_.pop_front();
+    // 写入 ring buffer 当前 slot（覆盖最旧）。
+    DelayedFrame& slot = df_delay_ring_[df_delay_idx_];
+    std::copy(coefs, coefs + kNbDf * kDfOrder * 2, slot.coefs.data());
+    slot.gain = gain[0];
+    std::copy(spec_m_.begin(), spec_m_.end(), slot.spec_m.begin());
+    df_delay_idx_ = (df_delay_idx_ + 1) % (kDfLookahead + 1);
+    ++df_delay_count_;
+    // 如果 delay buf 满（> kDfLookahead），取最旧项做 non-causal 卷积。
+    if (df_delay_count_ > kDfLookahead) {
+      // 最旧项 = 当前写入位置（ring 已前移），即被覆盖前的 slot。
+      const DelayedFrame& delayed_frame = df_delay_ring_[df_delay_idx_];
+      --df_delay_count_;
       // history 当前布局（back() 已填 spec_）：
       //   [t-6, t-5, t-4, t-3, t-2, t-1, t]
       // non-causal window = history[2..6] = [t-4, t-3, t-2, t-1, t]
       // spec_orig = history[4] = t-2（输出帧的原始 spec，仅前 96 频点）
-      std::vector<std::vector<fft::Complex>> window(kDfOrder);
+      // Spec6 T3：window 改用 history 指针引用（零 per-frame heap）。
+      std::vector<const std::vector<fft::Complex>*> window_ptrs(kDfOrder);
       for (size_t o = 0; o < kDfOrder; ++o)
-        window[o] = df_spec_history_[2 + o];
+        window_ptrs[o] = &df_spec_history_[2 + o];
       // spec_e: bins 0..95 用深度滤波，96..481 用 ERB 掩蔽版（delayed
       // spec_m）。
-      std::vector<fft::Complex> spec_e(kFreq);
-      std::vector<fft::Complex> df_out;
-      apply_df_op(window, delayed_frame.coefs.data(), delayed_frame.gain,
-                  window[2], df_out);
+      apply_df_op(window_ptrs, delayed_frame.coefs.data(), delayed_frame.gain,
+                  *window_ptrs[2], df_out_);
       for (size_t f = 0; f < kNbDf; ++f)
-        spec_e[f] = df_out[f];
+        spec_e_[f] = df_out_[f];
       // 余频点（96..481）用 delayed frame 的 ERB 掩蔽版。
       for (size_t f = kNbDf; f < kFreq; ++f)
-        spec_e[f] = delayed_frame.spec_m[f];
+        spec_e_[f] = delayed_frame.spec_m[f];
       // ── 7. 合成 ISTFT（libdf frame_synthesis）──
-      auto time_block = fft::Irfft(spec_e.data(), kFreq, kFft);
+      // Spec6 T3：Irfft 改输出参数，time_block_ 预分配成员。
+      fft::Irfft(spec_e_.data(), kFreq, kFft, time_block_.data(),
+                 time_block_.size());
       for (size_t i = 0; i < kFft; ++i)
-        time_block[i] *= window_[i];
+        time_block_[i] *= window_[i];
+      // Spec6 T3：out_frame 复用 time_block_ 前 kHop（原 out_frame 临时 vector
+      // 改为直接 push back 到 out_frame_buf_）。
       std::vector<float> out_frame(kHop, 0.0f);
       for (size_t i = 0; i < kHop; ++i)
-        out_frame[i] = time_block[i] + synthesis_mem_[i];
+        out_frame[i] = time_block_[i] + synthesis_mem_[i];
       const size_t split = synthesis_mem_.size() - kHop;
       if (split == 0) {
         for (size_t i = 0; i < kHop; ++i)
-          synthesis_mem_[i] = time_block[kHop + i];
+          synthesis_mem_[i] = time_block_[kHop + i];
       } else {
         std::rotate(synthesis_mem_.begin(), synthesis_mem_.begin() + kHop,
                     synthesis_mem_.end());
         for (size_t i = 0; i < split; ++i)
-          synthesis_mem_[i] += time_block[kHop + i];
+          synthesis_mem_[i] += time_block_[kHop + i];
         for (size_t i = split; i < synthesis_mem_.size(); ++i)
-          synthesis_mem_[i] = time_block[kHop + i];
+          synthesis_mem_[i] = time_block_[kHop + i];
       }
       out_frame_buf_.push_back(std::move(out_frame));
     }
@@ -597,8 +614,10 @@ std::string DeepFilterNetAdapter::get_param(const std::string& /*key*/) const {
 //     alpha = clamp(gain_alpha, 0, 1)
 // 此静态方法为纯函数（无实例状态），供 process_one_frame_ 内部调用 +
 // 单元测试直接验证卷积逻辑（无需 ONNX 模型）。
+// Spec6 T3：window 改为 const std::vector<Complex>* 指针数组（避免拷贝
+// vector）， spec_out 改为引用（调用者预分配）。
 void DeepFilterNetAdapter::apply_df_op(
-    const std::vector<std::vector<fft::Complex>>& window,
+    const std::vector<const std::vector<fft::Complex>*>& window,
     const float* coefs,
     float gain_alpha,
     const std::vector<fft::Complex>& spec_orig,
@@ -615,7 +634,7 @@ void DeepFilterNetAdapter::apply_df_op(
     for (size_t o = 0; o < kDfOrder; ++o) {
       const float cr = coefs[f * 10 + o * 2 + 0];
       const float ci = coefs[f * 10 + o * 2 + 1];
-      const auto& s = window[o][f];  // o=0=oldest
+      const auto& s = (*window[o])[f];  // o=0=oldest
       // 复乘 (cr+i*ci)*(sr+i*si) = (cr*sr-ci*si) + i*(cr*si+ci*sr)
       re_out += cr * s.real() - ci * s.imag();
       im_out += cr * s.imag() + ci * s.real();

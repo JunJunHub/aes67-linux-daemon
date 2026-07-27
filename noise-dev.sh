@@ -61,12 +61,12 @@ die()  { echo "${C_RED}[dev]${C_OFF} ERROR: $*" >&2; exit 1; }
 
 # ---- build -------------------------------------------------------------------
 cmd_build() {
-  local with_avahi=ON fake_driver=ON with_streamer=OFF with_noise=ON
+  local with_avahi=ON fake_driver=ON with_streamer=ON with_noise=ON
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-avahi)     with_avahi=OFF; shift ;;
       --real)         fake_driver=OFF; shift ;;
-      --with-streamer) with_streamer=ON; shift ;;
+      --no-streamer)  with_streamer=OFF; shift ;;
       --no-noise)     with_noise=OFF; shift ;;
       *) die "build: unknown option: $1" ;;
     esac

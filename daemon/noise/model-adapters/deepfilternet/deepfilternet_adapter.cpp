@@ -460,8 +460,11 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
       // Spec6 T3：Irfft 改输出参数，time_block_ 预分配成员。
       fft::Irfft(spec_e_.data(), kFreq, kFft, time_block_.data(),
                  time_block_.size());
+      // fft.hpp 的 IFFT 含 1/N 归一化（原始 libdf 不含），需乘 N 补偿，
+      // 否则输出被缩小 N 倍（wnorm_=1/N 在 STFT 缩放 + IFFT 1/N = 双重缩放）。
+      const float istft_scale = static_cast<float>(kFft);
       for (size_t i = 0; i < kFft; ++i)
-        time_block_[i] *= window_[i];
+        time_block_[i] *= window_[i] * istft_scale;
       // Spec6 T3 review Important #3/#4：out_frame 改预分配 ring buffer slot，
       // 零 per-frame heap。直接写入 out_ring_[tail_]，然后推进 tail。
       std::array<float, kHop>& out_slot = out_ring_[out_ring_tail_];

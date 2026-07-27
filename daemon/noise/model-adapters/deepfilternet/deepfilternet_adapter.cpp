@@ -11,7 +11,7 @@
 // 对照 DeepFilterNet/df/modules.py DfOp + spec_pad + assign_df（non-causal
 // window [i-2..i+2] + coef[0] 配最旧帧 + alpha blend）。modules.py 未 vendored
 // 于本 worktree，实现依据 spec §T2 设计描述 + 测试（行为权威定义，见
-// apply_df_op_for_test）。延迟 (coefs, gain, mask) kDfLookahead=2 帧以对齐
+// apply_df_op）。延迟 (coefs, gain, mask) kDfLookahead=2 帧以对齐
 // non-causal window，warmup=0（延迟由 df_delay_buf_ 提供，总算法延迟不变 =
 // hop*(1+kDfLookahead)=1440）。真实 DFN 模型 fidelity 验证需模型（CI skip）。
 #include "deepfilternet_adapter.hpp"
@@ -421,8 +421,8 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
       // spec_m）。
       std::vector<fft::Complex> spec_e(kFreq);
       std::vector<fft::Complex> df_out;
-      apply_df_op_for_test(window, delayed_frame.coefs.data(),
-                           delayed_frame.gain, window[2], df_out);
+      apply_df_op(window, delayed_frame.coefs.data(), delayed_frame.gain,
+                  window[2], df_out);
       for (size_t f = 0; f < kNbDf; ++f)
         spec_e[f] = df_out[f];
       // 余频点（96..481）用 delayed frame 的 ERB 掩蔽版。
@@ -454,14 +454,10 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
     df_spec_history_.push_back(std::vector<fft::Complex>(kNbDf));
     return true;
   } catch (...) {
-    // ONNX 失败：仍 push spec_ 到 history + 滑窗（保持 history 对齐），
-    // 但不 push delay buf（delay buf 1 帧短，下帧补；silence 由 caller
-    // push 对齐输出计数）。D-S5.5 偏差：silence 降级保留（真实 memcpy
-    // passthrough 延后，T2 不改 failure handling）。
-    for (size_t f = 0; f < kNbDf; ++f)
-      df_spec_history_.back()[f] = spec_[f];
-    df_spec_history_.erase(df_spec_history_.begin());
-    df_spec_history_.push_back(std::vector<fft::Complex>(kNbDf));
+    // ONNX 失败：保持 history 与 delay_buf 同步（两者都不前进），匹配
+    // pre-T2 行为（1b7bbd4）。non-causal window 在失败帧处保留旧 spec，
+    // 不劣于 pre-T2 causal 同路径；failure 路径已降级（D-S5.5 silence）。
+    // T2 不改 failure handling（见 spec6-plan T2 约束）。
     return false;
   }
 }
@@ -601,7 +597,7 @@ std::string DeepFilterNetAdapter::get_param(const std::string& /*key*/) const {
 //     alpha = clamp(gain_alpha, 0, 1)
 // 此静态方法为纯函数（无实例状态），供 process_one_frame_ 内部调用 +
 // 单元测试直接验证卷积逻辑（无需 ONNX 模型）。
-void DeepFilterNetAdapter::apply_df_op_for_test(
+void DeepFilterNetAdapter::apply_df_op(
     const std::vector<std::vector<fft::Complex>>& window,
     const float* coefs,
     float gain_alpha,

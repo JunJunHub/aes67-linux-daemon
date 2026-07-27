@@ -76,7 +76,7 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   bool set_param(const std::string& key, const std::string& value) override;
   std::string get_param(const std::string& key) const override;
 
-  // DFN 模型常量（Spec6 T2 移至 public：测试 apply_df_op_for_test 需引用）。
+  // DFN 模型常量（Spec6 T2 移至 public：apply_df_op 需引用）。
   static constexpr uint32_t kSr = 48000;
   static constexpr size_t kFft = 960;            // fft_size
   static constexpr size_t kHop = 480;            // hop_size
@@ -99,12 +99,11 @@ class DeepFilterNetAdapter : public IDenoisePlugin {
   // gain_alpha: alpha 来源（df_dec 输出 gain[0]）。
   // spec_orig: 输出帧原始复谱（kNbDf bins，= window[2] 即中间帧）。
   // spec_out: 输出（kNbDf bins）。
-  static void apply_df_op_for_test(
-      const std::vector<std::vector<fft::Complex>>& window,
-      const float* coefs,
-      float gain_alpha,
-      const std::vector<fft::Complex>& spec_orig,
-      std::vector<fft::Complex>& spec_out);
+  static void apply_df_op(const std::vector<std::vector<fft::Complex>>& window,
+                          const float* coefs,
+                          float gain_alpha,
+                          const std::vector<fft::Complex>& spec_orig,
+                          std::vector<fft::Complex>& spec_out);
 
  private:
   bool process_one_frame_(float& lsnr_out);

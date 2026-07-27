@@ -4124,8 +4124,8 @@ BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(3.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
   // gain=1 -> alpha=1 -> spec_out = spec_f (pure deep filter, no blend)
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 1.0f,
-                                                    spec_orig, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 1.0f,
+                                           spec_orig, spec_out);
   // 验证：spec_f = coefs[2]*window[2] = 1*3 = 3.0
   // alpha=1 -> spec_out = spec_f = 3.0
   BOOST_REQUIRE_EQUAL(spec_out.size(), noise::DeepFilterNetAdapter::kNbDf);
@@ -4134,8 +4134,8 @@ BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
   // 用 coefs[0] 验证：non-causal 下 o=0 配最旧帧（window[0]），
   // 因果下 o=0 配最新帧（window[4]）。
   auto coefs2 = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs2.data(), 1.0f,
-                                                    spec_orig, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs2.data(), 1.0f,
+                                           spec_orig, spec_out);
   // non-causal: o=0 配 window[0]=1.0 -> spec_f=1.0 -> spec_out=1.0
   // causal: o=0 配 window[4]=5.0 -> spec_f=5.0 -> spec_out=5.0
   BOOST_CHECK_CLOSE(spec_out[0].real(), 1.0f, 1e-4f);
@@ -4149,14 +4149,14 @@ BOOST_AUTO_TEST_CASE(dfn_coef_mapping_oldest_first) {
   const std::vector<noise::fft::Complex> spec_orig(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(30.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 1.0f,
-                                                    spec_orig, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 1.0f,
+                                           spec_orig, spec_out);
   // coef[0] 配最旧帧 window[0]=10.0 -> spec_out=10.0
   BOOST_CHECK_CLOSE(spec_out[0].real(), 10.0f, 1e-4f);
   // 验证 coef[4] 配最新帧 window[4]=50.0
   auto coefs4 = make_df_coefs({{0, 0}, {0, 0}, {0, 0}, {0, 0}, {1, 0}});
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs4.data(), 1.0f,
-                                                    spec_orig, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs4.data(), 1.0f,
+                                           spec_orig, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 50.0f, 1e-4f);
 }
 
@@ -4172,19 +4172,19 @@ BOOST_AUTO_TEST_CASE(dfn_assign_df_alpha_blend) {
   const std::vector<noise::fft::Complex> spec_orig(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(0.0f, 0.0f));
   std::vector<noise::fft::Complex> spec_out;
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.3f,
-                                                    spec_orig, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.3f,
+                                           spec_orig, spec_out);
   // alpha=0.3 -> spec_out = 30*0.3 + 0*0.7 = 9.0
   BOOST_CHECK_CLOSE(spec_out[0].real(), 9.0f, 1e-4f);
   // spec_orig = 100 -> spec_out = 30*0.3 + 100*0.7 = 9 + 70 = 79.0
   const std::vector<noise::fft::Complex> spec_orig2(
       noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(100.0f, 0.0f));
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.3f,
-                                                    spec_orig2, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.3f,
+                                           spec_orig2, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 79.0f, 1e-4f);
   // gain=0 -> alpha=0 -> spec_out = spec_f*0 + spec_orig*1 = spec_orig
-  noise::DeepFilterNetAdapter::apply_df_op_for_test(window, coefs.data(), 0.0f,
-                                                    spec_orig2, spec_out);
+  noise::DeepFilterNetAdapter::apply_df_op(window, coefs.data(), 0.0f,
+                                           spec_orig2, spec_out);
   BOOST_CHECK_CLOSE(spec_out[0].real(), 100.0f, 1e-4f);
 }
 
@@ -4232,6 +4232,10 @@ BOOST_AUTO_TEST_CASE(ref_comparator_48k_route_native_not_48k) {
   // 验证 total_written 不等于原生帧数（4410），证明走了 48k 重采样。
   BOOST_CHECK_NE(ref_total, 4410u);
   BOOST_CHECK_NE(cmp_total, 4410u);
+  // 强化（T2 review Minor #5）：验证 routed count 近似 48k 重采样期望值。
+  // 4410 * 48/44.1 ≈ 4799.3，5% 容差覆盖 SpeexDSP 内部延迟舍入。
+  BOOST_CHECK_CLOSE(static_cast<double>(ref_total), 4800.0, 5.0);
+  BOOST_CHECK_CLOSE(static_cast<double>(cmp_total), 4800.0, 5.0);
   // 清理
   BOOST_CHECK(mgr.remove_ref_comparator(cid));
 }

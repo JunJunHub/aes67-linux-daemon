@@ -334,7 +334,7 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
     Ort::Value enc_inputs[2] = {std::move(in_erb), std::move(in_spec)};
     auto enc_out = enc_->Run(Ort::RunOptions{nullptr}, enc_in, enc_inputs, 2,
                              enc_out_c_.data(), enc_out_c_.size());
-    // enc outputs: e0,e1,e2,e3,emb,c0,lsnr (index 0..7, order per export).
+    // enc outputs: e0,e1,e2,e3,emb,c0,lsnr (index 0..6, order per export).
     // 读取各输出指针（shape 含 S=1）。
     const float* e0 = enc_out[0].GetTensorMutableData<float>();
     const float* e1 = enc_out[1].GetTensorMutableData<float>();

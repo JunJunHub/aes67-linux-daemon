@@ -7,6 +7,7 @@ set(NOISE_SOURCES
   noise_manager.cpp
   noise_metrics.cpp
   noise_http.cpp
+  noise_history.cpp
   noise_status.cpp
   vad.cpp
   noise_detector.cpp
@@ -40,6 +41,24 @@ if(NOT SPEEXDSP_INCLUDE_DIR OR NOT SPEEXDSP_LIBRARY)
 endif()
 target_include_directories(noise PUBLIC ${SPEEXDSP_INCLUDE_DIR})
 target_link_libraries(noise PUBLIC ${SPEEXDSP_LIBRARY})
+
+# Spec6 T1（D-S6.1）：SQLite 历史持久化依赖（noise_history.cpp）。
+# WITH_NOISE=OFF 时本文件不执行，不引入 SQLite（--no-noise 零回归）。
+# find_package(SQLite3) 用 CMake config（系统 libsqlite3-dev 自带 SQLite3Config），
+# 失败时回退 find_path/find_library（与 SpeexDSP 同风格，兼容无 config 的环境）。
+find_package(SQLite3 QUIET)
+if(SQLite3_FOUND)
+  target_link_libraries(noise PUBLIC SQLite::SQLite3)
+else()
+  find_path(SQLITE3_INCLUDE_DIR sqlite3.h)
+  find_library(SQLITE3_LIBRARY NAMES sqlite3)
+  if(NOT SQLITE3_INCLUDE_DIR OR NOT SQLITE3_LIBRARY)
+    message(FATAL_ERROR
+      "SQLite3 not found (install libsqlite3-dev, e.g. debian-packages.sh)")
+  endif()
+  target_include_directories(noise PUBLIC ${SQLITE3_INCLUDE_DIR})
+  target_link_libraries(noise PUBLIC ${SQLITE3_LIBRARY})
+endif()
 
 # RNNoise 降噪插件（Spec2 1.6b）。
 # 整个 daemon/noise/CMakeLists.txt 由 daemon/CMakeLists.txt 的

@@ -52,6 +52,8 @@ NoiseManager::~NoiseManager() {
   // 不依赖 PTP 联动（on_capture_thread_joined 只在 PTP unlock 路径触发），
   // 析构是确定性的 shutdown 路径，必须保证线程退出。
   stop_comparison_thread();
+  // Spec6 T1：join history housekeeper 线程（确定性 shutdown）。
+  stop_history_thread();
 }
 
 bool NoiseManager::add_sensor(uint8_t sensor_id,
@@ -442,52 +444,55 @@ void NoiseManager::on_period_end() {
           ctx.metrics->set_plugin_degraded(true);
       }
     }
-    // Spec4 T4：告警引擎评估（D-S4.2）。
+    // Spec4 T4：告警引擎评估（D-S4.2）+ Spec6 T1：收集 alert 事件供持久化。
     // 在 denoise/metrics on_period_end（swap + collect 完成）后，
     // push_sse_events 前。evaluate_alerts 轻量（比较 + 计数），无 socket I/O。
     // 返回 raise/clear 事件 -> push 到全局 alert_broadcaster_（非阻塞
     // try_push）。 仅当有订阅者时才 push（T3 review Important 2 模式：消除 idle
-    // 开销）。
-    if (alert_broadcaster_.has_subscribers()) {
-      for (auto& [id, ctx] : *pinned_table_) {
-        if (!ctx.metrics)
-          continue;
-        auto ev = ctx.metrics->evaluate_alerts(id);
-        if (ev.has_value()) {
-          // 组装 SSE 事件 JSON（arch §C 告警事件格式）。
-          // raise/clear 仅在状态转换时发生（罕见），JSON 组装可接受。
-          const char* level_str = "none";
-          switch (ev->level) {
-            case AlertLevel::Info:
-              level_str = "info";
-              break;
-            case AlertLevel::Warning:
-              level_str = "warning";
-              break;
-            case AlertLevel::Critical:
-              level_str = "critical";
-              break;
-            case AlertLevel::None:
-            default:
-              level_str = "none";
-              break;
-          }
-          std::ostringstream ss;
-          ss << "data: {\"sensor_id\": " << static_cast<unsigned>(id)
-             << ", \"level\": \"" << level_str << "\"" << ", \"rule\": \""
-             << ev->rule << "\"" << ", \"message\": \"" << ev->message << "\""
-             << ", \"raised_at_ms\": " << ev->raised_at_ms
-             << ", \"is_active\": " << (ev->is_active ? "true" : "false")
-             << "}\n\n";
-          alert_broadcaster_.push(ss.str());
-        }
+    // 开销）。Spec6 T1：无论是否 push SSE，均收集 AlertHistoryEntry 供
+    // NoiseStore 持久化（仅当 noise_store_ 配置时）。
+    const bool has_alert_subscribers = alert_broadcaster_.has_subscribers();
+    const bool persist_history = (noise_store_ != nullptr);
+    std::vector<AlertHistoryEntry> alert_entries;
+    for (auto& [id, ctx] : *pinned_table_) {
+      if (!ctx.metrics)
+        continue;
+      auto ev = ctx.metrics->evaluate_alerts(id);
+      if (!ev.has_value())
+        continue;
+      if (persist_history) {
+        AlertHistoryEntry e;
+        e.sensor_id = id;
+        e.event = *ev;
+        alert_entries.push_back(std::move(e));
       }
-    } else {
-      // 无订阅者：仍需评估（更新 is_alerting + alert_level + history ring），
-      // 但不 push SSE 事件。evaluate_alerts 内部不组装 JSON，仅比较+计数。
-      for (auto& [id, ctx] : *pinned_table_) {
-        if (ctx.metrics)
-          (void)ctx.metrics->evaluate_alerts(id);
+      if (has_alert_subscribers) {
+        // 组装 SSE 事件 JSON（arch §C 告警事件格式）。
+        // raise/clear 仅在状态转换时发生（罕见），JSON 组装可接受。
+        const char* level_str = "none";
+        switch (ev->level) {
+          case AlertLevel::Info:
+            level_str = "info";
+            break;
+          case AlertLevel::Warning:
+            level_str = "warning";
+            break;
+          case AlertLevel::Critical:
+            level_str = "critical";
+            break;
+          case AlertLevel::None:
+          default:
+            level_str = "none";
+            break;
+        }
+        std::ostringstream ss;
+        ss << "data: {\"sensor_id\": " << static_cast<unsigned>(id)
+           << ", \"level\": \"" << level_str << "\"" << ", \"rule\": \""
+           << ev->rule << "\"" << ", \"message\": \"" << ev->message << "\""
+           << ", \"raised_at_ms\": " << ev->raised_at_ms
+           << ", \"is_active\": " << (ev->is_active ? "true" : "false")
+           << "}\n\n";
+        alert_broadcaster_.push(ss.str());
       }
     }
     // Spec4 Task 3：SSE push（D-S4.1，非阻塞）。
@@ -495,6 +500,17 @@ void NoiseManager::on_period_end() {
     // advance_epoch 前调用 push_sse_events。此时 front 缓冲已是本 period
     // 数据（swap 后），metrics latest_ 已更新（collect 写入）。
     push_sse_events(*pinned_table_);
+    // Spec6 T1（D-S6.1）：push metrics 快照 + alert 事件到 pending 队列
+    // （capture 线程，mutex 短临界区，不接触 SQLite）。housekeeper 控制线程
+    // 定时 drain -> NoiseStore 批量 insert。RT 安全：仅 deque push + try_lock
+    // 模式，housekeeper 滞后时丢弃最旧（kMaxPendingMetrics/Alerts 上界）。
+    if (persist_history) {
+      uint64_t now_ms = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count());
+      push_history_pending(*pinned_table_, now_ms, alert_entries);
+    }
   }
   pinned_table_ = nullptr;
   sensor_table_.advance_epoch();
@@ -1405,6 +1421,124 @@ void NoiseManager::push_sse_events(const SensorTable& table) {
         }
       }
     }
+  }
+}
+
+// ── Spec6 T1：NoiseStore 历史持久化（D-S6.1）─────────────────────────────
+// 线程模型：housekeeper 控制线程定时 drain pending -> NoiseStore 批量 insert
+// + retention cleanup。capture 线程只 push pending（mutex 短临界区，不接触
+// SQLite）。与 comparison 线程同模式（SCHED_OTHER，stop_ + join）。
+void NoiseManager::set_noise_store(std::shared_ptr<NoiseStore> store) {
+  // 控制线程调用（main wiring，init 前）。已运行时先停旧线程再换。
+  stop_history_thread();
+  noise_store_ = std::move(store);
+  if (noise_store_) {
+    // 同步 flush 间隔（NoiseStore 持有 config 注入的值）。
+    history_flush_interval_s_ = noise_store_->get_flush_interval_s();
+    start_history_thread();
+  }
+}
+
+void NoiseManager::start_history_thread() {
+  if (history_thread_.joinable())
+    return;
+  history_stop_.store(false, std::memory_order_relaxed);
+  history_thread_ = std::thread([this]() { history_loop(); });
+}
+
+void NoiseManager::stop_history_thread() {
+  history_stop_.store(true, std::memory_order_relaxed);
+  history_trigger_.store(true, std::memory_order_relaxed);
+  history_wake_cv_.notify_one();
+  if (history_thread_.joinable()) {
+    history_thread_.join();
+  }
+}
+
+void NoiseManager::history_loop() {
+  // SCHED_OTHER（非 RT）。~每 flush_interval_s 轮询 drain pending -> SQLite。
+  // 保留清理：每 ~60s 一次（每 6 个 flush cycle @ flush=10s）。trigger/stop
+  // 经 cv 立即唤醒（不等 flush_interval_s）。done_ 仅在 triggered cycle 设置
+  // （避免非触发周期 stale done 让 wait_ 误返回）。
+  while (!history_stop_.load(std::memory_order_relaxed)) {
+    // 等待 trigger 或 timeout（flush_interval_s）。stop 时 predicate 唤醒。
+    {
+      std::unique_lock<std::mutex> lk(history_wake_mutex_);
+      history_wake_cv_.wait_for(
+          lk, std::chrono::seconds(history_flush_interval_s_), [this] {
+            return history_stop_.load(std::memory_order_relaxed) ||
+                   history_trigger_.load(std::memory_order_relaxed);
+          });
+    }
+    const bool triggered =
+        history_trigger_.exchange(false, std::memory_order_relaxed);
+    // drain pending（swap 出，锁外批量 insert）。
+    std::vector<MetricsHistoryRecord> metrics;
+    std::vector<AlertHistoryRecord> alerts;
+    {
+      std::lock_guard<std::mutex> lock(history_mutex_);
+      metrics.assign(pending_metrics_.begin(), pending_metrics_.end());
+      pending_metrics_.clear();
+      alerts.assign(pending_alerts_.begin(), pending_alerts_.end());
+      pending_alerts_.clear();
+    }
+    if (noise_store_) {
+      if (!metrics.empty())
+        noise_store_->insert_metrics(metrics);
+      if (!alerts.empty())
+        noise_store_->insert_alerts(alerts);
+    }
+    // 保留清理：约每 60s 一次（flush_interval_s * 6）。
+    if (++history_cycle_ >= 6 && noise_store_) {
+      history_cycle_ = 0;
+      noise_store_->run_retention_cleanup();
+    }
+    if (triggered)
+      history_done_.store(true, std::memory_order_relaxed);
+  }
+}
+
+bool NoiseManager::wait_history_flush_done_for_test(uint32_t timeout_ms) {
+  // 先置 done_=false 再 trigger，避免错过上一次 done（与 comparison 同模式）。
+  history_done_.store(false, std::memory_order_relaxed);
+  history_trigger_.store(true, std::memory_order_relaxed);
+  auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (history_done_.load(std::memory_order_relaxed))
+      return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return false;
+}
+
+void NoiseManager::push_history_pending(
+    const SensorTable& table,
+    uint64_t now_ms,
+    const std::vector<AlertHistoryEntry>& alert_entries) {
+  // capture 线程调用（on_period_end 末尾）。push 各 sensor 的最新 metrics
+  // 快照 + 本 period 产出的 alert 事件到 pending 队列。mutex 短临界区
+  // （deque push_back），housekeeper 滞后时丢弃最旧。
+  std::lock_guard<std::mutex> lock(history_mutex_);
+  for (const auto& [id, ctx] : table) {
+    if (!ctx.metrics)
+      continue;
+    MetricsHistoryRecord r;
+    r.sensor_id = id;
+    r.timestamp_ms = now_ms;
+    r.snapshot = ctx.metrics->get_snapshot();
+    pending_metrics_.push_back(std::move(r));
+    while (pending_metrics_.size() > kMaxPendingMetrics)
+      pending_metrics_.pop_front();
+  }
+  for (const auto& e : alert_entries) {
+    AlertHistoryRecord r;
+    r.sensor_id = e.sensor_id;
+    r.timestamp_ms = now_ms;
+    r.event = e.event;
+    pending_alerts_.push_back(std::move(r));
+    while (pending_alerts_.size() > kMaxPendingAlerts)
+      pending_alerts_.pop_front();
   }
 }
 

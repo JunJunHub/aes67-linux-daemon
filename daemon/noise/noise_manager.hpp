@@ -7,6 +7,7 @@
 #define NOISE_NOISE_MANAGER_HPP_
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "noise_analyzer.hpp"
 #include "noise_audio_bridge.hpp"
 #include "noise_detector.hpp"
+#include "noise_history.hpp"  // Spec6 T1：NoiseStore
 #include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
 #include "ref_comparator.hpp"
@@ -371,6 +373,21 @@ class NoiseManager {
     template_db_ = db;
   }
 
+  // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。控制线程调用
+  // （main wiring，init 前；非空时启动 history housekeeper 线程）。空
+  // shared_ptr -> 历史持久化禁用，on_period_end 不 push pending，/history
+  // ?from=&to= 返回 404。
+  void set_noise_store(std::shared_ptr<NoiseStore> store);
+  std::shared_ptr<NoiseStore> get_noise_store() const { return noise_store_; }
+  // 测试钩子：同步触发一次 history housekeeper flush（绕过 flush_interval_s
+  // 轮询）。用于测试中确定性验证 pending -> SQLite 落盘。
+  void trigger_history_flush_for_test() {
+    history_trigger_.store(true);
+    history_wake_cv_.notify_one();
+  }
+  // 测试钩子：等待 history housekeeper 完成一次 flush（最多 timeout_ms）。
+  bool wait_history_flush_done_for_test(uint32_t timeout_ms = 2000);
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -414,6 +431,8 @@ class NoiseManager {
   // 共享同一实例。
   std::shared_ptr<MlClassifier> ml_classifier_;
   std::shared_ptr<NoiseTemplateDB> template_db_;
+  // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
+  std::shared_ptr<NoiseStore> noise_store_;
   // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
   // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
   // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，
@@ -497,6 +516,37 @@ class NoiseManager {
   // push metrics 快照 + PCM chunk（每 period）到对应 broadcaster。
   // 非阻塞：SseBroadcaster::push 内部 try_lock + drop-oldest（风险 9/17）。
   void push_sse_events(const SensorTable& table);
+
+  // ── Spec6 T1：NoiseStore 历史持久化（D-S6.1）──
+  // capture 线程（on_period_end）只 push 到内存 pending 队列（mutex 短临界区，
+  // 不接触 SQLite，避免 RT I/O）。history housekeeper 控制线程定时 drain
+  // pending
+  // -> NoiseStore 批量 insert + 定时 retention cleanup。线程模型与 comparison
+  // 线程同模式（SCHED_OTHER，stop_ 标志 + join）。
+  std::deque<MetricsHistoryRecord> pending_metrics_;
+  std::deque<AlertHistoryRecord> pending_alerts_;
+  mutable std::mutex history_mutex_;  // 保护 pending_metrics_/pending_alerts_
+  std::thread history_thread_;
+  std::atomic<bool> history_stop_{false};
+  std::atomic<bool> history_trigger_{false};  // 测试钩子：立即 flush
+  std::atomic<bool> history_done_{false};  // 测试钩子：flush 完成信号
+  // cv：trigger/stop 立即唤醒 housekeeper（否则 sleep flush_interval_s）。
+  std::mutex history_wake_mutex_;
+  std::condition_variable history_wake_cv_;
+  uint32_t history_flush_interval_s_{10};
+  uint32_t history_cycle_{0};  // retention cleanup 计数（每 6 cycle 一次）
+  // pending 队列容量上界（防止 housekeeper 滞后时无限增长；超出丢弃最旧）。
+  static constexpr size_t kMaxPendingMetrics = 6000;  // ~100 sensors * 60
+  static constexpr size_t kMaxPendingAlerts = 6000;
+  void history_loop();
+  void start_history_thread();
+  void stop_history_thread();
+  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 前）：
+  // push 各 sensor 的 metrics 快照 + 本 period 产出的 alert 事件到 pending。
+  void push_history_pending(
+      const SensorTable& table,
+      uint64_t now_ms,
+      const std::vector<AlertHistoryEntry>& alert_entries);
 
   // Spec5 T1：①②③④ 链路体（参数化 pcm/n）。原 on_frame 内联的 ①②③④
   // 抽出为方法，使 on_frame 可对「48k 直通帧」与「重采样后的 48k 480-样本

@@ -28,6 +28,7 @@
 #include <utility>
 
 #include "ml_classifier.hpp"  // Spec5 T3：vggish 模板录入 embed
+#include "noise_history.hpp"  // Spec6 T1：NoiseStore 历史记录序列化
 
 namespace noise {
 
@@ -107,6 +108,22 @@ inline const char* bool_str(bool b) {
   return b ? "true" : "false";
 }
 
+// Spec6 T1：AlertLevel -> JSON 小写字符串（与 /alerts 路由 + SSE
+// 事件格式一致）。
+inline const char* alert_level_to_string(AlertLevel level) {
+  switch (level) {
+    case AlertLevel::Info:
+      return "info";
+    case AlertLevel::Warning:
+      return "warning";
+    case AlertLevel::Critical:
+      return "critical";
+    case AlertLevel::None:
+    default:
+      return "none";
+  }
+}
+
 // 单个 NoiseMetricsSnapshot 字段追加到 stream（不含外层 {}）。
 // indent 是每行前缀（如 "  " 或 "    "），用于嵌套场景的对齐。
 // include_denoise_enabled：是否输出 denoise_enabled 字段。
@@ -141,7 +158,14 @@ void append_snapshot_fields(std::stringstream& ss,
      << indent << "\"spectral_centroid_hz\": " << s.spectral_centroid_hz
      << ",\n"
      << indent << "\"spectral_flatness\": " << s.spectral_flatness << ",\n"
-     << indent << "\"hum_strength_db\": " << s.hum_strength_db;
+     << indent << "\"hum_strength_db\": " << s.hum_strength_db << ",\n"
+     << indent << "\"l3_match_type\": \"" << escape_json(s.l3_match_type)
+     << "\",\n"
+     << indent << "\"l3_similarity\": " << s.l3_similarity << ",\n"
+     << indent << "\"plugin_degraded\": " << bool_str(s.plugin_degraded)
+     << ",\n"
+     << indent << "\"alert_level\": \"" << alert_level_to_string(s.alert_level)
+     << "\"";
 }
 
 // noise_candidates 数组追加（arch §5.4 混合噪声示例）。
@@ -242,6 +266,76 @@ std::string history_to_json(const std::vector<NoiseMetricsSnapshot>& history) {
   return ss.str();
 }
 
+// Spec6 T1（D-S6.2）：NoiseStore 记录序列化 ───────────────────────────────
+// SQLite 查询结果（MetricsHistoryRecord）-> JSON / CSV。区别于内存 60s ring
+// 的 history_to_json（后者输入 NoiseMetricsSnapshot），此处输入含 sensor_id +
+// 墙钟 timestamp_ms 的持久化记录。
+
+// JSON 数组导出：[{<full snapshot>}, ...]。每条记录含 sensor_id + timestamp_ms
+// 外层字段 + 全部 metrics 字段。
+std::string history_records_to_json_array(
+    const std::vector<MetricsHistoryRecord>& records) {
+  std::stringstream ss;
+  ss << "[";
+  for (size_t i = 0; i < records.size(); ++i) {
+    if (i > 0)
+      ss << ",";
+    const auto& r = records[i];
+    ss << "\n  {\n"
+       << "    \"sensor_id\": " << static_cast<unsigned>(r.sensor_id)
+       << ",\n    \"timestamp_ms\": " << r.timestamp_ms << ",\n";
+    append_snapshot_fields(ss, r.snapshot, "    ",
+                           /*include_denoise_enabled=*/true);
+    ss << ",\n";
+    append_candidates_array(ss, r.snapshot, "    ");
+    ss << "\n  }";
+  }
+  ss << "\n]\n";
+  return ss.str();
+}
+
+// CSV 导出：首行表头 + 每条记录一行。列 = 关键标量字段（UI 绘图常用）。
+std::string history_records_to_csv(
+    const std::vector<MetricsHistoryRecord>& records) {
+  std::stringstream ss;
+  ss << "sensor_id,timestamp_ms,noise_level_dbfs,noise_type,"
+        "noise_type_confidence,estimated_snr_db,spectral_flatness,hum_strength_"
+        "db,denoise_enabled,noise_reduction_db,is_alerting,alert_level,"
+        "plugin_degraded,l3_match_type,l3_similarity\n";
+  for (const auto& r : records) {
+    const auto& s = r.snapshot;
+    ss << static_cast<unsigned>(r.sensor_id) << "," << r.timestamp_ms << ","
+       << s.noise_level_dbfs << "," << noise_type_to_string(s.noise_type) << ","
+       << s.noise_type_confidence << "," << s.estimated_snr_db << ","
+       << s.spectral_flatness << "," << s.hum_strength_db << ","
+       << (s.denoise_enabled ? 1 : 0) << "," << s.noise_reduction_db << ","
+       << (s.is_alerting ? 1 : 0) << "," << alert_level_to_string(s.alert_level)
+       << "," << (s.plugin_degraded ? 1 : 0) << "," << s.l3_match_type << ","
+       << s.l3_similarity << "\n";
+  }
+  return ss.str();
+}
+
+// 解析 ?from=&to= 查询参数为墙钟 ms 时间范围。返回 true 表示两者都提供且合法。
+// 缺省任一 -> 返回 false（调用方据此回退到内存 ring 或全量导出）。
+bool parse_time_range(const httplib::Request& req,
+                      uint64_t& from_ms,
+                      uint64_t& to_ms) {
+  if (!req.has_param("from") || !req.has_param("to"))
+    return false;
+  try {
+    auto f = std::stoll(req.get_param_value("from"));
+    auto t = std::stoll(req.get_param_value("to"));
+    if (f < 0 || t < 0 || f > t)
+      return false;
+    from_ms = static_cast<uint64_t>(f);
+    to_ms = static_cast<uint64_t>(t);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
 // ── 路由注册 ────────────────────────────────────────────────────────────
 // 照搬 daemon/http_server.cpp 模式：std::regex ([0-9]+) + req.matches[1]。
 // 错误处理：sensor 不存在 -> 404 + text/plain；JSON 解析失败 -> 400 +
@@ -278,9 +372,10 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
             res.set_content(metrics_to_json(snapshot), "application/json");
           });
 
-  // GET /api/noise/sensor/([0-9]+)/history - 60s history ring。
-  // 注：?duration & ?interval 查询参数留给 Phase 2（D-S3.5 内存 60s 固定）。
-  svr.Get("/api/noise/sensor/([0-9]+)/history",
+  // GET /api/noise/sensor/([0-9]+)/history/export - 导出历史（D-S6.2）。
+  // ?from=&to=&format=json|csv。format 缺省 json。from/to 缺省 -> 全量（保留
+  // 窗口内）。JSON 返回数组，CSV 返回 text/csv 下载。
+  svr.Get("/api/noise/sensor/([0-9]+)/history/export",
           [&mgr](const Request& req, Response& res) {
             uint8_t id;
             if (!parse_sensor_id(req, res, id))
@@ -291,9 +386,71 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
               res.set_content("sensor not found", "text/plain");
               return;
             }
-            auto hist = mgr.get_history_snapshot(id);
-            res.set_content(history_to_json(hist), "application/json");
+            auto store = mgr.get_noise_store();
+            if (!store) {
+              res.status = 404;
+              res.set_content("history persistence not configured",
+                              "text/plain");
+              return;
+            }
+            uint64_t from_ms = 0, to_ms = 0;
+            bool ranged = parse_time_range(req, from_ms, to_ms);
+            std::vector<MetricsHistoryRecord> records;
+            if (ranged) {
+              records = store->query_metrics(id, from_ms, to_ms);
+            } else {
+              // 全量：宽松窗口覆盖全部保留期。用 INT64_MAX 避免uint64 bind
+              // 溢出 int64（timestamp_ms 列为 int64）。
+              records =
+                  store->query_metrics(id, 0, static_cast<uint64_t>(INT64_MAX));
+            }
+            std::string fmt = "json";
+            if (req.has_param("format"))
+              fmt = req.get_param_value("format");
+            if (fmt == "csv") {
+              res.set_content(history_records_to_csv(records), "text/csv");
+            } else {
+              res.set_content(history_records_to_json_array(records),
+                              "application/json");
+            }
           });
+
+  // GET /api/noise/sensor/([0-9]+)/history - 60s 内存 ring（无参，兼容）
+  // 或 SQLite 时间范围查询（?from=&to=，D-S6.2）。
+  svr.Get("/api/noise/sensor/([0-9]+)/history", [&mgr](const Request& req,
+                                                       Response& res) {
+    uint8_t id;
+    if (!parse_sensor_id(req, res, id))
+      return;
+    SensorInfo info;
+    if (!mgr.get_sensor_info(id, info)) {
+      res.status = 404;
+      res.set_content("sensor not found", "text/plain");
+      return;
+    }
+    uint64_t from_ms = 0, to_ms = 0;
+    if (parse_time_range(req, from_ms, to_ms)) {
+      // 时间范围查询 SQLite（D-S6.2）。
+      auto store = mgr.get_noise_store();
+      if (!store) {
+        res.status = 404;
+        res.set_content("history persistence not configured", "text/plain");
+        return;
+      }
+      auto records = store->query_metrics(id, from_ms, to_ms);
+      // 还原为 NoiseMetricsSnapshot 列表复用 history_to_json 输出格式
+      // （{ "history": [...] }），保持与无参响应结构一致。
+      std::vector<NoiseMetricsSnapshot> snaps;
+      snaps.reserve(records.size());
+      for (auto& r : records)
+        snaps.push_back(std::move(r.snapshot));
+      res.set_content(history_to_json(snaps), "application/json");
+      return;
+    }
+    // 无 from/to -> 60s 内存 ring（向后兼容，D-S6.2）。
+    auto hist = mgr.get_history_snapshot(id);
+    res.set_content(history_to_json(hist), "application/json");
+  });
 
   // GET /api/noise/sensor/([0-9]+) - sensor 信息 + 最新 metrics 快照（§5.4
   // 示例）。
@@ -376,7 +533,8 @@ void register_noise_sensor_routes(httplib::Server& svr, NoiseManager& mgr) {
 namespace {
 
 // 单个模板序列化为 JSON 对象（不含外层 {}，由调用方决定缩进）。
-// 字段：id, label, description, bark_spectrum, wav_file（arch §7.5）。
+// 字段：id, label, description, bark_spectrum, wav_file, feature_type,
+// vggish_embedding（arch §7.5 + Spec5 T3 D-S5.8）。
 std::string template_to_json_object(const Template& t, const char* indent) {
   std::stringstream ss;
   ss << indent << "\"id\": " << t.template_id << ",\n"
@@ -390,7 +548,17 @@ std::string template_to_json_object(const Template& t, const char* indent) {
     ss << t.bark_features[j];
   }
   ss << "],\n"
-     << indent << "\"wav_file\": \"" << escape_json(t.wav_file) << "\"";
+     << indent << "\"wav_file\": \"" << escape_json(t.wav_file) << "\",\n"
+     << indent << "\"feature_type\": \""
+     << (t.feature_type == TemplateFeatureType::Vggish ? "vggish" : "bark")
+     << "\",\n"
+     << indent << "\"vggish_embedding\": [";
+  for (size_t j = 0; j < t.vggish_embedding.size(); ++j) {
+    if (j > 0)
+      ss << ", ";
+    ss << t.vggish_embedding[j];
+  }
+  ss << "]";
   return ss.str();
 }
 

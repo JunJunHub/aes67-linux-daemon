@@ -38,6 +38,7 @@
 #ifdef _USE_NOISE_
 #include "noise/noise_http.hpp"
 #include "noise/ml_classifier.hpp"  // Spec5 T3：L3 VGGish ML 分类
+#include "noise/noise_history.hpp"  // Spec6 T1：NoiseStore SQLite 仓储
 #include "noise/noise_manager.hpp"
 #include "noise/noise_template_db.hpp"
 #include "noise/onnx_session.hpp"  // Spec5 T2：Ort::Env 生命周期装配
@@ -224,6 +225,16 @@ int main(int argc, char* argv[]) {
       }
       noise_manager->set_ml_classifier(ml_classifier);
       noise_manager->set_template_db(noise_template_db);
+      // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。非空
+      // noise_db_path 时创建 NoiseStore + 启动 history housekeeper 线程
+      // （控制线程定时 drain pending -> SQLite）。空 -> 历史持久化禁用。
+      if (!config->get_noise_db_path().empty()) {
+        auto noise_store = std::make_shared<noise::NoiseStore>(
+            config->get_noise_db_path(),
+            config->get_noise_history_retention_hours(),
+            config->get_noise_history_flush_interval_s());
+        noise_manager->set_noise_store(noise_store);
+      }
       // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
       if (!config->get_noise_status_file().empty()) {
         noise_manager->load_status(config->get_noise_status_file());

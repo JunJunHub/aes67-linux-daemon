@@ -3833,3 +3833,242 @@ BOOST_AUTO_TEST_CASE(template_feature_type_roundtrip) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T1：历史持久化 + Spec5 字段暴露（D-S6.1/D-S6.7）──────────────────
+#include "noise/noise_history.hpp"
+
+BOOST_AUTO_TEST_SUITE(spec6_t1_tests)
+
+// 辅助：构造带 NoiseStore 的 NoiseManager + 注册 sensor 路由的 HTTP server。
+// 返回 port。调用方负责 svr.stop() + join svr_thread。
+struct Spec6HistoryEnv {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr;
+  std::shared_ptr<noise::NoiseStore> store;
+  httplib::Server svr;
+  int port{0};
+  std::thread svr_thread;
+  std::string db_path;
+
+  explicit Spec6HistoryEnv(const std::string& path,
+                           uint32_t retention_hours = 24)
+      : mgr(bridge), db_path(path) {
+    std::filesystem::remove(db_path);
+    store = std::make_shared<noise::NoiseStore>(db_path, retention_hours, 1);
+    mgr.set_noise_store(store);
+    noise::register_noise_sensor_routes(svr, mgr);
+    port = svr.bind_to_any_port("127.0.0.1");
+    BOOST_REQUIRE_GT(port, 0);
+    svr_thread = std::thread([this]() { svr.listen_after_bind(); });
+  }
+  ~Spec6HistoryEnv() {
+    svr.stop();
+    if (svr_thread.joinable())
+      svr_thread.join();
+    std::filesystem::remove(db_path);
+    // 清理 SQLite WAL/SHM 临时文件。
+    std::filesystem::remove(db_path + "-wal");
+    std::filesystem::remove(db_path + "-shm");
+  }
+};
+
+// 喂 loud 帧驱动一个 period（on_period_begin/on_frame/on_period_end）。
+static void feed_one_period(noise::NoiseManager& mgr,
+                            uint8_t sink_id,
+                            float amp) {
+  float buf[480];
+  for (int i = 0; i < 480; ++i)
+    buf[i] = amp;
+  mgr.on_period_begin();
+  mgr.on_frame(sink_id, buf, 480);
+  mgr.on_period_end();
+}
+
+// T1: 喂 N period metrics -> SQLite metrics 表有记录。
+BOOST_AUTO_TEST_CASE(history_persists_metrics_to_sqlite) {
+  Spec6HistoryEnv env("test_noise_spec6_persist_metrics.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  for (int i = 0; i < 3; ++i)
+    feed_one_period(env.mgr, 0, 0.1f);
+  // 触发 housekeeper flush + 等待完成。
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_metrics(), 1u);
+}
+
+// T1: 触发 alert -> SQLite alerts 表有记录。
+BOOST_AUTO_TEST_CASE(history_persists_alerts_to_sqlite) {
+  Spec6HistoryEnv env("test_noise_spec6_persist_alerts.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  env.mgr.add_sensor(0, 0, cfg);
+  // loud 帧 -> on_period_end 触发 evaluate_alerts raise。
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_alerts(), 1u);
+}
+
+// T1: GET /history?from=&to= 返回范围内记录（无参 60s ring 兼容）。
+BOOST_AUTO_TEST_CASE(history_query_by_time_range) {
+  Spec6HistoryEnv env("test_noise_spec6_query_range.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  uint64_t t0 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  feed_one_period(env.mgr, 0, 0.1f);
+  uint64_t t1 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  // 时间范围查询 SQLite -> 返回 1 条记录。
+  std::string q =
+      "/api/noise/sensor/0/history?from=" + std::to_string(t0 - 1000) +
+      "&to=" + std::to_string(t1 + 1000);
+  auto r = cli.Get(q.c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"history\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("noise_level_dbfs") != std::string::npos);
+  // 无参 -> 60s ring 兼容（返回 history 键，可能为空数组）。
+  auto r2 = cli.Get("/api/noise/sensor/0/history");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK(r2->body.find("\"history\"") != std::string::npos);
+}
+
+// T1: GET /history/export?format=json 返回 JSON 数组。
+BOOST_AUTO_TEST_CASE(history_export_json) {
+  Spec6HistoryEnv env("test_noise_spec6_export_json.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  feed_one_period(env.mgr, 0, 0.1f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/sensor/0/history/export?format=json");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"timestamp_ms\"") != std::string::npos);
+}
+
+// T1: GET /history/export?format=csv 返回 CSV 下载。
+BOOST_AUTO_TEST_CASE(history_export_csv) {
+  Spec6HistoryEnv env("test_noise_spec6_export_csv.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  feed_one_period(env.mgr, 0, 0.1f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/sensor/0/history/export?format=csv");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms") != std::string::npos);
+  // 至少一行数据（CSV 行尾换行）。
+  BOOST_CHECK(r->body.find("\n") != std::string::npos);
+}
+
+// T1: 过期记录被后台清理（NoiseStore 单元）。
+BOOST_AUTO_TEST_CASE(history_retention_cleanup) {
+  const std::string db = "test_noise_spec6_retention.sqlite";
+  std::filesystem::remove(db);
+  noise::NoiseStore store(db, /*retention_hours=*/1, 1);
+  std::filesystem::remove(db + "-wal");
+  std::filesystem::remove(db + "-shm");
+  uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  // 1 条 2h 前（过期）+ 1 条当前（保留）。
+  std::vector<noise::MetricsHistoryRecord> records(2);
+  records[0].sensor_id = 0;
+  records[0].timestamp_ms = now - 2ULL * 3600 * 1000;
+  records[0].snapshot.noise_level_dbfs = -50.0f;
+  records[1].sensor_id = 0;
+  records[1].timestamp_ms = now;
+  records[1].snapshot.noise_level_dbfs = -40.0f;
+  store.insert_metrics(records);
+  BOOST_CHECK_EQUAL(store.count_metrics(), 2u);
+  // 清理 -> 删过期，保留当前。
+  store.run_retention_cleanup();
+  BOOST_CHECK_EQUAL(store.count_metrics(), 1u);
+  std::filesystem::remove(db);
+  std::filesystem::remove(db + "-wal");
+  std::filesystem::remove(db + "-shm");
+}
+
+// T1（D-S6.7）：/metrics 响应含 l3_match_type / l3_similarity。
+BOOST_AUTO_TEST_CASE(l3_fields_in_metrics_response) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"l3_match_type\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l3_similarity\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+}
+
+// T1（D-S6.7）：/metrics 含 plugin_degraded / alert_level。
+BOOST_AUTO_TEST_CASE(plugin_degraded_alert_level_in_metrics) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"plugin_degraded\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"alert_level\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+}
+
+// T1（D-S6.7）：/template 响应含 feature_type / vggish_embedding。
+BOOST_AUTO_TEST_CASE(feature_type_vggish_in_template_response) {
+  const std::string d = "test_noise_spec6_template_ft";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  std::array<float, 32> bark{};
+  bark[0] = 0.5f;
+  uint32_t id = db.add_template("test_tpl", bark);
+  BOOST_REQUIRE_GT(id, 0u);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get(("/api/noise/template/" + std::to_string(id)).c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"feature_type\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"vggish_embedding\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

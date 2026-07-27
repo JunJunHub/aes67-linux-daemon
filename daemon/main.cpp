@@ -256,6 +256,12 @@ int main(int argc, char* argv[]) {
             else if (status == "unlocked")
               noise_manager->on_ptp_unlocked();
           });
+      // FAKE_DRIVER 时序修复：PcmCaptureService 创建时已收到 PTP "unlocked"
+      // 并启动 fake_capture_loop，但 ptp_status_forward_cb_ 当时未设置，
+      // "locked" 未转发。此处手动补发 on_ptp_locked 使 pipeline 运行。
+#ifdef _USE_FAKE_DRIVER_
+      noise_manager->on_ptp_locked();
+#endif
       // Spec3 Task 8b（C2 修复）：装配 period 生命周期回调。
       // NoiseSessionManagerBridge::on_pcm_frame（PcmCaptureService dispatch
       // 每周期调）经此回调驱动 NoiseManager::on_period_begin/end（ONCE/period，

@@ -127,4 +127,13 @@ if(ENABLE_TESTS AND WITH_NOISE)
     target_compile_definitions(noise-test PRIVATE -D_USE_STREAMER_)
   endif()
   add_test(NAME noise-test COMMAND noise-test -p)
+
+  # noise_bench：降噪质量 + 并发性能基准工具（不依赖 Boost.Test）。
+  add_executable(noise-bench noise/tools/noise_bench.cpp)
+  target_link_libraries(noise-bench PRIVATE
+    "-Wl,--whole-archive"
+    noise
+    "-Wl,--no-whole-archive"
+    Threads::Threads)
+  target_compile_definitions(noise-bench PRIVATE -D_USE_NOISE_)
 endif()

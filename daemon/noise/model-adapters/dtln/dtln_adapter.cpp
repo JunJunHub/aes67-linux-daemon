@@ -302,11 +302,12 @@ size_t DtlnAdapter::process(const float* in,
       up_scratch_.resize(up_cap);
     // up_->process 需连续缓冲；deque 非连续，先拷到连续缓冲。
     // Spec6 T3：预分配成员复用（零 per-frame heap）。
-    if (up_contig_.size() < out_fifo16_.size())
-      up_contig_.resize(out_fifo16_.size());
+    const size_t in16_size = out_fifo16_.size();
+    if (up_contig_.size() < in16_size)
+      up_contig_.resize(in16_size);
     std::copy(out_fifo16_.begin(), out_fifo16_.end(), up_contig_.begin());
     out_fifo16_.clear();
-    const size_t n48 = up_->process(up_contig_.data(), up_contig_.size(),
+    const size_t n48 = up_->process(up_contig_.data(), in16_size,
                                     up_scratch_.data(), up_scratch_.size());
     for (size_t i = 0; i < n48; ++i)
       out_fifo48_.push_back(up_scratch_[i]);
@@ -314,9 +315,6 @@ size_t DtlnAdapter::process(const float* in,
 
   // 5. 输出：取 min(out_fifo48_.size(), n_out_max)，dry_wet 混合 + sanitize。
   // D-S5.5：ONNX 失败时 dry_wet 降为 0.0，输出 = orig（memcpy passthrough）。
-  // in_delay48_ 与 out_fifo48_ 同步 pop（算法延迟对齐），失败 hop 的 silence
-  // 对应位置的 in_delay48_ 样本即原始输入，混合系数归零即等价 memcpy
-  // passthrough。
   const float effective_dry_wet = failed ? 0.0f : dry_wet;
   size_t n_out = std::min(out_fifo48_.size(), n_out_max);
   for (size_t i = 0; i < n_out; ++i) {

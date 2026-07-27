@@ -72,13 +72,21 @@ class Config {
     return noise_template_dir_;
   };
   // Spec5 T2：ONNX 模型目录（dtln/deepfilternet 推导模型路径）。
-  const std::string& get_onnx_model_dir() const {
-    return onnx_model_dir_;
-  };
+  const std::string& get_onnx_model_dir() const { return onnx_model_dir_; };
   // Spec5 T3：VGGish ML 模型文件路径（L3 分类用，区别于 onnx_model_dir 目录）。
   // 空字符串 -> 不加载 VGGish，L3 跳过（L1+L2 仍可用，additive 降级）。
-  const std::string& get_ml_model_path() const {
-    return ml_model_path_;
+  const std::string& get_ml_model_path() const { return ml_model_path_; };
+  // Spec6 T1（D-S6.1/D-S6.3）：噪声历史 SQLite 仓储配置。
+  // noise_db_path：noise.sqlite 路径（空 -> 禁用历史持久化）。
+  // noise_history_retention_hours：历史保留时长（默认 24h，0 =
+  // 测试用立即过期）。 noise_history_flush_interval_s：housekeeper flush
+  // 间隔（默认 10s）。
+  const std::string& get_noise_db_path() const { return noise_db_path_; };
+  uint32_t get_noise_history_retention_hours() const {
+    return noise_history_retention_hours_;
+  };
+  uint32_t get_noise_history_flush_interval_s() const {
+    return noise_history_flush_interval_s_;
   };
   const std::string& get_fake_pcm_source() const { return fake_pcm_source_; };
   const std::string& get_interface_name() const { return interface_name_; };
@@ -181,6 +189,16 @@ class Config {
   void set_ml_model_path(std::string_view ml_model_path) {
     ml_model_path_ = ml_model_path;
   };
+  // Spec6 T1：噪声历史 SQLite 仓储配置 setter。
+  void set_noise_db_path(std::string_view noise_db_path) {
+    noise_db_path_ = noise_db_path;
+  };
+  void set_noise_history_retention_hours(uint32_t hours) {
+    noise_history_retention_hours_ = hours;
+  };
+  void set_noise_history_flush_interval_s(uint32_t seconds) {
+    noise_history_flush_interval_s_ = seconds;
+  };
   void set_fake_pcm_source(std::string_view fake_pcm_source) {
     fake_pcm_source_ = fake_pcm_source;
   };
@@ -238,6 +256,11 @@ class Config {
            lhs.get_noise_template_dir() != rhs.get_noise_template_dir() ||
            lhs.get_onnx_model_dir() != rhs.get_onnx_model_dir() ||
            lhs.get_ml_model_path() != rhs.get_ml_model_path() ||
+           lhs.get_noise_db_path() != rhs.get_noise_db_path() ||
+           lhs.get_noise_history_retention_hours() !=
+               rhs.get_noise_history_retention_hours() ||
+           lhs.get_noise_history_flush_interval_s() !=
+               rhs.get_noise_history_flush_interval_s() ||
            lhs.get_fake_pcm_source() != rhs.get_fake_pcm_source() ||
            lhs.get_interface_name() != rhs.get_interface_name() ||
            lhs.get_mdns_enabled() != rhs.get_mdns_enabled() ||
@@ -279,11 +302,17 @@ class Config {
   // 空字符串禁用对应持久化（save_status / TemplateDB::save 为 no-op）。
   std::string noise_status_file_{"./noise_status.json"};
   std::string noise_template_dir_{"./noise_templates"};
-  // Spec5 T2：ONNX 模型目录（默认 ./noise_models，与 download_models.sh 目标一致）。
+  // Spec5 T2：ONNX 模型目录（默认 ./noise_models，与 download_models.sh
+  // 目标一致）。
   std::string onnx_model_dir_{"./noise_models"};
   // Spec5 T3：VGGish ML 模型文件路径（默认空 -> 不加载，L3 跳过）。
   // 非空时指向 vggish.onnx（如 ./noise_models/vggish.onnx）。
   std::string ml_model_path_{""};
+  // Spec6 T1（D-S6.1/D-S6.3）：噪声历史 SQLite 仓储配置。
+  // noise_db_path 空字符串 -> 禁用历史持久化（/history?from=&to= 返回 404）。
+  std::string noise_db_path_{"./noise.sqlite"};
+  uint32_t noise_history_retention_hours_{24};
+  uint32_t noise_history_flush_interval_s_{10};
   // FAKE_DRIVER 专用：PcmCaptureService::fake_capture_loop 替代 PCM 数据源。
   // 空字符串=内置静音帧。仅 FAKE_DRIVER 生效，真实模式忽略。
   std::string fake_pcm_source_{""};

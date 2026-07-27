@@ -29,7 +29,9 @@ using Complex = std::complex<float>;
 constexpr float kPi = 3.14159265358979323846f;
 
 // 返回 v 是否为 2 的幂。
-inline bool IsPow2(size_t v) { return v > 0 && (v & (v - 1)) == 0; }
+inline bool IsPow2(size_t v) {
+  return v > 0 && (v & (v - 1)) == 0;
+}
 
 // in-place radix-2 迭代 FFT。sign=-1 正变换，sign=+1 逆变换（含 1/N 归一化）。
 // 仅支持 n 为 2 的幂。蝶形方向：标准 Cooley-Tukey 时间抽取。
@@ -123,21 +125,37 @@ inline void Fft(std::vector<Complex>& a, int sign) {
 }
 
 // rfft：实序列 N 点正变换 -> 前 N/2+1 个复频点（对齐 numpy.fft.rfft）。
-// 输入 real 长度 N（任意），输出复 vector 长度 N/2+1。
-inline std::vector<Complex> Rfft(const float* real, size_t n) {
-  std::vector<Complex> a(n);
+// 输入 real 长度 N（任意），输出复频点写入 out（调用者预分配 >= N/2+1 个
+// Complex）。Spec6 T3：输出参数替代返 vector，消除 per-call heap。内部
+// thread_local 暂存（Fft + FftBluestein 的 fa/fb），同线程复用，首次调用后
+// 零分配。
+inline void Rfft(const float* real, size_t n, Complex* out, size_t out_size) {
+  (void)out_size;  // 调用者保证 >= n/2+1
+  thread_local std::vector<Complex> a;
+  if (a.size() < n)
+    a.resize(n);
   for (size_t i = 0; i < n; ++i)
     a[i] = Complex(real[i], 0.0f);
   Fft(a, -1);
-  a.resize(n / 2 + 1);
-  return a;
+  const size_t nbins = n / 2 + 1;
+  for (size_t i = 0; i < nbins; ++i)
+    out[i] = a[i];
 }
 
 // irfft：前 nbins 个复频点 -> N 点实序列（对齐 numpy.fft.irfft）。
 // n_out 为目标时域长度（必须 >= 2*(nbins-1)；通常 n_out=2*(nbins-1)）。
-// 重建 Hermitian 对称谱后逆变换取实部。
-inline std::vector<float> Irfft(const Complex* spec, size_t nbins, size_t n_out) {
-  std::vector<Complex> full(n_out, Complex(0, 0));
+// 重建 Hermitian 对称谱后逆变换取实部。输出写入 out（调用者预分配 >= n_out
+// 个 float）。Spec6 T3：输出参数替代返 vector，消除 per-call heap。
+inline void Irfft(const Complex* spec,
+                  size_t nbins,
+                  size_t n_out,
+                  float* out,
+                  size_t out_size) {
+  (void)out_size;  // 调用者保证 >= n_out
+  thread_local std::vector<Complex> full;
+  if (full.size() < n_out)
+    full.resize(n_out);
+  std::fill(full.begin(), full.begin() + n_out, Complex(0, 0));
   for (size_t k = 0; k < nbins && k < n_out; ++k)
     full[k] = spec[k];
   // Hermitian 对称：full[N-k] = conj(full[k])，k=1..N/2-1。
@@ -146,10 +164,8 @@ inline std::vector<float> Irfft(const Complex* spec, size_t nbins, size_t n_out)
       full[n_out - k] = std::conj(full[k]);
   }
   Fft(full, +1);  // 逆变换含 1/N 归一化
-  std::vector<float> out(n_out);
   for (size_t i = 0; i < n_out; ++i)
     out[i] = full[i].real();
-  return out;
 }
 
 }  // namespace fft

@@ -34,7 +34,8 @@
 
 namespace noise {
 
-class MlClassifier;  // Spec5 T3：L3 ML 分类器（前向声明，.cpp 内 include 全定义）
+class MlClassifier;  // Spec5 T3：L3 ML 分类器（前向声明，.cpp 内 include
+                     // 全定义）
 
 // NoiseType 枚举序列化：C++ CamelCase -> JSON 小写蛇形（arch §5.4）。
 //   Clean -> "clean", Hum50Hz -> "hum_50hz", Hum60Hz -> "hum_60hz", 等。
@@ -90,7 +91,8 @@ void register_noise_template_routes(httplib::Server& svr,
 // Spec3 Task 6：聚合注册 sensor + template 路由（main.cpp 单点调用）。
 // 等价于依次调用 register_noise_sensor_routes +
 // register_noise_template_routes。 模板 DB 由调用方持有并传入（review Important
-// #1：DB 独立参数）。Spec5 T3：ml 为 L3 分类器（可空 -> vggish 录入降级为 400）。
+// #1：DB 独立参数）。Spec5 T3：ml 为 L3 分类器（可空 -> vggish 录入降级为
+// 400）。
 void register_noise_routes(httplib::Server& svr,
                            NoiseManager& mgr,
                            NoiseTemplateDB& template_db,
@@ -105,6 +107,10 @@ void register_noise_routes(httplib::Server& svr,
 //
 // Spec4 Task 4：新增告警查询路由。
 //   GET /api/noise/alerts - 查询告警历史 ring（所有 sensor，arch §C）
+//
+// Spec6 final review M7：告警持久化历史查询/导出路由。
+//   GET /api/noise/alerts/history        - 查询 SQLite 持久化告警历史
+//   GET /api/noise/alerts/history/export - 导出告警历史（JSON/CSV）
 //
 // SSE 使用 cpp-httplib set_chunked_content_provider + text/event-stream。
 // 每订阅者 SseBroadcaster SPSC 队列，capture 线程 on_period_end push，

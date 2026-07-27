@@ -136,6 +136,14 @@ void RefComparator::write_cmp(const float* frames, size_t n) {
   cmp_buf_.write(frames, n);
 }
 
+size_t RefComparator::total_ref_written_for_test() const {
+  return ref_buf_.get_total_written();
+}
+
+size_t RefComparator::total_cmp_written_for_test() const {
+  return cmp_buf_.get_total_written();
+}
+
 std::optional<RefCompareResult> RefComparator::try_process() {
   // 前置：PTP 解锁期间不应调用（由 NoiseManager 控制 comparison_running_），
   // 但防御性检查：任一路 stale -> delay_anomaly + 拒绝处理（风险 20）。

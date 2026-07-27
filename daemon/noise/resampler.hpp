@@ -68,12 +68,10 @@ class Resampler {
   // 无样本丢弃。供测试对齐参考 + max_output_for_input 缓冲上界计算。
   // passthrough 时为 0。
   //
-  // 已知限制（reviewer ⚠️，controller 确认有意延后）：本延迟当前未折入
-  // DenoiseProcessor::algorithmic_latency_samples()。后者是 plugin 级语义
-  // （denoise_plugin.hpp），且其 set_latency_change_cb 暂无外部消费者
-  // （pcm_capture_service.cpp 仅注释提及），pipeline 级（入口 resampler +
-  // plugin）总延迟上报机制尚未完整接线。native==48k 时 resampler 为
-  // passthrough、延迟=0，不影响现有延迟账。延后到延迟上报机制接线时统一处理。
+  // Spec6 T2：本延迟已折入 DenoiseProcessor 上报的总延迟
+  // （switch_plugin 时 latency_change_cb_(plugin_latency +
+  // resampler_latency)）， 消费者 PcmCaptureService
+  // 据此做播放延迟补偿。native==48k 时为 0 （passthrough），不影响现有延迟账。
   size_t output_latency() const { return output_latency_; }
 
   // 给定输入长度，返回输出样本数的保守上界（含滤波器延迟 + 余量），供

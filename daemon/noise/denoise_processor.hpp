@@ -58,13 +58,13 @@ class DenoiseProcessor {
     current_config_.onnx_model_dir = dir;
   }
 
-  // ── Spec5 T2：ONNX 失败降级（D-S5.5）──
+  // ── Spec5 T2 / Spec6 T3：ONNX 失败降级（D-S5.5 + D-S6.5）──
   // process() 内对 plugin 返回的 result->status 计数：连续 kBypass 达阈值
   // kDegradationThreshold(10) -> 升级为 kError + 置 degraded_pending_。
-  // 控制线程 housekeeper（on_period_end 经 NoiseManager）检查 degraded_pending_
-  // -> switch_plugin("passthrough") + 上报告警。RT 仅置原子标志，实际切换在
-  // 控制线程（switch_plugin 含 RcuPtr publish + retire，非 RT 安全；on_period_end
-  // 非每帧紧路径，罕见故障下可接受，旧 slot 经 retire 延迟回收避免 RT 析构）。
+  // Spec6 T3：控制线程 housekeeper（NoiseManager::housekeeper_loop）检查
+  // degraded_pending_ -> switch_plugin("passthrough") + 上报告警。RT 仅置
+  // 原子标志，实际切换在控制线程（switch_plugin 含 RcuPtr publish + retire，
+  // ONNX Session 析构不在 RT 线程）。
   bool degraded_pending() const {
     return degraded_pending_.load(std::memory_order_acquire);
   }
@@ -114,6 +114,11 @@ class DenoiseProcessor {
   using LatencyChangeCb = std::function<void(uint32_t)>;
   // init-only：运行期不再改，避免 std::function 读写竞态。
   void set_latency_change_cb(LatencyChangeCb cb);
+  // Spec6 T2：注入入口 Resampler 延迟（per-sensor，add_sensor 时由
+  // NoiseManager 调用）。switch_plugin 时 cb 上报的总延迟 =
+  // plugin->algorithmic_latency_samples() + resampler_latency_。
+  // native==48k 时 Resampler 为 passthrough、output_latency()=0，不影响。
+  void set_resampler_latency(uint32_t latency) { resampler_latency_ = latency; }
 
  private:
   // 三路输出缓冲（front/back 双缓冲，构造时按 max_frame_
@@ -140,11 +145,18 @@ class DenoiseProcessor {
   };
 
   RcuPtr<PluginSlot> rcu_ptr_;  // 原子插槽 + 静止点回收
-  PluginSlot* pinned_{
-      nullptr};  // 本周期裸指针快照（RT 持有，on_period_end 置空）
+  // Spec6 final review I5：pinned_ 改 std::atomic<PluginSlot*>（消除 barrier
+  // 超时时的 data race UB）。on_period_begin 写（capture 线程），process 读
+  // （per-sink 线程），on_period_end 置空（capture 线程）。retire queue 保证
+  // slot 生命周期，relaxed 序即可（指针值原子性 + retire grace 期足够）。
+  std::atomic<PluginSlot*> pinned_{nullptr};
   RetireQueue<PluginSlot> retire_list_;  // 旧 slot 延迟释放队列
   PluginConfig current_config_;
   LatencyChangeCb latency_change_cb_;  // init-only
+  // Spec6 T2：入口 Resampler 延迟（per-sensor，set_resampler_latency 注入）。
+  // switch_plugin 时加到 plugin latency 上报给 cb 消费者（PcmCaptureService
+  // 做播放延迟补偿）。native==48k 时为 0。
+  uint32_t resampler_latency_{0};
   // 双缓冲（BL1）：front 供 Streamer/SSE 读，back 供 RT process
   // 写，on_period_end swap。
   std::unique_ptr<DenoiseBuffer> front_;
@@ -161,7 +173,7 @@ class DenoiseProcessor {
   static constexpr size_t kConvergenceMargin = 2400;
   // Spec5 T2：连续 kBypass 阈值，达此升级为 kError（D-S5.5）。
   static constexpr size_t kDegradationThreshold = 10;
-  size_t consecutive_bypass_count_{0};  // RT 线程写（process）
+  size_t consecutive_bypass_count_{0};         // RT 线程写（process）
   std::atomic<bool> degraded_pending_{false};  // RT 写，控制线程读+清
 };
 

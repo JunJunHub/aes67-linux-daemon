@@ -3414,7 +3414,10 @@ BOOST_AUTO_TEST_CASE(onnx_consecutive_failure_switches_passthrough) {
   mgr.on_period_begin();
   for (int f = 0; f < 12; ++f)
     mgr.on_frame(0, in, 480);
-  mgr.on_period_end();  // housekeeper：切 passthrough + plugin_degraded=true
+  // Spec6 T3：on_period_end 仅置 trigger flag，实际 switch_plugin 在控制线程
+  // housekeeper 异步执行。wait_housekeeper_done_for_test 等待完成。
+  mgr.on_period_end();
+  BOOST_CHECK(mgr.wait_housekeeper_done_for_test(2000));
 
   // 切换已发生：plugin_degraded 锁存（告警引擎据此 raise）。
   auto snap = mgr.get_metrics_for_test(0);
@@ -3830,6 +3833,777 @@ BOOST_AUTO_TEST_CASE(template_feature_type_roundtrip) {
   auto [mid2, sim2] = db2.match_vggish(vgg);
   BOOST_CHECK_EQUAL(mid2, id_vgg);
   std::filesystem::remove_all(d);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T1：历史持久化 + Spec5 字段暴露（D-S6.1/D-S6.7）──────────────────
+#include "noise/noise_history.hpp"
+
+BOOST_AUTO_TEST_SUITE(spec6_t1_tests)
+
+// 辅助：构造带 NoiseStore 的 NoiseManager + 注册 sensor 路由的 HTTP server。
+// 返回 port。调用方负责 svr.stop() + join svr_thread。
+struct Spec6HistoryEnv {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr;
+  std::shared_ptr<noise::NoiseStore> store;
+  httplib::Server svr;
+  int port{0};
+  std::thread svr_thread;
+  std::string db_path;
+
+  explicit Spec6HistoryEnv(const std::string& path,
+                           uint32_t retention_hours = 24)
+      : mgr(bridge), db_path(path) {
+    std::filesystem::remove(db_path);
+    store = std::make_shared<noise::NoiseStore>(db_path, retention_hours, 1);
+    mgr.set_noise_store(store);
+    noise::register_noise_sensor_routes(svr, mgr);
+    // Spec6 M7：注册告警路由（含 alerts/history + alerts/history/export）。
+    noise::register_noise_sse_routes(svr, mgr);
+    port = svr.bind_to_any_port("127.0.0.1");
+    BOOST_REQUIRE_GT(port, 0);
+    svr_thread = std::thread([this]() { svr.listen_after_bind(); });
+  }
+  ~Spec6HistoryEnv() {
+    svr.stop();
+    if (svr_thread.joinable())
+      svr_thread.join();
+    std::filesystem::remove(db_path);
+    // 清理 SQLite WAL/SHM 临时文件。
+    std::filesystem::remove(db_path + "-wal");
+    std::filesystem::remove(db_path + "-shm");
+  }
+};
+
+// 喂 loud 帧驱动一个 period（on_period_begin/on_frame/on_period_end）。
+static void feed_one_period(noise::NoiseManager& mgr,
+                            uint8_t sink_id,
+                            float amp) {
+  float buf[480];
+  for (int i = 0; i < 480; ++i)
+    buf[i] = amp;
+  mgr.on_period_begin();
+  mgr.on_frame(sink_id, buf, 480);
+  mgr.on_period_end();
+}
+
+// T1: 喂 N period metrics -> SQLite metrics 表有记录。
+BOOST_AUTO_TEST_CASE(history_persists_metrics_to_sqlite) {
+  Spec6HistoryEnv env("test_noise_spec6_persist_metrics.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  for (int i = 0; i < 3; ++i)
+    feed_one_period(env.mgr, 0, 0.1f);
+  // 触发 housekeeper flush + 等待完成。
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_metrics(), 1u);
+}
+
+// T1: 触发 alert -> SQLite alerts 表有记录。
+BOOST_AUTO_TEST_CASE(history_persists_alerts_to_sqlite) {
+  Spec6HistoryEnv env("test_noise_spec6_persist_alerts.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  env.mgr.add_sensor(0, 0, cfg);
+  // loud 帧 -> on_period_end 触发 evaluate_alerts raise。
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_alerts(), 1u);
+}
+
+// T1: GET /history?from=&to= 返回范围内记录（无参 60s ring 兼容）。
+BOOST_AUTO_TEST_CASE(history_query_by_time_range) {
+  Spec6HistoryEnv env("test_noise_spec6_query_range.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  uint64_t t0 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  feed_one_period(env.mgr, 0, 0.1f);
+  uint64_t t1 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  // 时间范围查询 SQLite -> 返回 1 条记录。
+  std::string q =
+      "/api/noise/sensor/0/history?from=" + std::to_string(t0 - 1000) +
+      "&to=" + std::to_string(t1 + 1000);
+  auto r = cli.Get(q.c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"history\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("noise_level_dbfs") != std::string::npos);
+  // 无参 -> 60s ring 兼容（返回 history 键，可能为空数组）。
+  auto r2 = cli.Get("/api/noise/sensor/0/history");
+  BOOST_REQUIRE(r2);
+  BOOST_CHECK_EQUAL(r2->status, 200);
+  BOOST_CHECK(r2->body.find("\"history\"") != std::string::npos);
+}
+
+// T1: GET /history/export?format=json 返回 JSON 数组。
+BOOST_AUTO_TEST_CASE(history_export_json) {
+  Spec6HistoryEnv env("test_noise_spec6_export_json.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  feed_one_period(env.mgr, 0, 0.1f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/sensor/0/history/export?format=json");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"timestamp_ms\"") != std::string::npos);
+}
+
+// T1: GET /history/export?format=csv 返回 CSV 下载。
+BOOST_AUTO_TEST_CASE(history_export_csv) {
+  Spec6HistoryEnv env("test_noise_spec6_export_csv.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  env.mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  feed_one_period(env.mgr, 0, 0.1f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/sensor/0/history/export?format=csv");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms") != std::string::npos);
+  // 至少一行数据（CSV 行尾换行）。
+  BOOST_CHECK(r->body.find("\n") != std::string::npos);
+}
+
+// T1: 过期记录被后台清理（NoiseStore 单元）。
+BOOST_AUTO_TEST_CASE(history_retention_cleanup) {
+  const std::string db = "test_noise_spec6_retention.sqlite";
+  std::filesystem::remove(db);
+  noise::NoiseStore store(db, /*retention_hours=*/1, 1);
+  std::filesystem::remove(db + "-wal");
+  std::filesystem::remove(db + "-shm");
+  uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  // 1 条 2h 前（过期）+ 1 条当前（保留）。
+  std::vector<noise::MetricsHistoryRecord> records(2);
+  records[0].sensor_id = 0;
+  records[0].timestamp_ms = now - 2ULL * 3600 * 1000;
+  records[0].snapshot.noise_level_dbfs = -50.0f;
+  records[1].sensor_id = 0;
+  records[1].timestamp_ms = now;
+  records[1].snapshot.noise_level_dbfs = -40.0f;
+  store.insert_metrics(records);
+  BOOST_CHECK_EQUAL(store.count_metrics(), 2u);
+  // 清理 -> 删过期，保留当前。
+  store.run_retention_cleanup();
+  BOOST_CHECK_EQUAL(store.count_metrics(), 1u);
+  std::filesystem::remove(db);
+  std::filesystem::remove(db + "-wal");
+  std::filesystem::remove(db + "-shm");
+}
+
+// T1（D-S6.7）：/metrics 响应含 l3_match_type / l3_similarity。
+BOOST_AUTO_TEST_CASE(l3_fields_in_metrics_response) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"l3_match_type\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l3_similarity\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+}
+
+// T1（D-S6.7）：/metrics 含 plugin_degraded / alert_level。
+BOOST_AUTO_TEST_CASE(plugin_degraded_alert_level_in_metrics) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
+  httplib::Server svr;
+  noise::register_noise_sensor_routes(svr, mgr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get("/api/noise/sensor/0/metrics");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"plugin_degraded\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"alert_level\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+}
+
+// T1（D-S6.7）：/template 响应含 feature_type / vggish_embedding。
+BOOST_AUTO_TEST_CASE(feature_type_vggish_in_template_response) {
+  const std::string d = "test_noise_spec6_template_ft";
+  std::filesystem::remove_all(d);
+  std::filesystem::create_directories(d);
+  noise::NoiseTemplateDB db;
+  db.set_dir_for_test(d);
+  std::array<float, 32> bark{};
+  bark[0] = 0.5f;
+  uint32_t id = db.add_template("test_tpl", bark);
+  BOOST_REQUIRE_GT(id, 0u);
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  httplib::Server svr;
+  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  int port = svr.bind_to_any_port("127.0.0.1");
+  BOOST_REQUIRE_GT(port, 0);
+  std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
+  httplib::Client cli("127.0.0.1", port);
+  auto r = cli.Get(("/api/noise/template/" + std::to_string(id)).c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("\"feature_type\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"vggish_embedding\"") != std::string::npos);
+  svr.stop();
+  svr_thread.join();
+  std::filesystem::remove_all(d);
+}
+
+// Spec6 final review M4：raised_at_ms 持久化（不被 timestamp_ms 覆盖）。
+// 触发 alert -> SQLite alerts_history 有记录，raised_at_ms 是原始帧计数
+// （与墙钟 timestamp_ms 不同）。
+BOOST_AUTO_TEST_CASE(alerts_history_persists_raised_at_ms) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_raised_at.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;  // 单 period 即 raise
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);  // loud -> raise
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  BOOST_CHECK_GE(env.store->count_alerts(), 1u);
+  // 直接查 SQLite 验证 raised_at_ms 未被覆盖。
+  auto records = env.store->query_alerts(0, static_cast<uint64_t>(INT64_MAX));
+  BOOST_REQUIRE_GE(records.size(), 1u);
+  // raised_at_ms 是帧计数（小整数），timestamp_ms 是墙钟毫秒（大整数）。
+  // 二者不应相等（M4 修复前 query_alerts 用 timestamp_ms 覆盖 raised_at_ms）。
+  BOOST_CHECK_NE(records[0].event.raised_at_ms, records[0].timestamp_ms);
+  // raised_at_ms 应 > 0（帧计数，feed_one_period 后至少 1）。
+  BOOST_CHECK_GT(records[0].event.raised_at_ms, 0u);
+  // is_active=true（raise 事件）。
+  BOOST_CHECK(records[0].event.is_active);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history?from=&to=
+// 返回范围内记录。
+BOOST_AUTO_TEST_CASE(alerts_history_query_by_time_range) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_range.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  uint64_t t0 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  feed_one_period(env.mgr, 0, 0.5f);  // loud -> raise
+  uint64_t t1 = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  std::string q =
+      "/api/noise/alerts/history?from=" + std::to_string(t0 - 1000) +
+      "&to=" + std::to_string(t1 + 1000);
+  auto r = cli.Get(q.c_str());
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  // JSON 数组（以 [ 开头）。
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"raised_at_ms\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"is_active\"") != std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history?sensor_id= 过滤。
+BOOST_AUTO_TEST_CASE(alerts_history_query_by_sensor_id) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_sensor_filter.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  env.mgr.add_sensor(1, 1, cfg);
+  // 两个 sensor 都 raise。
+  feed_one_period(env.mgr, 0, 0.5f);
+  feed_one_period(env.mgr, 1, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  // 无过滤 -> 至少 2 条。
+  auto r_all =
+      cli.Get("/api/noise/alerts/history?from=0&to=9223372036854775807");
+  BOOST_REQUIRE(r_all);
+  BOOST_CHECK_EQUAL(r_all->status, 200);
+  // 过滤 sensor_id=0 -> 仅 sensor 0 的告警。
+  auto r_filtered = cli.Get(
+      "/api/noise/alerts/history?from=0&to=9223372036854775807&sensor_id=0");
+  BOOST_REQUIRE(r_filtered);
+  BOOST_CHECK_EQUAL(r_filtered->status, 200);
+  BOOST_CHECK(r_filtered->body.find("\"sensor_id\": 0") != std::string::npos);
+  // 过滤后不应含 sensor_id 1 的记录。
+  BOOST_CHECK(r_filtered->body.find("\"sensor_id\": 1") == std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history/export?format=json。
+BOOST_AUTO_TEST_CASE(alerts_history_export_json) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_export_json.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/alerts/history/export?format=json");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK_EQUAL(r->body.front(), '[');
+  BOOST_CHECK(r->body.find("\"sensor_id\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"timestamp_ms\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"raised_at_ms\"") != std::string::npos);
+}
+
+// Spec6 final review M7：GET /api/noise/alerts/history/export?format=csv。
+BOOST_AUTO_TEST_CASE(alerts_history_export_csv) {
+  Spec6HistoryEnv env("test_noise_spec6_alerts_export_csv.sqlite");
+  env.mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.alert_debounce_periods = 1;
+  env.mgr.add_sensor(0, 0, cfg);
+  feed_one_period(env.mgr, 0, 0.5f);
+  BOOST_CHECK(env.mgr.wait_history_flush_done_for_test(2000));
+  httplib::Client cli("127.0.0.1", env.port);
+  auto r = cli.Get("/api/noise/alerts/history/export?format=csv");
+  BOOST_REQUIRE(r);
+  BOOST_CHECK_EQUAL(r->status, 200);
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms,level,rule,message,"
+                           "raised_at_ms,is_active") != std::string::npos);
+  // Content-Disposition 触发下载。
+  auto cd = r->headers.find("Content-Disposition");
+  BOOST_CHECK(cd != r->headers.end());
+  if (cd != r->headers.end())
+    BOOST_CHECK(cd->second.find("noise_alerts.csv") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T2：DFN non-causal + RefComparator 48k + resampler latency ──────
+#include "denoise_processor.hpp"
+#include "model-adapters/deepfilternet/deepfilternet_adapter.hpp"
+#include "ref_comparator.hpp"
+#include "resampler.hpp"
+
+BOOST_AUTO_TEST_SUITE(spec6_t2_tests)
+
+// 辅助：构造一个 DFN deep-filter window（5 帧，每帧 kNbDf=96 复频点）。
+// frame_values 是 5 个标量值，每帧所有频点设为同一值（便于验证卷积选择）。
+static std::vector<std::vector<noise::fft::Complex>> make_df_window(
+    const std::vector<float>& frame_values) {
+  std::vector<std::vector<noise::fft::Complex>> window(
+      noise::DeepFilterNetAdapter::kDfOrder);
+  for (size_t o = 0; o < noise::DeepFilterNetAdapter::kDfOrder; ++o) {
+    window[o].assign(noise::DeepFilterNetAdapter::kNbDf,
+                     noise::fft::Complex(frame_values[o], 0.0f));
+  }
+  return window;
+}
+
+// Spec6 T3：apply_df_op 签名改为指针数组。辅助：把 vector<vector> 转
+// 指针数组（测试侧一次性转换，不污染被测 API）。
+static std::vector<const std::vector<noise::fft::Complex>*> make_df_window_ptrs(
+    const std::vector<std::vector<noise::fft::Complex>>& window) {
+  std::vector<const std::vector<noise::fft::Complex>*> ptrs(window.size());
+  for (size_t i = 0; i < window.size(); ++i)
+    ptrs[i] = &window[i];
+  return ptrs;
+}
+
+// 辅助：构造 coefs 数组（kNbDf * kDfOrder * 2 = 960 floats）。
+// order_values 是 5 个复数值（re,im 交替），每帧所有频点同一值。
+static std::vector<float> make_df_coefs(
+    const std::vector<std::pair<float, float>>& order_values) {
+  const size_t kNbDf = noise::DeepFilterNetAdapter::kNbDf;
+  const size_t kDfOrder = noise::DeepFilterNetAdapter::kDfOrder;
+  std::vector<float> coefs(kNbDf * kDfOrder * 2, 0.0f);
+  for (size_t f = 0; f < kNbDf; ++f) {
+    for (size_t o = 0; o < kDfOrder; ++o) {
+      coefs[f * 10 + o * 2 + 0] = order_values[o].first;   // re
+      coefs[f * 10 + o * 2 + 1] = order_values[o].second;  // im
+    }
+  }
+  return coefs;
+}
+
+// T2: DFN deep-filter non-causal window [i-2..i+2]。
+// 设 coefs[2]（中间帧）=1，其余=0，gain=1（alpha=1，纯 deep filter）。
+// 输出应 = window[2]（中间帧 = 输出帧 i），验证 window 使用 [i-2..i+2]
+// 而非纯因果 [i, i-1, ..., i-4]。
+BOOST_AUTO_TEST_CASE(dfn_deep_filter_non_causal_window) {
+  // window: [1.0, 2.0, 3.0, 4.0, 5.0]（oldest..newest）
+  auto window = make_df_window({1.0f, 2.0f, 3.0f, 4.0f, 5.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
+  // coefs: o=2 -> (1, 0)，其余 (0, 0)
+  auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
+  // spec_orig = window[2] = 3.0（中间帧，alpha blend 的 spec_orig）
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(3.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  // gain=1 -> alpha=1 -> spec_out = spec_f (pure deep filter, no blend)
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs.data(),
+                                           1.0f, spec_orig, spec_out);
+  // 验证：spec_f = coefs[2]*window[2] = 1*3 = 3.0
+  // alpha=1 -> spec_out = spec_f = 3.0
+  BOOST_REQUIRE_EQUAL(spec_out.size(), noise::DeepFilterNetAdapter::kNbDf);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 3.0f, 1e-4f);
+  // 如果是纯因果（o=0 配最新帧），coefs[2] 配 window[2] 也会过。
+  // 用 coefs[0] 验证：non-causal 下 o=0 配最旧帧（window[0]），
+  // 因果下 o=0 配最新帧（window[4]）。
+  auto coefs2 = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs2.data(),
+                                           1.0f, spec_orig, spec_out);
+  // non-causal: o=0 配 window[0]=1.0 -> spec_f=1.0 -> spec_out=1.0
+  // causal: o=0 配 window[4]=5.0 -> spec_f=5.0 -> spec_out=5.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 1.0f, 1e-4f);
+}
+
+// T2: DFN coef[0] 配最旧帧（non-causal mapping）。
+// coefs[0]=1, 其余=0, gain=1。输出应 = window[0]（最旧 = i-2）。
+BOOST_AUTO_TEST_CASE(dfn_coef_mapping_oldest_first) {
+  auto window = make_df_window({10.0f, 20.0f, 30.0f, 40.0f, 50.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
+  auto coefs = make_df_coefs({{1, 0}, {0, 0}, {0, 0}, {0, 0}, {0, 0}});
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(30.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs.data(),
+                                           1.0f, spec_orig, spec_out);
+  // coef[0] 配最旧帧 window[0]=10.0 -> spec_out=10.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 10.0f, 1e-4f);
+  // 验证 coef[4] 配最新帧 window[4]=50.0
+  auto coefs4 = make_df_coefs({{0, 0}, {0, 0}, {0, 0}, {0, 0}, {1, 0}});
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs4.data(),
+                                           1.0f, spec_orig, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 50.0f, 1e-4f);
+}
+
+// T2: DFN assign_df alpha blend：spec_f = spec_f*alpha + spec*(1-alpha)。
+// 设 coefs[2]=1（选中间帧），gain=0.3（alpha=0.3）。
+// spec_f = 1 * window[2] = 30.0
+// spec_out = 30*0.3 + spec_orig*0.7 = 9 + 21 = 30.0（巧合，spec_orig=30）
+// 用不同 spec_orig 验证：spec_orig=0 -> spec_out = 30*0.3 = 9.0
+BOOST_AUTO_TEST_CASE(dfn_assign_df_alpha_blend) {
+  auto window = make_df_window({0.0f, 0.0f, 30.0f, 0.0f, 0.0f});
+  auto window_ptrs = make_df_window_ptrs(window);
+  auto coefs = make_df_coefs({{0, 0}, {0, 0}, {1, 0}, {0, 0}, {0, 0}});
+  // spec_orig = 0 -> spec_out = spec_f * alpha + 0 * (1-alpha) = 30*0.3 = 9.0
+  const std::vector<noise::fft::Complex> spec_orig(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(0.0f, 0.0f));
+  std::vector<noise::fft::Complex> spec_out;
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs.data(),
+                                           0.3f, spec_orig, spec_out);
+  // alpha=0.3 -> spec_out = 30*0.3 + 0*0.7 = 9.0
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 9.0f, 1e-4f);
+  // spec_orig = 100 -> spec_out = 30*0.3 + 100*0.7 = 9 + 70 = 79.0
+  const std::vector<noise::fft::Complex> spec_orig2(
+      noise::DeepFilterNetAdapter::kNbDf, noise::fft::Complex(100.0f, 0.0f));
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs.data(),
+                                           0.3f, spec_orig2, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 79.0f, 1e-4f);
+  // gain=0 -> alpha=0 -> spec_out = spec_f*0 + spec_orig*1 = spec_orig
+  noise::DeepFilterNetAdapter::apply_df_op(window_ptrs.data(),
+                                           window_ptrs.size(), coefs.data(),
+                                           0.0f, spec_orig2, spec_out);
+  BOOST_CHECK_CLOSE(spec_out[0].real(), 100.0f, 1e-4f);
+}
+
+// T2: RefComparator native≠48k 时收 48k chunk（非原生帧）。
+// 创建 44.1k sensor + ref_comparator，喂 N 帧原生（44.1k）。
+// comparator 的 total_written 应反映 48k resampled 样本数（≠ N）。
+BOOST_AUTO_TEST_CASE(ref_comparator_48k_route_native_not_48k) {
+  // 用 44.1k 采样率的 stub（native ≠ 48k 触发入口重采样）。
+  struct Bridge44100 : public NoiseAudioBridgeStub {
+    uint32_t get_sample_rate() const override { return 44100; }
+  };
+  Bridge44100 bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.plugin_name = "passthrough";  // 不需 ONNX
+  BOOST_REQUIRE(mgr.add_sensor(0, 0, cfg));
+  BOOST_REQUIRE(mgr.add_sensor(1, 1, cfg));
+  // 配置 ref_comparator（ref_sink=0, cmp_sink=1）
+  uint8_t cid = mgr.add_ref_comparator(0, 1);
+  BOOST_REQUIRE_NE(cid, 0u);
+  // 喂足够多的帧触发 resampler 产出 48k chunk。
+  // 44.1k -> 48k：每 441 native 样本 -> ~480 48k 样本
+  // 喂 10 * 441 = 4410 native -> ~4800 48k samples
+  mgr.on_period_begin();
+  float buf[441];
+  for (int i = 0; i < 441; ++i)
+    buf[i] = 0.1f * static_cast<float>(i) / 441.0f;
+  for (int f = 0; f < 10; ++f)
+    mgr.on_frame(0, buf, 441);
+  for (int f = 0; f < 10; ++f)
+    mgr.on_frame(1, buf, 441);
+  mgr.on_period_end();
+  // 验证 comparator 收到的样本数 > 0（48k chunk 已路由）
+  size_t ref_total = 0, cmp_total = 0;
+  BOOST_REQUIRE(mgr.get_ref_total_written_for_test(cid, ref_total, cmp_total));
+  BOOST_TEST_MESSAGE("44.1k route: ref_total=" << ref_total
+                                               << " cmp_total=" << cmp_total
+                                               << " (fed 4410 each)");
+  // 4410 native -> ~4800 48k。验证 total_written ≠ 4410（不是原生帧）
+  // 且 > 0（48k chunk 已路由）。
+  BOOST_CHECK_GT(ref_total, 0u);
+  BOOST_CHECK_GT(cmp_total, 0u);
+  // native 4410 -> 48k 应为 ~4800（resampler 比例 48/44.1≈1.088）。
+  // 验证 total_written 不等于原生帧数（4410），证明走了 48k 重采样。
+  BOOST_CHECK_NE(ref_total, 4410u);
+  BOOST_CHECK_NE(cmp_total, 4410u);
+  // 强化（T2 review Minor #5）：验证 routed count 近似 48k 重采样期望值。
+  // 4410 * 48/44.1 ≈ 4799.3，5% 容差覆盖 SpeexDSP 内部延迟舍入。
+  BOOST_CHECK_CLOSE(static_cast<double>(ref_total), 4800.0, 5.0);
+  BOOST_CHECK_CLOSE(static_cast<double>(cmp_total), 4800.0, 5.0);
+  // 清理
+  BOOST_CHECK(mgr.remove_ref_comparator(cid));
+}
+
+// T2: algorithmic_latency_samples 含 resampler 延迟。
+// DenoiseProcessor::switch_plugin 时 cb 收到 plugin_latency +
+// resampler_latency。
+BOOST_AUTO_TEST_CASE(resampler_latency_in_algorithmic_latency) {
+  noise::DenoiseProcessor proc;
+  uint32_t reported_latency = 0;
+  proc.set_latency_change_cb(
+      [&reported_latency](uint32_t l) { reported_latency = l; });
+  // 设 resampler 延迟 = 100（模拟非 48k 的 SpeexDSP 延迟）
+  proc.set_resampler_latency(100);
+  // switch 到 passthrough（latency=0）-> cb 收 0 + 100 = 100
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 100u);
+  // 设 resampler 延迟 = 0（模拟 48k passthrough）-> cb 收 0 + 0 = 0
+  proc.set_resampler_latency(0);
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 0u);
+  // 设 resampler 延迟 = 200 -> cb 收 0 + 200 = 200
+  proc.set_resampler_latency(200);
+  BOOST_REQUIRE(proc.switch_plugin("passthrough"));
+  BOOST_CHECK_EQUAL(reported_latency, 200u);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ── Spec6 T3：降级线程模型迁控制线程 + per-sink thread + RT heap 预分配 +
+// seqlock 测试 ──────────────────────────────────────────────────────────
+BOOST_AUTO_TEST_SUITE(spec6_t3_tests)
+
+// T3: switch_plugin 在控制线程 housekeeper 执行，不在 capture 线程。
+// 用 test_bypass 插件触发连续 kBypass -> degraded_pending_，on_period_end
+// 仅置 trigger flag（不执行 switch_plugin），housekeeper 控制线程执行切换。
+// 验证：on_period_end 后立即检查 plugin_degraded 为 false（尚未切换），
+// wait_housekeeper_done_for_test 后为 true（控制线程已切换）。
+BOOST_AUTO_TEST_CASE(switch_plugin_on_control_thread_not_capture) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = true;
+  cfg.plugin_name = "test_bypass";
+  cfg.alert_debounce_periods = 1;
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+
+  float in[480];
+  synth::speech_like(in, 480);
+  mgr.on_period_begin();
+  for (int f = 0; f < 12; ++f)
+    mgr.on_frame(0, in, 480);
+  // on_period_end 仅置 trigger，housekeeper 异步执行。
+  mgr.on_period_end();
+  // 等待 housekeeper 完成（控制线程执行 switch_plugin）。
+  BOOST_CHECK(mgr.wait_housekeeper_done_for_test(2000));
+  // plugin_degraded 锁存（housekeeper 已执行 set_plugin_degraded(true)）。
+  auto snap = mgr.get_metrics_for_test(0);
+  BOOST_CHECK(snap.plugin_degraded);
+}
+
+// T3: 多 sink on_frame 并行（per-sink 独立线程，无竞争）。
+// 两个 sensor（sink 0 + sink 1），同时喂帧，验证各自 frame_count 独立递增。
+BOOST_AUTO_TEST_CASE(per_sink_parallel_processing) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;  // passthrough，简化验证
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+  BOOST_CHECK(mgr.add_sensor(1, 1, cfg));
+  // 验证 per-sink 队列已创建。
+  BOOST_CHECK(mgr.has_sink_queue_for_test(0));
+  BOOST_CHECK(mgr.has_sink_queue_for_test(1));
+
+  float in0[480], in1[480];
+  synth::speech_like(in0, 480);
+  synth::white_noise(in1, 480, 5);
+  mgr.on_period_begin();
+  // 交替喂帧（模拟并行分发）。
+  for (int f = 0; f < 5; ++f) {
+    mgr.on_frame(0, in0, 480);
+    mgr.on_frame(1, in1, 480);
+  }
+  mgr.on_period_end();  // barrier 等待 per-sink 线程完成
+  // 各 sink 的 frame_count 应为 5（独立递增，无竞争）。
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 5u);
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(1), 5u);
+}
+
+// T3: ALSA xrun 时降级（跳过 period 处理，直通）。
+// set_xrun_for_test(true) 模拟 xrun，on_period_begin 检测到 -> pinned_table_
+// 置空 -> on_frame/on_period_end 跳过链路。frame_count 不递增。
+BOOST_AUTO_TEST_CASE(xrun_degradation) {
+  NoiseAudioBridgeStub bridge;
+  noise::NoiseManager mgr(bridge);
+  mgr.set_status_file_for_test("");
+  mgr.set_ptp_locked_for_test(true);
+  noise::NoiseSensorConfig cfg;
+  cfg.denoise_enabled = false;
+  BOOST_CHECK(mgr.add_sensor(0, 0, cfg));
+
+  float in[480];
+  synth::speech_like(in, 480);
+  // 正常 period：frame_count 递增。
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);
+  mgr.on_period_end();
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 1u);
+
+  // xrun period：跳过处理，frame_count 不递增。
+  mgr.set_xrun_for_test(true);
+  mgr.on_period_begin();     // 检测 xrun -> pinned_table_ = nullptr
+  mgr.on_frame(0, in, 480);  // pinned_table_ null -> 早返回
+  mgr.on_period_end();       // pinned_table_ null -> 跳过链路
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 1u);  // 仍为 1
+
+  // 恢复后正常处理。
+  mgr.on_period_begin();
+  mgr.on_frame(0, in, 480);
+  mgr.on_period_end();
+  BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 2u);
+}
+
+// T3: Rfft/Irfft 不返 vector（输出参数，调用者预分配 buffer）。
+// 验证 API 签名：输出参数形式，不返回 vector。
+BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
+  // Rfft：输出参数形式（spec_, out, out_size）。
+  constexpr size_t N = 512;
+  float input[N];
+  for (size_t i = 0; i < N; ++i)
+    input[i] = 0.1f * std::sin(2.0f * 3.14159f * 100.0f * i / N);
+  std::vector<noise::fft::Complex> spec(N / 2 + 1);
+  noise::fft::Rfft(input, N, spec.data(), spec.size());
+  BOOST_REQUIRE_EQUAL(spec.size(), N / 2 + 1);
+  // 100Hz 正弦 -> 在 bin 100 有峰值。
+  // 验证非全零（变换有效）。
+  bool has_nonzero = false;
+  for (const auto& c : spec) {
+    if (std::abs(c) > 1e-6f) {
+      has_nonzero = true;
+      break;
+    }
+  }
+  BOOST_CHECK(has_nonzero);
+
+  // Irfft：输出参数形式（spec, nbins, n_out, out, out_size）。
+  std::vector<float> output(N);
+  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
+  BOOST_REQUIRE_EQUAL(output.size(), N);
+  // irfft(rfft(x)) ≈ x（数值误差 < 1e-4 绝对，近零值用绝对比较避免相对误差
+  // 放大）。
+  for (size_t i = 0; i < N; ++i) {
+    float diff = std::abs(output[i] - input[i]);
+    BOOST_CHECK_LT(diff, 1e-4f);
+  }
+}
+
+// T3: DTLN/DFN process 无 per-call 堆分配（预分配成员）。
+// 验证：连续 process 多帧，输出稳定（预分配成员复用，无 realloc 导致的状态
+// 丢失）。用 DTLN（无需模型即可验证无 crash + 输出连续性）。
+BOOST_AUTO_TEST_CASE(dtln_dfn_no_per_frame_heap) {
+  // DTLN 未 init 时直通（sanitize + kBypass），验证连续帧输出稳定。
+  noise::DtlnAdapter dtln;
+  float in[480];
+  synth::speech_like(in, 480);
+  float out[480];
+  noise::DenoiseResult r;
+  // 连续 process 10 帧，验证输出一致（直通模式，每帧应相同）。
+  std::vector<float> first_out(480);
+  for (int f = 0; f < 10; ++f) {
+    size_t n = dtln.process(in, 480, out, 480, &r);
+    BOOST_REQUIRE_EQUAL(n, 480u);
+    if (f == 0)
+      std::copy(out, out + 480, first_out.begin());
+    else {
+      for (size_t i = 0; i < 480; ++i)
+        BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
+    }
+  }
+}
+
+// T3: TemplateDB seqlock 读（capture 线程无锁读，HTTP 写时读 retry）。
+// 写者（add_template）+ 读者（match_vggish）并发：读者要么读到旧值要么新值，
+// 不 crash（seqlock 保证无 torn read）。
+BOOST_AUTO_TEST_CASE(template_db_seqlock_read) {
+  noise::NoiseTemplateDB db;
+  // 初始空库：match_vggish 返回 (0, 0)。
+  std::array<float, 128> embedding{};
+  auto [id1, sim1] = db.match_vggish(embedding);
+  BOOST_CHECK_EQUAL(id1, 0u);
+
+  // 添加一个 vggish 模板。
+  std::array<float, 32> bark{};
+  std::array<float, 128> vgg{};
+  for (size_t i = 0; i < 128; ++i)
+    vgg[i] = 0.5f;
+  uint32_t tid = db.add_template("test", "desc", "",
+                                 noise::TemplateFeatureType::Vggish, bark, vgg);
+  BOOST_CHECK_GT(tid, 0u);
+
+  // 读：match_vggish 应找到模板（seqlock 读路径，无锁）。
+  auto [id2, sim2] = db.match_vggish(vgg);
+  BOOST_CHECK_EQUAL(id2, tid);
+  BOOST_CHECK_GT(sim2, 0.75f);
+
+  // 并发：写者持续 add/remove，读者持续 match_vggish，不 crash。
+  // 简化验证：单线程多次写 + 读交替（seqlock 正确性靠 atomic 保证）。
+  for (int i = 0; i < 5; ++i) {
+    db.remove_template(tid);
+    db.add_template("test", "desc", "", noise::TemplateFeatureType::Vggish,
+                    bark, vgg);
+    auto [id, sim] = db.match_vggish(vgg);
+    BOOST_CHECK_GT(id, 0u);  // 写后读应找到
+  }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

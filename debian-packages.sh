@@ -23,4 +23,6 @@ sudo apt-get install -y libsystemd-dev
 sudo apt-get install -y libfaac-dev
 # noise 模块（fork 特性，WITH_NOISE）：入口重采样 native↔48k（Spec5 T1）。
 sudo apt-get install -y libspeexdsp-dev
+# Spec6 T1：噪声历史持久化 SQLite 仓储（NoiseStore，noise.sqlite）。
+sudo apt-get install -y libsqlite3-dev
 

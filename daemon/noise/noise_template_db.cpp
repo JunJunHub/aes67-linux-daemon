@@ -75,16 +75,10 @@ uint32_t NoiseTemplateDB::add_template(
     const std::array<float, 32>& bark_features,
     const std::string& description,
     const std::string& wav_file) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  Template t;
-  t.template_id = next_id_++;
-  t.name = name;
-  t.bark_features = bark_features;
-  t.description = description;
-  t.wav_file = wav_file;
-  t.feature_type = TemplateFeatureType::Bark;  // 既有路径默认 bark
-  templates_.push_back(std::move(t));
-  return templates_.back().template_id;
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock（HTTP 控制线程写）。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return add_template_nolock_(name, bark_features, description, wav_file,
+                              TemplateFeatureType::Bark, {});
 }
 
 // Spec5 T3（D-S5.8）：按特征类型添加模板。
@@ -95,14 +89,25 @@ uint32_t NoiseTemplateDB::add_template(
     TemplateFeatureType feature_type,
     const std::array<float, 32>& bark_features,
     const std::array<float, 128>& vggish_embedding) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return add_template_nolock_(name, bark_features, description, wav_file,
+                              feature_type, vggish_embedding);
+}
+
+uint32_t NoiseTemplateDB::add_template_nolock_(
+    const std::string& name,
+    const std::array<float, 32>& bark_features,
+    const std::string& description,
+    const std::string& wav_file,
+    TemplateFeatureType feature_type,
+    const std::array<float, 128>& vggish_embedding) {
   Template t;
   t.template_id = next_id_++;
   t.name = name;
+  t.bark_features = bark_features;
   t.description = description;
   t.wav_file = wav_file;
   t.feature_type = feature_type;
-  t.bark_features = bark_features;
   t.vggish_embedding = vggish_embedding;
   templates_.push_back(std::move(t));
   return templates_.back().template_id;
@@ -110,6 +115,9 @@ uint32_t NoiseTemplateDB::add_template(
 
 std::pair<uint32_t, float> NoiseTemplateDB::match(
     const std::array<float, 32>& bark_spectrum) {
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock（capture 线程读）。
+  // 直接遍历 templates_，无需 snapshot 拷贝（锁保证一致性）。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
   if (templates_.empty()) {
     return {0, 0.0f};
   }
@@ -135,6 +143,8 @@ std::pair<uint32_t, float> NoiseTemplateDB::match(
 // Spec5 T3（D-S5.8）：L3 VGGish 嵌入 kNN 检索。
 std::pair<uint32_t, float> NoiseTemplateDB::match_vggish(
     const std::array<float, 128>& embedding) const {
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock（capture 线程读）。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
   uint32_t best_id = 0;
   float best_sim = 0.0f;
   for (const auto& t : templates_) {
@@ -153,7 +163,11 @@ std::pair<uint32_t, float> NoiseTemplateDB::match_vggish(
 }
 
 bool NoiseTemplateDB::remove_template(uint32_t template_id) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return remove_template_nolock_(template_id);
+}
+
+bool NoiseTemplateDB::remove_template_nolock_(uint32_t template_id) {
   auto it = std::find_if(templates_.begin(), templates_.end(),
                          [template_id](const Template& t) {
                            return t.template_id == template_id;
@@ -167,7 +181,8 @@ bool NoiseTemplateDB::remove_template(uint32_t template_id) {
 
 std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
     const {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex shared_lock。
+  std::shared_lock<std::shared_mutex> rl(mutex_);
   std::vector<std::pair<uint32_t, std::string>> result;
   result.reserve(templates_.size());
   for (const auto& t : templates_) {
@@ -177,7 +192,18 @@ std::vector<std::pair<uint32_t, std::string>> NoiseTemplateDB::list_templates()
 }
 
 const Template* NoiseTemplateDB::get_template(uint32_t template_id) const {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock。
+  // get_template 仅在 HTTP 控制线程调用（非 capture 线程），返回指向
+  // templates_ 内元素的指针。调用方约定在 mutex_ 保护下使用（HTTP 控制线程
+  // 串行调用，无并发写）。shared_mutex unique_lock 保证写者间互斥 +
+  // 排斥读者，返回的指针在锁释放后仍有效（直到下一次写操作 mutate
+  // templates_）。 HTTP 控制线程不与自身并发，故指针安全。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  return get_template_nolock_(template_id);
+}
+
+const Template* NoiseTemplateDB::get_template_nolock_(
+    uint32_t template_id) const {
   for (const auto& t : templates_) {
     if (t.template_id == template_id)
       return &t;
@@ -188,7 +214,8 @@ const Template* NoiseTemplateDB::get_template(uint32_t template_id) const {
 bool NoiseTemplateDB::update_template(uint32_t template_id,
                                       const std::string& new_label,
                                       const std::string& new_description) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  bool ok = false;
   for (auto& t : templates_) {
     if (t.template_id == template_id) {
       // label/description 仅在非空时覆盖（PUT {"label":"x"} 不清空
@@ -199,10 +226,11 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
         t.name = new_label;
       if (!new_description.empty())
         t.description = new_description;
-      return true;
+      ok = true;
+      break;
     }
   }
-  return false;
+  return ok;
 }
 
 // ── Spec3 Task 4 持久化实现（arch §7.5）─────────────────────────────────
@@ -215,7 +243,8 @@ bool NoiseTemplateDB::update_template(uint32_t template_id,
 bool NoiseTemplateDB::save(const std::string& dir) const {
   if (dir.empty())
     return false;
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   // 序列化 templates_ 为 JSON（arch §7.5 格式）：
   // { "templates": [ { "id": 1, "label": "test", "bark_spectrum": [...],
   //                    "description": "...", "wav_file": "...",
@@ -257,17 +286,21 @@ bool NoiseTemplateDB::save(const std::string& dir) const {
   }
   ss << "\n  ]\n}\n";
   std::string path = dir + "/templates.json";
-  return write_atomic(path, ss.str());
+  bool ok = write_atomic(path, ss.str());
+  return ok;
 }
 
 bool NoiseTemplateDB::load(const std::string& dir) {
   if (dir.empty())
     return false;
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   dir_ = dir;
   std::string path = dir + "/templates.json";
-  if (!std::filesystem::exists(path))
+  bool exists = std::filesystem::exists(path);
+  bool ok = false;
+  if (!exists) {
     return false;  // 首次启动，无文件
+  }
   try {
     boost::property_tree::ptree pt;
     std::ifstream in(path, std::ios::binary);
@@ -291,7 +324,7 @@ bool NoiseTemplateDB::load(const std::string& dir) {
       // Spec5 T3（D-S5.8）：feature_type 缺省 = bark（向后兼容）。
       std::string ft = v.second.get<std::string>("feature_type", "bark");
       t.feature_type = (ft == "vggish") ? TemplateFeatureType::Vggish
-                                       : TemplateFeatureType::Bark;
+                                        : TemplateFeatureType::Bark;
       std::array<float, 32> feat{};
       size_t idx = 0;
       BOOST_FOREACH (const boost::property_tree::ptree::value_type& f,
@@ -307,7 +340,8 @@ bool NoiseTemplateDB::load(const std::string& dir) {
         boost::optional<const boost::property_tree::ptree&> vp =
             v.second.get_child_optional("vggish_embedding");
         if (vp) {
-          BOOST_FOREACH (const boost::property_tree::ptree::value_type& f, *vp) {
+          BOOST_FOREACH (const boost::property_tree::ptree::value_type& f,
+                         *vp) {
             if (vi < 128)
               vgg[vi++] = f.second.get_value<float>();
           }
@@ -330,23 +364,25 @@ bool NoiseTemplateDB::load(const std::string& dir) {
       if (t.template_id >= next_id_)
         next_id_ = t.template_id + 1;
     }
-    return true;
+    ok = true;
   } catch (const boost::property_tree::json_parser::json_parser_error& je) {
     std::cerr << "NoiseTemplateDB::load: JSON parse error at line " << je.line()
               << ": " << je.message() << std::endl;
-    return false;
+    ok = false;
   } catch (const std::exception& e) {
     std::cerr << "NoiseTemplateDB::load: error: " << e.what() << std::endl;
-    return false;
+    ok = false;
   }
+  return ok;
 }
 
 // Spec4 T1（D-S4.7）：返回模板 WAV 文件的完整路径。
 // wav_available=false 或 wav_file 为空 -> 返回空串（无 WAV 可用）。
 // 否则返回 dir_ + "/" + wav_file。未找到模板 -> 返回空串。
 std::string NoiseTemplateDB::get_wav_path(uint32_t template_id) const {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
-  const Template* t = get_template(template_id);
+  // HTTP 控制线程调用（非 capture 线程），持 unique_lock 串行化。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
+  const Template* t = get_template_nolock_(template_id);
   if (t == nullptr)
     return "";
   if (!t->wav_available || t->wav_file.empty())
@@ -438,7 +474,9 @@ bool parse_wav_pcm16_48k_mono(const std::string& wav_bytes,
 uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
                                                 const std::string& description,
                                                 const std::string& wav_bytes) {
-  std::lock_guard<std::recursive_mutex> lock(mutex_);
+  // Spec6 T3 review Critical #1：shared_mutex unique_lock + nolock_ 内部实现
+  // （避免重入死锁，同 seqlock 版本约束）。
+  std::unique_lock<std::shared_mutex> wl(mutex_);
   if (dir_.empty())
     return 0;
   // 1. 解析 WAV -> float PCM
@@ -449,8 +487,9 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   // 2. 提取 32 维 Bark（复用 NoiseAnalyzer 的 compute_bark_spectrum，DRY）
   auto bark =
       compute_bark_spectrum(samples.data(), samples.size(), sample_rate);
-  // 3. 先 add_template 占位获取 id（wav_file 后填）
-  uint32_t id = add_template(label, bark, description, "");
+  // 3. 先 add_template 占位获取 id（wav_file 后填）。
+  uint32_t id = add_template_nolock_(label, bark, description, "",
+                                     TemplateFeatureType::Bark, {});
   if (id == 0)
     return 0;
   // 4. 写 WAV 文件到 dir_/template-<id>.wav
@@ -460,8 +499,8 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   std::filesystem::create_directories(dir_, ec);
   std::ofstream out(wav_path, std::ios::binary);
   if (!out.is_open()) {
-    // 写文件失败：回滚内存中的 add_template
-    remove_template(id);
+    // 写文件失败：回滚内存中的 add_template。
+    remove_template_nolock_(id);
     return 0;
   }
   out.write(wav_bytes.data(), static_cast<std::streamsize>(wav_bytes.size()));
@@ -472,17 +511,54 @@ uint32_t NoiseTemplateDB::add_template_from_wav(const std::string& label,
   if (!out.good()) {
     std::error_code rm_ec;
     std::filesystem::remove(wav_path, rm_ec);
-    remove_template(id);
+    remove_template_nolock_(id);
     return 0;
   }
-  // 5. 更新 wav_file 字段 + save
-  if (auto* t = const_cast<Template*>(get_template(id))) {
+  // 5. 更新 wav_file 字段 + save（nolock_ 路径，不调 save() 因会再次加
+  // mutex_ 死锁 -> 直接内联 save 逻辑）。
+  if (auto* t = const_cast<Template*>(get_template_nolock_(id))) {
     t->wav_file = wav_name;
   }
-  if (!save(dir_)) {
-    // save 失败不回滚（内存状态正确，仅持久化失败；调用方应告警）
-    std::cerr << "NoiseTemplateDB::add_template_from_wav: save failed"
-              << std::endl;
+  // 内联 save 序列化（不调 save()，因 save() 会再次加 mutex_）。
+  {
+    std::ostringstream ss;
+    ss << "{\n  \"templates\": [";
+    for (size_t i = 0; i < templates_.size(); ++i) {
+      const auto& t = templates_[i];
+      if (i > 0)
+        ss << ",";
+      ss << "\n    {" << "\n      \"id\": " << t.template_id
+         << ",\n      \"label\": \"" << escape_json(t.name) << "\""
+         << ",\n      \"bark_spectrum\": [";
+      for (size_t j = 0; j < t.bark_features.size(); ++j) {
+        if (j > 0)
+          ss << ", ";
+        ss << t.bark_features[j];
+      }
+      ss << "],\n      \"description\": \"" << escape_json(t.description)
+         << "\",\n      \"wav_file\": \"" << escape_json(t.wav_file) << "\""
+         << ",\n      \"wav_available\": "
+         << (t.wav_available ? "true" : "false")
+         << ",\n      \"feature_type\": \""
+         << (t.feature_type == TemplateFeatureType::Vggish ? "vggish" : "bark")
+         << "\"";
+      if (t.feature_type == TemplateFeatureType::Vggish) {
+        ss << ",\n      \"vggish_embedding\": [";
+        for (size_t j = 0; j < t.vggish_embedding.size(); ++j) {
+          if (j > 0)
+            ss << ", ";
+          ss << t.vggish_embedding[j];
+        }
+        ss << "]";
+      }
+      ss << "\n    }";
+    }
+    ss << "\n  ]\n}\n";
+    std::string path = dir_ + "/templates.json";
+    if (!write_atomic(path, ss.str())) {
+      std::cerr << "NoiseTemplateDB::add_template_from_wav: save failed"
+                << std::endl;
+    }
   }
   return id;
 }

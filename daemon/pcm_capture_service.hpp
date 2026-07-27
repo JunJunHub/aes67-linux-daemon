@@ -59,6 +59,25 @@ class PcmCaptureService
   // Spec3 Task 6b：注册 PTP 状态转发回调。init-only（同
   // set_capture_joined_callback 模式）。
   void set_ptp_status_forward_callback(PtpStatusForwardCallback cb);
+  // Spec6 T2：注册降噪总延迟变更回调（plugin + resampler）。
+  // init-only（同 set_capture_joined_callback 模式）。消费者为
+  // PcmCaptureService 做播放延迟补偿（实际补偿逻辑后续 task 接线，此处先存储 cb
+  // + 可查询）。
+  using LatencyChangeCallback =
+      std::function<void(uint8_t sensor_id, uint32_t latency_samples)>;
+  void set_latency_change_callback(LatencyChangeCallback cb);
+  // Spec6 T2：触发延迟变更回调（由 NoiseManager forward cb 调用）。
+  // 实际播放延迟补偿逻辑后续 task 接线。
+  void on_latency_change(uint8_t sensor_id, uint32_t latency_samples) {
+    if (latency_change_cb_)
+      latency_change_cb_(sensor_id, latency_samples);
+  }
+  // Spec6 T3 review Important #2：注册 xrun 回调。init-only（同
+  // set_capture_joined_callback 模式）。capture_loop 在 snd_pcm_readi 返回
+  // -EPIPE 时调用此回调通知 NoiseManager 置 xrun_pending_，使下一个 period
+  // 跳过降噪处理（直通）。snd_pcm_recover 仍执行以恢复 ALSA 状态。
+  using XrunCallback = std::function<void()>;
+  void set_xrun_callback(XrunCallback cb) { xrun_cb_ = std::move(cb); }
 
   ProviderToken register_provider(FrameProvider provider);
   void unregister_provider(ProviderToken token);
@@ -129,6 +148,10 @@ class PcmCaptureService
   CaptureJoinedCallback capture_joined_cb_;
   // Spec3 Task 6b：PTP 状态转发回调（init-only，运行期不改）。
   PtpStatusForwardCallback ptp_status_forward_cb_;
+  // Spec6 T2：降噪总延迟变更回调（init-only，运行期不改）。
+  LatencyChangeCallback latency_change_cb_;
+  // Spec6 T3 review Important #2：xrun 回调（init-only，运行期不改）。
+  XrunCallback xrun_cb_;
   // 测试用 fake 参数
   uint32_t test_rate_{48000};
   uint8_t test_channels_{2};

@@ -5,13 +5,21 @@
 // HTTP/磁盘持久化)。
 //
 // 决策 1(仅内存 store):本文件不涉及 HTTP API 与磁盘持久化,那是 Spec3 的职责。
-// 线程安全:无 locking - Spec3 的 HTTP 层暴露 DB 时再加 mutex 同步访问。
+// 线程安全：Spec6 T3 review Critical #1 修复——shared_mutex 替代 seqlock。
+// seqlock 对 std::vector<Template>（含 std::string 成员）不安全：vector copy
+// 非 atomic，写者 push_back/erase 期间读者 snapshot = templates_ 拷贝 string
+// 成员是 UB。shared_mutex 正确且简单：读者 shared_lock（~25ns，capture 读多），
+// 写者 unique_lock（HTTP 控制线程写少）。读频率（每 period 模板查找）不足以
+// 证明 lock-free 复杂性。
 #ifndef NOISE_NOISE_TEMPLATE_DB_HPP_
 #define NOISE_NOISE_TEMPLATE_DB_HPP_
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -163,14 +171,26 @@ class NoiseTemplateDB {
   // 匹配阈值(arch §3.3.5 L540):> 0.75 判为该模板的噪声类型。
   static constexpr float kMatchThreshold = 0.75f;
 
-  // Spec5 T3：DB 并发访问保护。原 Spec2/3 DB 仅 HTTP 单线程访问（无锁，
-  // 债务见上文 "Spec3 的 HTTP 层暴露 DB 时再加 mutex"）。L3 在 capture 线程
-  // 读 vggish 模板（match_vggish）而 HTTP 线程增删模板 -> 需互斥。用
-  // recursive_mutex：add_template_from_wav 持锁调 add_template/get_template/
-  // save/remove_template（嵌套同线程重入），plain mutex 会死锁。RT 读
-  // match_vggish 非竞争锁 ~25ns，调用 ~1Hz，占比可忽略（与 NoiseMetrics::
-  // collect 持 metrics_mutex_ 同论证）。
-  mutable std::recursive_mutex mutex_;
+  // Spec6 T3 review Critical #1：shared_mutex 替代 seqlock。
+  // seqlock 对含 std::string 成员的 std::vector<Template> 不安全（vector copy
+  // 非 atomic，写者 mutate 期间读者拷贝 string 是 UB）。shared_mutex 正确：
+  // - HTTP 写（add/remove/update/load/save）：unique_lock（写者间串行 +
+  //   排斥读者）。
+  // - capture 读（match/match_vggish/list_templates）：shared_lock（多读者
+  //   并发，~25ns，不阻塞其他读者）。
+  // - add_template_from_wav 持 unique_lock 调 nolock_ 内部实现（避免重入
+  //   死锁，同 seqlock 版本的约束）。
+  mutable std::shared_mutex mutex_;
+
+  // 内部无锁实现（写者持 unique_lock 后调用）。
+  uint32_t add_template_nolock_(const std::string& name,
+                                const std::array<float, 32>& bark_features,
+                                const std::string& description,
+                                const std::string& wav_file,
+                                TemplateFeatureType feature_type,
+                                const std::array<float, 128>& vggish_embedding);
+  const Template* get_template_nolock_(uint32_t template_id) const;
+  bool remove_template_nolock_(uint32_t template_id);
 };
 
 }  // namespace noise

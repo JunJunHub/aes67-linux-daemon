@@ -14,7 +14,7 @@
 // 模型签名约定（identification §4.1 + 设计 D-S5.8）：
 //   VGGish ONNX 输入 = 0.96s log-mel 频谱图，形状 [1, 96, 64]
 //     （96 帧 × 64 mel bins，@16kHz：frame=25ms/400smp，hop=10ms/160smp，
-//      0.96s=15360smp；mel 125-7500Hz；log1p 功率谱）。
+//      0.96s=15360smp；mel 125-7500Hz；log(mel+0.01) 功率谱）。
 //   输出 = [1, 128] 嵌入向量。
 //   按 index 绑定 I/O（名字随导出版本变化，index 稳定，与 T2 adapter 同）。
 //
@@ -83,10 +83,10 @@ class MlClassifier {
                                                    size_t n) const;
 
   // 嵌入 -> kNN 检索模板库（feature_type=vggish 模板）-> 最佳匹配。
-  //   k=5 最近邻：对所有 vggish 模板算余弦相似度，取最高者；> 阈值返回。
-  //   模型未就绪 / 无 vggish 模板 / 最高相似度 <= 阈值 -> 返回 nullopt。
-  //   RT 安全：Run 异常被 embed 吞掉（返回全零 -> classify 退化为 nullopt）。
-  //   virtual：测试用 fake 子类覆写以计数 classify 调用次数。
+  //   取最高者（k=1 最近邻）：对所有 vggish 模板算余弦相似度，取最高者；>
+  //   阈值返回。 模型未就绪 / 无 vggish 模板 / 最高相似度 <= 阈值 -> 返回
+  //   nullopt。 RT 安全：Run 异常被 embed 吞掉（返回全零 -> classify 退化为
+  //   nullopt）。 virtual：测试用 fake 子类覆写以计数 classify 调用次数。
   virtual std::optional<L3Match> classify(
       const float* pcm48k,
       size_t n,

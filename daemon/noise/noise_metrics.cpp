@@ -77,6 +77,9 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   latest_.is_mixed = analysis.is_mixed;
   // Spec5 T3：主结果来源层（l1/l2/l3）。
   latest_.noise_type_source = analysis.noise_type_source;
+  // Spec6 T1（D-S6.7）：L3 分类结果字段暴露（从 NoiseAnalysisResult 拷入）。
+  latest_.l3_match_type = analysis.l3_match_type;
+  latest_.l3_similarity = analysis.l3_similarity;
   // candidates：vector -> 定长 array（最多 3，避免 per-call 堆分配）。
   size_t n = std::min(analysis.candidates.size(), kMaxNoiseCandidates);
   for (size_t i = 0; i < n; ++i) {

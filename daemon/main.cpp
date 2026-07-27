@@ -38,6 +38,7 @@
 #ifdef _USE_NOISE_
 #include "noise/noise_http.hpp"
 #include "noise/ml_classifier.hpp"  // Spec5 T3：L3 VGGish ML 分类
+#include "noise/noise_history.hpp"  // Spec6 T1：NoiseStore SQLite 仓储
 #include "noise/noise_manager.hpp"
 #include "noise/noise_template_db.hpp"
 #include "noise/onnx_session.hpp"  // Spec5 T2：Ort::Env 生命周期装配
@@ -224,6 +225,16 @@ int main(int argc, char* argv[]) {
       }
       noise_manager->set_ml_classifier(ml_classifier);
       noise_manager->set_template_db(noise_template_db);
+      // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。非空
+      // noise_db_path 时创建 NoiseStore + 启动 history housekeeper 线程
+      // （控制线程定时 drain pending -> SQLite）。空 -> 历史持久化禁用。
+      if (!config->get_noise_db_path().empty()) {
+        auto noise_store = std::make_shared<noise::NoiseStore>(
+            config->get_noise_db_path(),
+            config->get_noise_history_retention_hours(),
+            config->get_noise_history_flush_interval_s());
+        noise_manager->set_noise_store(noise_store);
+      }
       // 持久化加载（arch §7.6 / §7.5）。文件不存在视为首次启动（no-op）。
       if (!config->get_noise_status_file().empty()) {
         noise_manager->load_status(config->get_noise_status_file());
@@ -255,6 +266,24 @@ int main(int argc, char* argv[]) {
       noise_bridge->set_period_lifecycle_callbacks(
           [noise_manager]() { noise_manager->on_period_begin(); },
           [noise_manager]() { noise_manager->on_period_end(); });
+      // Spec6 T2：降噪总延迟变更转发到 PcmCaptureService（消费者，播放延迟
+      // 补偿）。add_sensor 时每个 sensor 的 DenoiseProcessor 经此 forward
+      // 上报 plugin_latency + resampler_latency。实际播放延迟补偿逻辑后续
+      // task 接线（此处先 wire cb + 存储）。
+      pcm_capture->set_latency_change_callback(
+          [](uint8_t /*sensor_id*/, uint32_t /*latency_samples*/) {
+            // TODO: 实际播放延迟补偿（后续 task）
+          });
+      noise_manager->set_latency_forward_callback(
+          [pcm_capture](uint8_t sensor_id, uint32_t latency_samples) {
+            pcm_capture->on_latency_change(sensor_id, latency_samples);
+          });
+      // Spec6 T3 review Important #2：xrun 检测 wiring。PcmCaptureService 在
+      // snd_pcm_readi 返回 -EPIPE 时调用此回调 -> NoiseManager::signal_xrun
+      // 置 xrun_pending_，下一个 period on_period_begin 检测到后跳过降噪
+      // 处理（直通）。snd_pcm_recover 仍执行恢复 ALSA 状态。
+      pcm_capture->set_xrun_callback(
+          [noise_manager]() { noise_manager->signal_xrun(); });
       // init() 须在两个 forward callback 装配之后调用：init() 会直接调
       // on_ptp_status_change（用缓存的 status），此时 forward cb 须已就绪，
       // 否则 FAKE_DRIVER 下唯一的 ""->"unlocked" 触发时 cb 为 null ->

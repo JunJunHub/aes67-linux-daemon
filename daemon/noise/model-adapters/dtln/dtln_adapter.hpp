@@ -139,6 +139,10 @@ class DtlnAdapter : public IDenoisePlugin {
   // 重采样暂存（capture 线程独占复用，避免每帧分配）。
   std::vector<float> down_scratch_;
   std::vector<float> up_scratch_;
+  // Spec6 T3：up_->process 需连续缓冲；deque 非连续，先拷到连续缓冲。
+  // 预分配成员复用（零 per-frame heap）。容量按 max_output_for_input 增长，
+  // 首帧后稳定。
+  std::vector<float> up_contig_;
 
   // FFT 暂存（复用容量，避免每帧 realloc）。
   std::vector<fft::Complex> spec_;  // rfft 输出 257 复频点

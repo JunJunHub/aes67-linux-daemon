@@ -142,6 +142,12 @@ struct NoiseMetricsSnapshot {
   // 在 switch_plugin 到非 passthrough 插件且该插件恢复 kOk 后清。告警引擎
   // 据此评估 plugin_degraded 规则（Warning）。
   bool plugin_degraded{false};
+  // Spec6 T1（D-S6.7）：L3 ML 分类结果字段暴露进快照（从
+  // NoiseAnalysisResult 拷入），供 /metrics + /history 序列化 + NoiseStore
+  // 持久化。l3_match_type 为 L3 匹配到的模板 label（空=未触发/未匹配），
+  // l3_similarity 为余弦相似度 [-1,1]。collect() 从 analysis 拷入。
+  std::string l3_match_type;
+  float l3_similarity{0.0f};
 };
 
 // ④NoiseMetrics - 聚合 ①②③ 链路结果到 NoiseMetricsSnapshot。
@@ -247,10 +253,16 @@ class NoiseMetrics {
   }
 
   // 测试钩子（spec §D 接受此模式）。
-  // 返回 latest_ 副本。Spec2 单线程测试，collect 后读无竞态。无锁。
-  // Spec3 Task 3 HTTP 控制线程读改用 get_snapshot()（持锁）。
-  NoiseMetricsSnapshot snapshot_for_test() const { return latest_; }
+  // Spec6 T3 前 collect 在 capture 线程，测试 main thread collect 后读无竞态，
+  // 故无锁。T3 把 collect 移到 per-sink 线程，测试 main thread 读
+  // latest_/history_ 与 per-sink 写竞争（TSan 报 race at NoiseMetricsSnapshot
+  // 拷贝）。改用持锁路径 （与 get_snapshot/get_history 同），消除 race。
+  NoiseMetricsSnapshot snapshot_for_test() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
+    return latest_;
+  }
   std::deque<NoiseMetricsSnapshot> get_history_for_test() const {
+    std::lock_guard<std::mutex> lock(metrics_mutex_);
     return history_;
   }
   // 设置 history 采样间隔（测试加速，默认 kHistorySampleIntervalFrames=100）。

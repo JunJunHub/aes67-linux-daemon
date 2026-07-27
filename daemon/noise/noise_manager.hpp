@@ -7,6 +7,7 @@
 #define NOISE_NOISE_MANAGER_HPP_
 
 #include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <map>
 #include <memory>
@@ -20,6 +21,7 @@
 #include "noise_analyzer.hpp"
 #include "noise_audio_bridge.hpp"
 #include "noise_detector.hpp"
+#include "noise_history.hpp"  // Spec6 T1：NoiseStore
 #include "noise_metrics.hpp"
 #include "rcu_ptr.hpp"
 #include "ref_comparator.hpp"
@@ -162,6 +164,12 @@ class NoiseManager {
   bool get_ref_overflow_for_test(uint8_t comparator_id,
                                  size_t& ref_overflow,
                                  size_t& cmp_overflow) const;
+  // Spec6 T2 测试钩子：获取 comparator 累计写入样本数（ref/cmp 各一路）。
+  // 用于验证 48k 路由（native≠48k 时 total_written 应反映 48k 样本数，
+  // 非原生帧数）。
+  bool get_ref_total_written_for_test(uint8_t comparator_id,
+                                      size_t& ref_total,
+                                      size_t& cmp_total) const;
   // 测试钩子：comparison 线程是否在运行。
   bool is_comparison_thread_running_for_test() const {
     return comparison_running_.load(std::memory_order_relaxed);
@@ -371,6 +379,56 @@ class NoiseManager {
     template_db_ = db;
   }
 
+  // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。控制线程调用
+  // （main wiring，init 前；非空时启动 history housekeeper 线程）。空
+  // shared_ptr -> 历史持久化禁用，on_period_end 不 push pending，/history
+  // ?from=&to= 返回 404。
+  void set_noise_store(std::shared_ptr<NoiseStore> store);
+  std::shared_ptr<NoiseStore> get_noise_store() const { return noise_store_; }
+  // 测试钩子：同步触发一次 history housekeeper flush（绕过 flush_interval_s
+  // 轮询）。用于测试中确定性验证 pending -> SQLite 落盘。
+  void trigger_history_flush_for_test() {
+    history_trigger_.store(true);
+    history_wake_cv_.notify_one();
+  }
+  // 测试钩子：等待 history housekeeper 完成一次 flush（最多 timeout_ms）。
+  bool wait_history_flush_done_for_test(uint32_t timeout_ms = 2000);
+
+  // Spec6 T3：降级 housekeeper 测试钩子。
+  // trigger：置 trigger flag + cv 唤醒（绕过 100ms 轮询）。
+  // wait_done：等待 housekeeper 完成一次 drain（最多 timeout_ms）。
+  void trigger_housekeeper_for_test() {
+    housekeeper_done_.store(false, std::memory_order_relaxed);
+    housekeeper_trigger_.store(true, std::memory_order_relaxed);
+    housekeeper_wake_cv_.notify_one();
+  }
+  bool wait_housekeeper_done_for_test(uint32_t timeout_ms = 2000);
+
+  // Spec6 T3 review Important #2：生产 xrun 信号入口。PcmCaptureService 在
+  // snd_pcm_readi 返回 -EPIPE 后调用此方法置 xrun_pending_，on_period_begin
+  // 检测到后跳过本 period 处理（直通）。同 set_xrun_for_test 但为生产 API
+  // （语义更清晰：signal 而非 set+clear 对）。
+  void signal_xrun() { xrun_pending_.store(true, std::memory_order_relaxed); }
+
+  // Spec6 T3：xrun 测试钩子。模拟 ALSA xrun（on_pcm_frame 检测到时跳过本
+  // period 处理，直通）。
+  void set_xrun_for_test(bool xrun) { xrun_pending_.store(xrun); }
+  bool is_xrun_pending_for_test() const { return xrun_pending_.load(); }
+
+  // Spec6 T3：per-sink 线程测试钩子。返回 per-sink 队列是否存在。
+  bool has_sink_queue_for_test(uint8_t sink_id) const;
+
+  // Spec6 T2：注册降噪总延迟变更转发回调（plugin + resampler）。
+  // init-only（同 set_ptp_status_forward_callback 模式）。消费者为
+  // PcmCaptureService 做播放延迟补偿。add_sensor 时每个 sensor 的
+  // DenoiseProcessor::set_latency_change_cb 经此 forward 到外部消费者。
+  // cb 为空时（默认）不上报（测试默认路径）。
+  using LatencyForwardCallback =
+      std::function<void(uint8_t sensor_id, uint32_t latency_samples)>;
+  void set_latency_forward_callback(LatencyForwardCallback cb) {
+    latency_forward_cb_ = std::move(cb);
+  }
+
  private:
   // 原子插槽 + 静止点回收。构造即 publish 空表，load() 永不为空（Spec1
   // 约束3）。
@@ -378,13 +436,8 @@ class NoiseManager {
   RetireQueue<const SensorTable> retire_queue_;
   // period 顶部 load 的快照（裸指针），整 period 内复用，on_period_end 置空。
   const SensorTable* pinned_table_{nullptr};
-  // Spec5 T1：重采样 process() 输出暂存（capture
-  // 线程独占，单线程复用，无并发）。 per-sensor 复用同一暂存（native rate
-  // 全局一致，所有 sensor 重采样输出上界 相同）。首次 on_frame 按
-  // max_output_for_input(kPipelineFrame) 惰性 resize，
-  // 之后稳定不重新分配（warmup 后零分配）。不用 shared_ptr：属 NoiseManager 非
-  // SensorTable，不经 COW 复制。
-  std::vector<float> resample_scratch_;
+  // Spec6 T3：resample_scratch_ 移至 per-sink SinkQueue（per-sink 独立 buffer，
+  // 无共享可变状态）。同步 fallback 路径用 thread_local。
   NoiseAudioBridge& bridge_;  // #6: held for Task 2-3 FrameProvider
                               // registration (Spec3 wiring)
   std::mutex
@@ -414,6 +467,10 @@ class NoiseManager {
   // 共享同一实例。
   std::shared_ptr<MlClassifier> ml_classifier_;
   std::shared_ptr<NoiseTemplateDB> template_db_;
+  // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
+  std::shared_ptr<NoiseStore> noise_store_;
+  // Spec6 T2：降噪总延迟变更转发回调（init-only，运行期不改）。
+  LatencyForwardCallback latency_forward_cb_;
   // Spec4 T1（D-S4.7）：save_status 并发写安全 mutex。
   // 序列化持久化写路径，防止并发 save_status（control 线程"变更即写" +
   // 直接 save_status 调用）竞争同一 tmp 文件导致损坏。仅保护持久化写路径，
@@ -498,6 +555,57 @@ class NoiseManager {
   // 非阻塞：SseBroadcaster::push 内部 try_lock + drop-oldest（风险 9/17）。
   void push_sse_events(const SensorTable& table);
 
+  // ── Spec6 T1：NoiseStore 历史持久化（D-S6.1）──
+  // capture 线程（on_period_end）只 push 到内存 pending 队列（mutex 短临界区，
+  // 不接触 SQLite，避免 RT I/O）。history housekeeper 控制线程定时 drain
+  // pending
+  // -> NoiseStore 批量 insert + 定时 retention cleanup。线程模型与 comparison
+  // 线程同模式（SCHED_OTHER，stop_ 标志 + join）。
+  std::deque<MetricsHistoryRecord> pending_metrics_;
+  std::deque<AlertHistoryRecord> pending_alerts_;
+  mutable std::mutex history_mutex_;  // 保护 pending_metrics_/pending_alerts_
+  std::thread history_thread_;
+  std::atomic<bool> history_stop_{false};
+  std::atomic<bool> history_trigger_{false};  // 测试钩子：立即 flush
+  std::atomic<bool> history_done_{false};  // 测试钩子：flush 完成信号
+  // cv：trigger/stop 立即唤醒 housekeeper（否则 sleep flush_interval_s）。
+  std::mutex history_wake_mutex_;
+  std::condition_variable history_wake_cv_;
+  uint32_t history_flush_interval_s_{10};
+  uint32_t history_cycle_{0};  // retention cleanup 计数（每 6 cycle 一次）
+  // pending 队列容量上界（防止 housekeeper 滞后时无限增长；超出丢弃最旧）。
+  static constexpr size_t kMaxPendingMetrics = 6000;  // ~100 sensors * 60
+  static constexpr size_t kMaxPendingAlerts = 6000;
+  void history_loop();
+  void start_history_thread();
+  void stop_history_thread();
+  // on_period_end 末尾调用（ADDITIVE，在 advance_epoch 前）：
+  // push 各 sensor 的 metrics 快照 + 本 period 产出的 alert 事件到 pending。
+  void push_history_pending(
+      const SensorTable& table,
+      uint64_t now_ms,
+      const std::vector<AlertHistoryEntry>& alert_entries);
+
+  // ── Spec6 T3：降级 housekeeper 控制线程（D-S6.5）──
+  // on_period_end（capture 线程）只置 degraded_pending_ 标志（atomic），实际
+  // switch_plugin("passthrough") + drain_retire 在本 housekeeper 控制线程
+  // 执行。消除 capture 线程 Ort::Session teardown 风险（Spec5 T2 review
+  // Important #2）。线程模型同
+  // comparison_thread_/history_thread_：SCHED_OTHER， stop_ + trigger_ +
+  // cv，析构 join。 trigger_：on_period_end 检测到 degraded_pending_ 时置位 ->
+  // cv 唤醒 housekeeper 立即处理（不等轮询）。非触发时 ~100ms 轮询（兜底，避免
+  // flag 置位与 cv notify 竞态丢失）。
+  std::thread housekeeper_thread_;
+  std::mutex housekeeper_thread_mutex_;
+  std::atomic<bool> housekeeper_stop_{false};
+  std::atomic<bool> housekeeper_trigger_{false};  // on_period_end 置位
+  std::atomic<bool> housekeeper_done_{false};     // 测试钩子：完成信号
+  std::mutex housekeeper_wake_mutex_;
+  std::condition_variable housekeeper_wake_cv_;
+  void housekeeper_loop();
+  void start_housekeeper_thread();
+  void stop_housekeeper_thread();
+
   // Spec5 T1：①②③④ 链路体（参数化 pcm/n）。原 on_frame 内联的 ①②③④
   // 抽出为方法，使 on_frame 可对「48k 直通帧」与「重采样后的 48k 480-样本
   // chunk」复用同一链路（一个 on_frame 经重采样 FIFO 可能 emit 0/1/N 个
@@ -506,6 +614,51 @@ class NoiseManager {
   void process_pipeline_chunk(const SensorContext& ctx,
                               const float* pcm,
                               size_t n);
+
+  // ── Spec6 T3：per-sink 独立线程（D-S6.4）──
+  // on_frame 分发到 per-sink 队列，每 sink 独立线程处理（sink≤64，per-sink
+  // 线程简单，无共享可变状态）。on_period_end 等待所有 per-sink 线程完成
+  // 当前 period 的帧处理（barrier），再 swap/advance_epoch。
+  // 线程模型：每 sink 一个 std::thread，SCHED_OTHER（非 RT，但 on_frame 内
+  // 的 ①②③④ 链路本身非硬 RT；capture 线程仅做 S16->float + demux + dispatch）。
+  // per-sink queue 为 mutex + cv 保护的单帧 FIFO（每 period 帧数少，~1-2 帧）。
+  struct SinkQueueEntry {
+    std::vector<float> frames;  // 拷贝（per-sink 独立 buffer，无共享）
+    size_t frame_size{0};
+  };
+  struct SinkQueue {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<SinkQueueEntry> pending;
+    std::atomic<bool> stop{false};
+    std::atomic<size_t> processed_count{0};  // period barrier 用
+    // Spec6 T3 review Important #7：atomic 化（barrier 读无锁，写在
+    // on_frame 持 queue->mutex）。当前单 capture 线程设计下本安全，
+    // atomic 使不变式显式且防未来回归。
+    std::atomic<size_t> expected_count{0};  // 本 period 预期帧数
+    std::thread thread;
+    // per-sink resample scratch（per-sink 独立，无共享可变状态）。
+    std::vector<float> resample_scratch;
+    // per-sink on_frame 处理（独立线程，无共享可变状态）。
+    void run(NoiseManager* mgr, uint8_t sink_id);
+  };
+  std::map<uint8_t, std::shared_ptr<SinkQueue>> sink_queues_;
+  std::mutex
+      sink_queues_mutex_;  // 保护 sink_queues_ map（add/remove vs dispatch）
+  void start_sink_thread_(uint8_t sink_id);
+  void stop_sink_thread_(uint8_t sink_id);
+  void stop_all_sink_threads_();
+  // on_frame 实际处理（per-sink 线程调用，原 on_frame 逻辑移此）。
+  // resample_scratch 为 per-sink 独立 buffer（无共享可变状态）。
+  void on_frame_impl_(uint8_t sink_id,
+                      const float* frames,
+                      size_t frame_size,
+                      std::vector<float>& resample_scratch);
+
+  // Spec6 T3：xrun 降级。capture 线程检测 ALSA xrun（PcmCaptureService
+  // readi 返回 -EPIPE 经 recover 后置 flag），on_pcm_frame 检查 flag -> 跳过
+  // 本 period 处理（直通，不喂 ①②③④）。测试钩子 set_xrun_for_test 模拟。
+  std::atomic<bool> xrun_pending_{false};
 };
 
 }  // namespace noise

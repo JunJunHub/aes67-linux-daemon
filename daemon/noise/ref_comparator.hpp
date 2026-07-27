@@ -83,6 +83,10 @@ class RefComparator {
   // 测试钩子：设置 stale 阈值（默认 500ms）。
   void set_stale_threshold_for_test(std::chrono::milliseconds threshold);
 
+  // Spec6 T2 测试钩子：返回各路累计写入样本数（用于验证 48k 路由）。
+  size_t total_ref_written_for_test() const;
+  size_t total_cmp_written_for_test() const;
+
   // 常量：默认环形缓冲容量（2×period ~128ms @48k，风险 12）。
   static constexpr size_t kDefaultRingCapacity = 6144;
   // 最少处理样本数（NLMS 256 taps 需足够收敛数据）。

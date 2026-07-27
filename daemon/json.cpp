@@ -108,8 +108,13 @@ std::string config_to_json(const Config& config) {
      << escape_json(config.get_noise_template_dir()) << "\""
      << ",\n  \"onnx_model_dir\": \""
      << escape_json(config.get_onnx_model_dir()) << "\""
-     << ",\n  \"ml_model_path\": \""
-     << escape_json(config.get_ml_model_path()) << "\""
+     << ",\n  \"ml_model_path\": \"" << escape_json(config.get_ml_model_path())
+     << "\"" << ",\n  \"noise_db_path\": \""
+     << escape_json(config.get_noise_db_path()) << "\""
+     << ",\n  \"noise_history_retention_hours\": "
+     << config.get_noise_history_retention_hours()
+     << ",\n  \"noise_history_flush_interval_s\": "
+     << config.get_noise_history_flush_interval_s()
      << ",\n  \"fake_pcm_source\": \""
      << escape_json(config.get_fake_pcm_source()) << "\""
      << ",\n  \"interface_name\": \""
@@ -387,6 +392,13 @@ Config json_to_config_(std::istream& js, Config& config) {
       } else if (key == "ml_model_path") {
         config.set_ml_model_path(
             remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "noise_db_path") {
+        config.set_noise_db_path(
+            remove_undesired_chars(val.get_value<std::string>()));
+      } else if (key == "noise_history_retention_hours") {
+        config.set_noise_history_retention_hours(val.get_value<uint32_t>());
+      } else if (key == "noise_history_flush_interval_s") {
+        config.set_noise_history_flush_interval_s(val.get_value<uint32_t>());
       } else if (key == "fake_pcm_source") {
         config.set_fake_pcm_source(
             remove_undesired_chars(val.get_value<std::string>()));

@@ -236,6 +236,21 @@ class NoiseManager {
   //   返回的 DenoiseOutput* 在下次 on_period_end swap 前有效（arch §11
   //   风险23）。
   const DenoiseOutput* get_denoise_output(uint8_t sink_id) const;
+  const DenoiseOutput* get_current_denoise_output(uint8_t sink_id) const;
+
+  // Per-sensor PCM ring buffer（流式 AAC 编码用）。
+  // on_frame_impl_ 写入（capture 线程），stream_aac_encode 读取（HTTP 线程），
+  // 互斥锁保护，无数据撕裂。容量 2s（96000 样本），溢出时丢弃最旧。
+  struct PcmRing {
+    std::mutex mutex;
+    std::deque<float> original, denoised, noise;
+  };
+  std::shared_ptr<PcmRing> get_pcm_ring(uint8_t sensor_id);
+  // 从 ring 取最多 max_n 个样本，返回实际取到的数量。
+  size_t drain_pcm_ring(std::shared_ptr<PcmRing> ring,
+                        int channel,
+                        float* out,
+                        size_t max_n);
 
   // ── Spec4 Task 3：SSE broadcaster 访问器（HTTP SSE 路由用）──
   // NoiseManager 持有 per-sensor 的 metrics_broadcaster_ + pcm_broadcaster_
@@ -542,6 +557,9 @@ class NoiseManager {
     std::shared_ptr<SseBroadcaster> pcm_noise;
   };
   std::map<uint8_t, SensorBroadcasters> sse_broadcasters_;
+  // Per-sensor PCM ring buffer（流式 AAC 编码用）。
+  std::map<uint8_t, std::shared_ptr<PcmRing>> pcm_rings_;
+  std::mutex pcm_rings_mutex_;
   // 保护 sse_broadcasters_ map 的并发访问：add_sensor/remove_sensor
   // （控制线程写）vs push_sse_events（capture 线程读）vs get_*_broadcaster
   // （HTTP 线程读）。与 ref_mutex_ 同模式：短临界区（map lookup + 指针

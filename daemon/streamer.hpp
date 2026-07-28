@@ -100,6 +100,23 @@ class Streamer {
   std::error_code encode_denoise_aac(uint8_t sink_id,
                                      bool denoised,
                                      std::string& out);
+  // 原始路 AAC 编码 - 取 DenoiseOutput.original（与 encode_denoise_aac 同模式，
+  // src = dout->original）。FAKE_DRIVER 下原始 ALSA capture 不可用，此方法
+  // 从 DenoiseOutput.original 获取原始 PCM -> faac 编码 ADTS AAC。
+  std::error_code encode_original_aac(uint8_t sink_id, std::string& out);
+
+  // 流式 AAC 编码：持久 faac 编码器 + 累积缓冲（解决 480 样本/帧 vs faac
+  // 1024 样本/帧不匹配问题）。channel: 0=original, 1=denoised, 2=noise。
+  struct AacStreamState;
+  std::shared_ptr<AacStreamState> create_aac_stream_state();
+  // 从 DenoiseOutput 取一帧（480 样本）追加到累积缓冲，够 1024 时编码 AAC。
+  // 内部用指针检测跳过重复帧（content_provider 回调频率 > period 更新频率）。
+  // 返回 error_code{} 且 out 非空 = 有 AAC 数据；{} 且 out 空 = 不足/重复帧；
+  // 非 {} = 错误（sensor 不存在等）。
+  std::error_code stream_aac_encode(std::shared_ptr<AacStreamState> state,
+                                    uint8_t sink_id,
+                                    int channel,
+                                    std::string& out);
   // Spec4 T2：PCM 直通 - 三路 ?format=pcm 分支（arch §5.2 + D-S4.6）。
   // 跳过 faac，直接返回 16-bit signed LE interleaved PCM（float [-1,1] ->
   // int16_t，与 encode_denoise_aac 的 float->S16 一致：v * 32767.0f + clamp）。

@@ -794,7 +794,156 @@ std::error_code Streamer::encode_denoise_aac(uint8_t sink_id,
   return std::error_code{};
 }
 
-// Spec4 T2：PCM 直通 - float [-1,1] -> S16 LE（arch §5.2 + D-S4.6）。
+// 原始路 AAC - 取 DenoiseOutput.original（与 encode_denoise_aac 同逻辑）。
+std::error_code Streamer::encode_original_aac(uint8_t sink_id,
+                                              std::string& out) {
+  if (!noise_manager_) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const noise::DenoiseOutput* dout =
+      noise_manager_->get_denoise_output(sink_id);
+  if (dout == nullptr || dout->frame_count == 0 || dout->original == nullptr) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  const float* src = dout->original;
+
+  size_t n = dout->frame_count;
+  std::vector<int16_t> s16(n);
+  for (size_t i = 0; i < n; ++i) {
+    float v = src[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    s16[i] = static_cast<int16_t>(v * 32767.0f);
+  }
+
+  unsigned long in_samples = 0;
+  unsigned long out_buf_size = 0;
+  faacEncHandle enc =
+      faacEncOpen(config_->get_sample_rate(), 1, &in_samples, &out_buf_size);
+  if (!enc) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  faacEncConfigurationPtr faac_cfg = faacEncGetCurrentConfiguration(enc);
+  if (faac_cfg) {
+    faac_cfg->aacObjectType = LOW;
+    faac_cfg->mpegVersion = MPEG4;
+    faac_cfg->useTns = 0;
+    faac_cfg->useLfe = 0;
+    faac_cfg->shortctl = SHORTCTL_NORMAL;
+    faac_cfg->allowMidside = 2;
+    faac_cfg->bitRate = 64000;
+    faac_cfg->outputFormat = 1;  // ADTS
+    faac_cfg->inputFormat = FAAC_INPUT_16BIT;
+    faacEncSetConfiguration(enc, faac_cfg);
+  }
+
+  std::vector<int16_t> buf(in_samples, 0);
+  size_t copy_n = std::min(n, static_cast<size_t>(in_samples));
+  std::copy(s16.data(), s16.data() + copy_n, buf.data());
+
+  std::vector<uint8_t> out_buf(out_buf_size);
+  int ret = 0;
+  for (int i = 0; i < 5 && ret <= 0; ++i) {
+    ret = faacEncEncode(enc, reinterpret_cast<int32_t*>(buf.data()), in_samples,
+                        out_buf.data(), out_buf_size);
+  }
+  faacEncClose(enc);
+
+  if (ret < 0) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  out.assign(reinterpret_cast<const char*>(out_buf.data()), ret);
+  return std::error_code{};
+}
+
+// ── 流式 AAC 编码（持久 faac + 累积缓冲）──────────────────────────────
+// 解决 encode_*_aac 每次创建临时 faac 的问题：faac 需 1024 样本/帧，
+// DenoiseOutput 仅 480 样本，补零导致每帧 47% 有效 = 断续怪声。
+// 流式方案：持久 faac 编码器 + 累积 480 样本帧到 1024 后编码。
+struct Streamer::AacStreamState {
+  faacEncHandle enc{nullptr};
+  unsigned long in_samples{0};
+  std::vector<int16_t> accum;
+  std::vector<uint8_t> out_buf;
+  const void* last_src_ptr{nullptr};  // 重复帧检测（src 指针，swap 后变化）
+  explicit AacStreamState(uint32_t sr) {
+    unsigned long out_buf_size = 0;
+    enc = faacEncOpen(sr, 1, &in_samples, &out_buf_size);
+    if (!enc)
+      return;
+    auto cfg = faacEncGetCurrentConfiguration(enc);
+    if (cfg) {
+      cfg->aacObjectType = LOW;
+      cfg->mpegVersion = MPEG4;
+      cfg->useTns = 0;
+      cfg->useLfe = 0;
+      cfg->shortctl = SHORTCTL_NORMAL;
+      cfg->allowMidside = 2;
+      cfg->bitRate = 64000;
+      cfg->outputFormat = 1;  // ADTS
+      cfg->inputFormat = FAAC_INPUT_16BIT;
+      faacEncSetConfiguration(enc, cfg);
+    }
+    out_buf.resize(out_buf_size);
+  }
+  ~AacStreamState() {
+    if (enc)
+      faacEncClose(enc);
+  }
+};
+
+std::shared_ptr<Streamer::AacStreamState> Streamer::create_aac_stream_state() {
+  return std::make_shared<AacStreamState>(config_->get_sample_rate());
+}
+
+std::error_code Streamer::stream_aac_encode(
+    std::shared_ptr<AacStreamState> state,
+    uint8_t sink_id,
+    int channel,
+    std::string& out) {
+  if (!state || !state->enc || !noise_manager_) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  // 从 PCM ring buffer 读取（on_frame_impl_ 写入，互斥锁保护，无数据撕裂）。
+  auto ring = noise_manager_->get_pcm_ring(sink_id);
+  if (!ring) {
+    return std::error_code{DaemonErrc::streamer_not_running};
+  }
+  // 每次取 480 样本（一个 on_frame 的量），追加到 faac 累积缓冲。
+  float buf[480];
+  size_t n = noise_manager_->drain_pcm_ring(ring, channel, buf, 480);
+  if (n == 0) {
+    out.clear();
+    return std::error_code{};  // 无新数据
+  }
+  // float [-1,1] -> S16，追加到累积缓冲
+  size_t old_size = state->accum.size();
+  state->accum.resize(old_size + n);
+  for (size_t i = 0; i < n; ++i) {
+    float v = buf[i];
+    if (v > 1.0f)
+      v = 1.0f;
+    if (v < -1.0f)
+      v = -1.0f;
+    state->accum[old_size + i] = static_cast<int16_t>(v * 32767.0f);
+  }
+  // 累积够 in_samples 后编码
+  out.clear();
+  while (state->accum.size() >= state->in_samples) {
+    int ret = faacEncEncode(
+        state->enc, reinterpret_cast<int32_t*>(state->accum.data()),
+        state->in_samples, state->out_buf.data(), state->out_buf.size());
+    state->accum.erase(state->accum.begin(),
+                       state->accum.begin() + state->in_samples);
+    if (ret > 0) {
+      out.append(reinterpret_cast<const char*>(state->out_buf.data()), ret);
+    }
+  }
+  return std::error_code{};
+}
+
 // 与 encode_denoise_aac 的 float->S16 转换一致（v * 32767.0f + clamp [-1,1]）。
 // 输出 16-bit signed LE interleaved，skip faac 编码。
 static void float_to_s16_le(const float* src, size_t n, std::string& out) {

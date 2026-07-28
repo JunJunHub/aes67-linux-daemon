@@ -22,8 +22,10 @@
 #include <boost/foreach.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 #include "main.hpp"
 #include "json.hpp"
@@ -412,6 +414,22 @@ bool HttpServer::init() {
       res.body = std::move(pcm);
       return;
     }
+    // 原始路 AAC 流式 - 持久 faac + 累积缓冲，从 DenoiseOutput.original
+    // 取数据。
+    auto aac_state = streamer_->create_aac_stream_state();
+    res.set_content_provider(
+        "audio/aac",
+        [this, sinkId, aac_state](size_t, DataSink& sink) -> bool {
+          std::string aac;
+          if (streamer_->stream_aac_encode(aac_state, sinkId, 0, aac))
+            return false;
+          if (!aac.empty() && !sink.write(aac.data(), aac.size()))
+            return false;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          return true;
+        },
+        nullptr);
+    return;
 #endif
     StreamSink sink;
     auto ret = session_manager_->get_sink(sinkId, sink);
@@ -510,15 +528,19 @@ bool HttpServer::init() {
       res.body = std::move(pcm);
       return;
     }
-    std::string aac;
-    auto ret = streamer_->encode_denoise_aac(sinkId, true, aac);
-    if (ret) {
-      set_error(404, "denoise not available for sink " + std::to_string(sinkId),
-                res);
-      return;
-    }
-    set_headers(res, "audio/aac");
-    res.body = std::move(aac);
+    auto aac_state = streamer_->create_aac_stream_state();
+    res.set_content_provider(
+        "audio/aac",
+        [this, sinkId, aac_state](size_t, DataSink& sink) -> bool {
+          std::string aac;
+          if (streamer_->stream_aac_encode(aac_state, sinkId, 1, aac))
+            return false;
+          if (!aac.empty() && !sink.write(aac.data(), aac.size()))
+            return false;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          return true;
+        },
+        nullptr);
   });
 
   svr_.Get("/api/streamer/stream/([0-9]+)/noise", [this](const Request& req,
@@ -548,15 +570,19 @@ bool HttpServer::init() {
       res.body = std::move(pcm);
       return;
     }
-    std::string aac;
-    auto ret = streamer_->encode_denoise_aac(sinkId, false, aac);
-    if (ret) {
-      set_error(404, "denoise not available for sink " + std::to_string(sinkId),
-                res);
-      return;
-    }
-    set_headers(res, "audio/aac");
-    res.body = std::move(aac);
+    auto aac_state = streamer_->create_aac_stream_state();
+    res.set_content_provider(
+        "audio/aac",
+        [this, sinkId, aac_state](size_t, DataSink& sink) -> bool {
+          std::string aac;
+          if (streamer_->stream_aac_encode(aac_state, sinkId, 2, aac))
+            return false;
+          if (!aac.empty() && !sink.write(aac.data(), aac.size()))
+            return false;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          return true;
+        },
+        nullptr);
   });
 #endif  // _USE_STREAMER_
 #endif  // _USE_NOISE_

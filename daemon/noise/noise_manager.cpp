@@ -471,6 +471,25 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
     denoised_rms = std::sqrt(denoised_rms / static_cast<float>(dn));
   }
   ctx.metrics->collect(denoise_result, detection, ar, input_rms, denoised_rms);
+
+  // Push to PCM ring buffer for streaming AAC encoding.
+  if (out != nullptr && out->denoised != nullptr && dn > 0) {
+    auto ring = get_pcm_ring(ctx.sink_id);
+    if (ring) {
+      std::lock_guard<std::mutex> rlock(ring->mutex);
+      for (size_t i = 0; i < dn; ++i) {
+        ring->original.push_back(out->original[i]);
+        ring->denoised.push_back(out->denoised[i]);
+        ring->noise.push_back(out->noise[i]);
+      }
+      // 限制缓冲 2s（96000 样本），溢出丢弃最旧。
+      while (ring->denoised.size() > 96000) {
+        ring->original.pop_front();
+        ring->denoised.pop_front();
+        ring->noise.pop_front();
+      }
+    }
+  }
 }
 
 void NoiseManager::on_period_end() {
@@ -713,6 +732,63 @@ const DenoiseOutput* NoiseManager::get_denoise_output(uint8_t sink_id) const {
     return ctx.denoise->get_output();
   }
   return nullptr;
+}
+
+const DenoiseOutput* NoiseManager::get_current_denoise_output(
+    uint8_t sink_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return nullptr;
+  for (const auto& [id, ctx] : *tbl) {
+    (void)id;
+    if (ctx.sink_id != sink_id)
+      continue;
+    if (!ctx.denoise_enabled || !ctx.denoise)
+      return nullptr;
+    return ctx.denoise->get_current_output();
+  }
+  return nullptr;
+}
+
+std::shared_ptr<NoiseManager::PcmRing> NoiseManager::get_pcm_ring(
+    uint8_t sensor_id) {
+  std::lock_guard<std::mutex> lock(pcm_rings_mutex_);
+  auto it = pcm_rings_.find(sensor_id);
+  if (it == pcm_rings_.end()) {
+    auto ring = std::make_shared<PcmRing>();
+    pcm_rings_[sensor_id] = ring;
+    return ring;
+  }
+  return it->second;
+}
+
+size_t NoiseManager::drain_pcm_ring(std::shared_ptr<PcmRing> ring,
+                                    int channel,
+                                    float* out,
+                                    size_t max_n) {
+  if (!ring)
+    return 0;
+  std::lock_guard<std::mutex> lock(ring->mutex);
+  std::deque<float>* src = nullptr;
+  switch (channel) {
+    case 0:
+      src = &ring->original;
+      break;
+    case 1:
+      src = &ring->denoised;
+      break;
+    case 2:
+      src = &ring->noise;
+      break;
+  }
+  if (!src)
+    return 0;
+  size_t n = std::min(src->size(), max_n);
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = src->front();
+    src->pop_front();
+  }
+  return n;
 }
 
 size_t NoiseManager::sensor_count_for_test() const {

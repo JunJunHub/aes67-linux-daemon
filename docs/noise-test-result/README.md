@@ -265,3 +265,55 @@ curl -X PUT http://127.0.0.1:9999/api/noise/sensor/0 \
 新增工具：
 - `daemon/noise/tools/noise_bench.cpp`：降噪质量 + 并发性能基准工具
 - `daemon/noise/tools/noise_bench_eval.py`：VoiceBank-DEMAND 批量 PESQ/STOI 评测脚本
+
+## 8. 三路 AAC 流式编码修复（追加）
+
+### 问题
+
+daemon HTTP 三路 AAC 流（原始/降噪/噪声）音频不正确，无正常人声，只有奇怪声音。VLC 直接播放 HTTP 流和保存文件播放都不正常。
+
+### 诊断过程（三层根因）
+
+| 层 | 根因 | 修复 |
+|----|------|------|
+| 1 | faac 需 1024 样本/帧但 DenoiseOutput 仅 480 样本，补零 544 个导致每帧仅 47% 有效 = 断续怪声 | 持久 faac 编码器 + 累积缓冲（AacStreamState），480×3≥1024 后编码 |
+| 2 | content_provider 回调（HTTP 线程）与 on_frame 写入（capture 线程）并发访问 DenoiseOutput = 数据撕裂 | per-sensor PCM ring buffer（PcmRing），互斥锁保护读写 |
+| 3 | set_content_provider 需 3 参数版本（含 nullptr resource_releaser）才能触发 chunked 流式推送 | 使用 3 参数版本 |
+
+### 最终方案
+
+```
+on_frame (capture 线程)          stream_aac_encode (HTTP 线程)
+    │                                  │
+    ▼                                  ▼
+process_pipeline_chunk            drain_pcm_ring (mutex lock)
+    │                                  │
+    ▼                                  ▼
+PcmRing.push (mutex lock)        faac encode (persistent enc)
+    │                                  │
+    ▼                                  ▼
+deque<float> × 3                 ADTS AAC chunk
+(original/denoised/noise)             │
+                                      ▼
+                                 DataSink.write -> HTTP chunked
+```
+
+### 验证
+
+| 路 | RMS | 对比 | 状态 |
+|----|-----|------|------|
+| original | 0.085 | = 源文件 0.085 | ✅ |
+| denoised | 0.066 | 降低 23%（有降噪） | ✅ |
+| noise | 0.110 | noise = original - denoised | ✅ |
+
+VLC 直接播放 HTTP 流 + 保存 AAC 文件播放，人声清晰可辨。
+
+### VLC 播放地址
+
+```
+http://<daemon_ip>:<port>/api/streamer/stream/0            ← 原始音频
+http://<daemon_ip>:<port>/api/streamer/stream/0/denoised   ← 降噪后
+http://<daemon_ip>:<port>/api/streamer/stream/0/noise      ← 分离噪声
+```
+
+Commit: `50e4088`

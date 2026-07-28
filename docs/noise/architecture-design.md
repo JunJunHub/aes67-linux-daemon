@@ -190,7 +190,7 @@ flowchart TB
     subgraph NOISE["噪声分析与降噪模块"]
         BRIDGE_IF["NoiseAudioBridge<br/>纯虚桥接接口"]
         NM2["NoiseManager::on_frame<br/>帧分发 (噪声内部)"]
-        DNR["① DenoiseProcessor×N<br/>降噪 (三路输出)<br/>(per-sensor 各持插件)<br/>始终执行，不门控"]
+        DNR["① DenoiseProcessor×N<br/>降噪 (三路输出)<br/>(per-sensor 各持插件)"]
         DET["② NoiseDetector<br/>噪声检测 (监测角色)<br/>始终执行，纯监测"]
         ANA["③ NoiseAnalyzer<br/>分类 + 置信度"]
         REF["RefComparator<br/>参考音比对<br/>(双路缓冲，独立于主链路)"]
@@ -208,12 +208,12 @@ flowchart TB
     ALSA -->|snd_pcm_readi<br/>PCM 帧| PCS
     PCS -->|FrameProvider 回调| STR
     PCS -->|FrameProvider 回调| BRIDGE_IF
-    BRIDGE_IF --> CAP
-    CAP --> DNR --> DET
+    BRIDGE_IF --> NM2
+    NM2 --> DNR --> DET
     DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA
     DET -->|"降噪关闭: 原始 PCM + VAD"| ANA
     ANA --> MET
-    CAP -.-> REF
+    NM2 -.-> REF
     REF -.-> MET
     MET --> HTTP & NoiseSSE
     PCS -->|原始 PCM 旁通| STR
@@ -229,7 +229,7 @@ flowchart TB
 >
 > **NoiseManager::on_frame 分层**：`PcmCaptureService` 是核心层的帧生产者/分发者；noise 模块内 `NoiseManager::on_frame` 是噪声模块的帧分发入口，从 `NoiseAudioBridge` 接收回调后经 NoiseManager 按传感器调度 ①→②→③→④ 顺序处理链路。两者职责不同，不在同一抽象层次。
 >
-> **①→② 顺序执行，无门控关系**：DenoiseProcessor 始终执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（详见 §6.3 线程模型）。
+> **①→② 顺序执行，无门控关系**：DenoiseProcessor 根据配置执行（降噪模型对干净音频 ≈ 直通，跳过无意义且引入门控误判风险），NoiseDetector 始终执行（纯监测指标）。①不门控②，②不依赖①——两者无数据依赖，但始终顺序执行（详见 §6.3 线程模型）。
 >
 > **③NoiseAnalyzer 输入源选择**：降噪开启时，NoiseAnalyzer 从 ①DenoiseProcessor 获取**噪声 PCM** + RNNoise VAD（纯噪声信号不含语音分量，分类更准，详见 [§3.3.1](#331-分析输入源选择)）；降噪关闭时，NoiseAnalyzer 从 ②NoiseDetector 获取 VAD + 原始 PCM，需 VAD 过滤语音段。两种路径互斥，由 NoiseManager 按传感器配置自动选择。
 >
@@ -324,7 +324,7 @@ daemon/
 flowchart LR
     PCS["PcmCaptureService<br/>(daemon 核心层)"] -->|FrameProvider| BRIDGE["NoiseAudioBridge"]
     BRIDGE -->|"on_pcm_frame -> entry.provider lambda"| NM["NoiseManager<br/>on_frame()"]
-    NM --> DNR["① DenoiseProcessor<br/>(始终执行，不门控)"]
+    NM --> DNR["① DenoiseProcessor<br/>(始终执行，未启用降噪=直通)"]
     DNR --> DET["② NoiseDetector<br/>(始终执行，纯监测)"]
     DNR -->|"降噪开启: 噪声 PCM + VAD"| ANA["③ NoiseAnalyzer"]
     DET -->|"降噪关闭: 原始 PCM + VAD"| ANA

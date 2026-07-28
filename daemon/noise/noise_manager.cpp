@@ -482,12 +482,16 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
         ring->denoised.push_back(out->denoised[i]);
         ring->noise.push_back(out->noise[i]);
       }
-      // 限制缓冲 2s（96000 样本），溢出丢弃最旧。
-      while (ring->denoised.size() > 96000) {
+      // 限制缓冲 2s（96000 样本），各 channel 独立丢弃最旧。
+      // 原联动 pop_front 的问题：当原始流消费 original 但降噪流未消费
+      // denoised 时，denoised 持续增长触发 limit，original 被双重消费
+      // （流读取 + limit pop_front），导致原始流过早断流。
+      while (ring->original.size() > 96000)
         ring->original.pop_front();
+      while (ring->denoised.size() > 96000)
         ring->denoised.pop_front();
+      while (ring->noise.size() > 96000)
         ring->noise.pop_front();
-      }
     }
   }
 }

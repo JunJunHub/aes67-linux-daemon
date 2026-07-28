@@ -66,12 +66,12 @@ inline float calc_norm_alpha(uint32_t sr, size_t hop, float tau) {
   return std::exp(-static_cast<float>(hop) / (static_cast<float>(sr) * tau));
 }
 
-// mean_norm 初始化（libdf MEAN_NORM_INIT = [-2.77, -3.0]）。
-constexpr float kMeanNormInitMin = -2.77f;
-constexpr float kMeanNormInitMax = -3.0f;
-// unit_norm 初始化（libdf UNIT_NORM_INIT = [1e-6, 1.0]）。
-constexpr float kUnitNormInitMin = 1e-6f;
-constexpr float kUnitNormInitMax = 1.0f;
+// mean_norm 初始化（libdf MEAN_NORM_INIT = [-60.0, -90.0]，dB 域）。
+constexpr float kMeanNormInitMin = -60.0f;
+constexpr float kMeanNormInitMax = -90.0f;
+// unit_norm 初始化（libdf UNIT_NORM_INIT = [0.001, 0.0001]）。
+constexpr float kUnitNormInitMin = 0.001f;
+constexpr float kUnitNormInitMax = 0.0001f;
 
 }  // namespace
 

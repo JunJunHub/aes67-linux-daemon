@@ -23,7 +23,6 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
-#include <sstream>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -41,7 +40,7 @@ constexpr uint32_t kYamnetSampleRate = 16000;  // YAMNet native 采样率
 constexpr size_t kYamnetInputSamples = 48000;  // 3s @16k
 constexpr size_t kYamnetNumClasses = 521;      // AudioSet 类别数
 constexpr size_t kYamnetNumFrames = 6;         // 3s -> 6 帧（0.5s/帧）
-constexpr size_t kTopN = 3;                    // 返回 top-3
+constexpr size_t kTopN = 6;                    // 返回 top-6
 constexpr float kMinScore = 0.05f;             // 最低报告分数
 
 // sanitize：非有限 -> 0。
@@ -158,22 +157,24 @@ void MlClassifier::load_class_map(const std::string& model_path) {
   std::getline(f, line);  // 跳过 header
   while (std::getline(f, line)) {
     // 格式：index,mid,display_name
-    // display_name 可能含逗号（引号包裹），取第一个逗号前的 index，
-    // 最后一个逗号后的 display_name（可能带引号）。
-    std::istringstream ss(line);
-    std::string idx_str, mid, name;
-    if (!std::getline(ss, idx_str, ','))
+    // display_name 可能含逗号（引号包裹），如 "Trickle, dribble"
+    // 解析：index（到第一个逗号）, mid（到第二个逗号）, name（剩余全部）
+    size_t c1 = line.find(',');
+    if (c1 == std::string::npos)
       continue;
-    if (!std::getline(ss, mid, ','))
+    size_t c2 = line.find(',', c1 + 1);
+    if (c2 == std::string::npos)
       continue;
-    // 剩余部分为 display_name（可能含逗号+引号）。
-    std::getline(ss, name);
-    // 去除首尾引号 + Windows 换行符 \r。
+    std::string idx_str = line.substr(0, c1);
+    // name = 第三个逗号后的全部内容
+    std::string name = line.substr(c2 + 1);
+    // 去除 Windows 换行符 \r（先于引号处理，因 \r 可能在引号之后）。
+    if (!name.empty() && name.back() == '\r')
+      name.pop_back();
+    // 去除首尾引号（CSV 引号包裹的字段）。
     if (!name.empty() && name.front() == '"')
       name = name.substr(1);
     if (!name.empty() && name.back() == '"')
-      name.pop_back();
-    if (!name.empty() && name.back() == '\r')
       name.pop_back();
     try {
       int idx = std::stoi(idx_str);

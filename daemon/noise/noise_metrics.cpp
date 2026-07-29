@@ -84,10 +84,12 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   // L3
   latest_.ml_noise_type = analysis.ml_noise_type;
   latest_.ml_noise_score = analysis.ml_noise_score;
+  // ml_top_types 序列化为 "type:score|type:score"（|
+  // 分隔，避免类名含逗号冲突）。
   latest_.ml_top_types.clear();
   for (size_t i = 0; i < analysis.ml_top_types.size(); ++i) {
     if (i > 0)
-      latest_.ml_top_types += ";";
+      latest_.ml_top_types += "|";
     latest_.ml_top_types += analysis.ml_top_types[i].type_name + ":" +
                             std::to_string(analysis.ml_top_types[i].score);
   }

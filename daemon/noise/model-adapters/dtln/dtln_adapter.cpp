@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <utility>
 #include <vector>
 
@@ -65,16 +66,21 @@ bool DtlnAdapter::init(const PluginConfig& cfg) {
   in_rate_ = cfg.sample_rate_in ? cfg.sample_rate_in : 48000;
 
   // 模型路径：cfg.model_path 优先（指向 model_1.onnx）；否则用 onnx_model_dir
-  // 推导（<dir>/model_1.onnx）。DTLN 无内置默认模型，路径为空时 init 失败
-  // -> DenoiseProcessor 切默认插件（passthrough）。
+  // 推导。先找 <dir>/dtln/model_1.onnx（按子目录布局），再回退
+  // <dir>/model_1.onnx。 DTLN 无内置默认模型，路径为空时 init 失败 -> 切
+  // passthrough。
   std::string m1 = cfg.model_path;
   if (m1.empty()) {
     if (cfg.onnx_model_dir.empty())
       return false;
-    m1 = cfg.onnx_model_dir;
-    if (!m1.empty() && m1.back() != '/' && m1.back() != '\\')
-      m1 += '/';
-    m1 += "model_1.onnx";
+    std::string dir = cfg.onnx_model_dir;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\')
+      dir += '/';
+    // 优先：<dir>/dtln/model_1.onnx
+    m1 = dir + "dtln/model_1.onnx";
+    // 回退：<dir>/model_1.onnx
+    if (std::ifstream(m1).fail())
+      m1 = dir + "model_1.onnx";
   }
   const std::string m2 = derive_sibling_model(m1);
 

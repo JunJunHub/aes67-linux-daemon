@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -130,6 +131,7 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
     return false;
 
   // 模型目录：cfg.onnx_model_dir 或 cfg.model_path 所在目录。
+  // 先找 <dir>/deepfilternet/ 子目录，再回退 <dir>/ 平铺。
   std::string dir = cfg.onnx_model_dir;
   if (dir.empty() && !cfg.model_path.empty()) {
     auto slash = cfg.model_path.find_last_of('/');
@@ -140,6 +142,12 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
   std::string d = dir;
   if (!d.empty() && d.back() != '/')
     d += '/';
+  // 优先：<dir>/deepfilternet/{enc,df_dec,erb_dec}.onnx
+  // 回退：<dir>/{enc,df_dec,erb_dec}.onnx
+  if (std::ifstream(d + "deepfilternet/enc.onnx").fail())
+    d = dir + (dir.back() != '/' && !dir.empty() ? "/" : "");
+  else
+    d = d + "deepfilternet/";
 
   enc_ = CreateOnnxSession(d + "enc.onnx");
   df_dec_ = CreateOnnxSession(d + "df_dec.onnx");

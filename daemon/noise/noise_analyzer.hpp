@@ -110,14 +110,11 @@ class NoiseAnalyzer {
   NoiseAnalysisResult analyze(const float* frames,
                               size_t frame_size,
                               const NoiseDetectionResult& detection);
-  void set_analysis_window_ms(uint32_t ms);  // 分析窗口(默认 2000ms)
 
-  // 注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1+L2 不受
-  // 影响，additive 向后兼容）。控制线程调用（add_sensor 后），由 NoiseManager
-  // 转发同一 shared_ptr 给所有 sensor 的 analyzer 共享。
+  // 注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1 不受影响）。
+  // 控制线程调用（add_sensor 后），由 NoiseManager 转发同一 shared_ptr
+  // 给所有 sensor 的 analyzer 共享。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml);
-  // L3 触发阈值：primary_confidence < 阈值时调 L3。默认 0.5。
-  void set_l3_confidence_threshold(float t) { l3_threshold_ = t; }
 
  private:
   // L1: 规则式分类(各规则输出置信度)
@@ -129,21 +126,9 @@ class NoiseAnalyzer {
       size_t frame_size,
       float spectral_flatness);
 
-  // 逐帧特征环形缓冲(§3.3.7)
-  std::vector<FrameFeatures> feature_ring_;
-  size_t ring_head_{0};
-  size_t ring_count_{0};
-  uint32_t analysis_window_ms_{2000};
-  static constexpr size_t kRingCapacity = 200;  // 2s @ 10ms/frame
-
-  // 窗口聚合(§3.3.7 L625):加权平均 bark_energy -> L2 输入
-  void aggregate_window();
-
-  // ── L3 ML 分类层（YAMNet 端到端分类）──
+  // ── L3 ML 分类层（YAMNet 端到端分类，独立于 L1）──
   // L3 分类器（可选，空则跳过）。
   std::shared_ptr<MlClassifier> ml_classifier_;
-  float l3_threshold_{
-      0.5f};  // L1+L2 未识别阈值（primary_confidence < 此值触发 L3）
 
   // L3 分类所需的 3s @48k PCM 环形缓冲。analyze() 每帧追加 analysis PCM，
   // 攒满 144000 样本后 L3 触发时取最新一窗送 MlClassifier::classify。

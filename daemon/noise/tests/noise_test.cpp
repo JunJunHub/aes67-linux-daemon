@@ -3716,28 +3716,29 @@ BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
   BOOST_CHECK_GT(fake_ptr->classify_count, 0u);
 }
 
-// L1 高置信度 -> 不调 L3（性能：classify 计数=0）。
-// 白噪 SF~1 -> White 候选 confidence~1.0 > 阈值 -> L3 跳过。无模型依赖，恒跑。
-BOOST_AUTO_TEST_CASE(l3_skipped_when_l1_confident) {
+// L3 独立于 L1 运行：L1 高置信度时 L3 仍按自己的节奏触发。
+// 白噪 L1 识别为 White（conf≈0.49），L3 在 3s 缓冲满后仍触发。
+// 两者并行上报：L1 报频域特征（White），L3 报声源识别。
+BOOST_AUTO_TEST_CASE(l3_runs_independently_of_l1) {
   auto fake_ptr = std::make_shared<FakeMlClassifier>();
   noise::NoiseAnalyzer a;
   a.set_ml_classifier(fake_ptr);
-  // L3 触发阈值设 0.4：合成白噪 L1 White conf≈0.49（sf≈0.848，
-  // conf=(sf-0.7)/0.3），>= 0.4 判 L1 已识别不触发 L3；默认 0.5 会使
-  // 边界 conf 0.49 误触发 L3（白噪非"L1 高置信度"强信号）。
-  a.set_l3_confidence_threshold(0.4f);
   float wn[synth::kFrameSize];
   synth::white_noise(wn, synth::kFrameSize, 5);
   noise::NoiseDetectionResult det{};
+  bool l3_triggered = false;
   for (int f = 0; f < 320; ++f) {
     auto ar = a.analyze(wn, synth::kFrameSize, det);
-    // L1 置信（conf >= threshold）-> source=l1，绝不 l3。
-    BOOST_CHECK_NE(ar.noise_type_source, "l3");
-    BOOST_CHECK(ar.primary_confidence >= 0.4f ||
-                ar.primary_type == noise::NoiseType::Unknown);
+    if (ar.noise_type_source == "l3") {
+      l3_triggered = true;
+      // L3 触发时 L1 结果仍在（White 或 Unknown）。
+      BOOST_CHECK(ar.primary_type == noise::NoiseType::White ||
+                  ar.primary_type == noise::NoiseType::Unknown);
+    }
   }
-  // L1 始终高置信 -> L3 从未被调用。
-  BOOST_CHECK_EQUAL(fake_ptr->classify_count, 0u);
+  // L3 独立于 L1，3s 缓冲满后应触发。
+  BOOST_CHECK(l3_triggered);
+  BOOST_CHECK_GT(fake_ptr->classify_count, 0u);
 }
 
 // Step 1e：bark/vggish 模板录入 + 检索往返 + 持久化。无模型依赖，恒跑。

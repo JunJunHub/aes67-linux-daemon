@@ -202,9 +202,14 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   if (frame_size == 0 || frames == nullptr)
     return result;
 
+  // L3 PCM 累积 + 分类：独立于 VAD 和 L1。
+  // YAMNet 多标签分类能处理混合音频（语音+噪声），不受 VAD 门控。
+  // L3 与 L1 是互补维度（频域特征 vs 声源识别），并行运行互不门控。
+  maybe_run_l3_(result, frames, frame_size);
+
   // arch §3.3.1:分析 OriginalPCM(降噪关闭)时,需 VAD 过滤语音段,仅在
-  // 非语音段做频谱分析。speech 帧不是噪声 -> 跳过分析,返回 Unknown。
-  // 不推 FrameFeatures 到环形缓冲(语音帧不参与窗口聚合统计)。
+  // 非语音段做频谱分析。speech 帧不是噪声 -> 跳过 L1 分析。
+  // L3 已在上面处理（PCM 累积不受 VAD 影响）。
   if (detection.is_speech) {
     return result;
   }
@@ -405,47 +410,18 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
         result.candidates.size() >= 2 && result.candidates[1].confidence > 0.3f;
   }
 
-  // ── 逐帧 FrameFeatures 推入环形缓冲(arch §3.3.7) ────────────────────
-  FrameFeatures feat{};
-  feat.bark_energy = result.band_energy;
-  feat.spectral_flatness = sf_recomputed;
-  feat.spectral_centroid_hz = result.spectral_centroid_hz;
-  feat.noise_level_dbfs = result.noise_level_dbfs;
-  feat.hum_strength_db = result.hum_strength_db;
-  feat.impulse_count = result.impulse_count;
-  feat.l1_type = result.primary_type;
-  feat.l1_confidence = result.primary_confidence;
-
-  if (feature_ring_.size() < kRingCapacity) {
-    feature_ring_.push_back(feat);
-    ++ring_count_;
-  } else {
-    feature_ring_[ring_head_] = feat;
-    ring_head_ = (ring_head_ + 1) % kRingCapacity;
-  }
-  // 窗口到期时聚合(arch §3.3.7 L625)。当前实现:每 200 帧(2s)聚合一次。
-  // Task 5 仅保留缓冲 + 聚合入口;Task 6/7 消费聚合结果。
-  if (ring_count_ >= kRingCapacity) {
-    aggregate_window();
-  }
-
-  // L1 规则式结果已定。若 primary_confidence < 阈值（L1+L2 未识别）
-  // 且 MlClassifier 可用，追加 PCM 环形缓冲并触发 L3（覆盖
-  // noise_type_source=l3）。
-  maybe_run_l3_(result, frames, frame_size);
-
   return result;
 }
 
-// L3 ML 分类层（YAMNet 端到端分类）。
-// 每帧追加 analysis PCM 到 3s 环形缓冲；当缓冲满 + L1 未识别
-// （primary_confidence < 阈值）+ 节流冷却到期时，取最新一窗 PCM 调
-// MlClassifier::classify 做直接分类。命中 -> noise_type_source="l3"
-// + ml_noise_type/ml_noise_score/ml_top_types；未命中/未触发 -> 保持
-// source="l1"。
+// L3 ML 分类层（YAMNet 端到端分类，独立于 L1）。
+// 每帧追加 analysis PCM 到 3s 环形缓冲；当缓冲满 + 节流冷却到期时，
+// 取最新一窗 PCM 调 MlClassifier::classify 做直接分类。
+// 命中 -> noise_type_source="l3" + ml_noise_type/ml_noise_score/ml_top_types。
 //
-// 触发频率：节流 kL3CooldownFrames(=3s) 一次，避免持续未知噪声时每帧
-// 跑 ONNX。L3 仅在 L1+L2 未识别时触发（低频），~ms 级可接受（brief）。
+// L3 与 L1 是互补维度（频域特征 vs 声源识别），并行运行：
+// - L3 不受 L1 置信度门控（L1 高置信时 L3 仍运行，提供声源信息）
+// - L3 不受 VAD 门控（YAMNet 多标签能处理混合音频）
+// 触发频率：节流 kL3CooldownFrames(=3s) 一次，避免每帧跑 ONNX。
 void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
                                   const float* frames,
                                   size_t frame_size) {
@@ -471,8 +447,6 @@ void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
   // 触发条件：缓冲满 + L1 未识别 + 冷却到期。
   if (pcm_ring_count_ < kYamnetWindowSamples)
     return;  // 不足 3s，无法分类
-  if (result.primary_confidence >= l3_threshold_)
-    return;  // L1 已识别，跳过 L3
   if (l3_cooldown_ > 0)
     return;  // 节流中
 
@@ -496,38 +470,6 @@ void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
     result.ml_top_types = std::move(m->top_types);
   }
   // 未命中：保持上次 L3 结果（如有），L3 已尽力。
-}
-
-void NoiseAnalyzer::set_analysis_window_ms(uint32_t ms) {
-  analysis_window_ms_ = ms;
-}
-
-void NoiseAnalyzer::aggregate_window() {
-  // arch §3.3.7 L625:窗口内特征聚合
-  // - 加权平均 bark_energy -> L2 模板匹配输入
-  // - 取中位数 spectral_flatness -> 最终 SF
-  // - 取 max impulse_count -> 脉冲率
-  // - 投票 L1 type -> 窗口级分类结果
-  // 当前实现:清空缓冲,聚合结果供 Task 6/7 消费。
-  // Task 5 仅保留入口;详细聚合逻辑在 Task 6 实现。
-  if (feature_ring_.empty())
-    return;
-  // 简单聚合:计算 bark_energy 均值(占位,Task 6 扩展)
-  std::array<float, 32> avg_bark{};
-  avg_bark.fill(0.0f);
-  for (const auto& f : feature_ring_) {
-    for (size_t b = 0; b < 32; ++b) {
-      avg_bark[b] += f.bark_energy[b];
-    }
-  }
-  float n = static_cast<float>(feature_ring_.size());
-  for (size_t b = 0; b < 32; ++b) {
-    avg_bark[b] /= n;
-  }
-  // 清空缓冲(聚合后)
-  feature_ring_.clear();
-  ring_head_ = 0;
-  ring_count_ = 0;
 }
 
 std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(

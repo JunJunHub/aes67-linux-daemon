@@ -69,17 +69,16 @@ download_dfn() {
   echo "[dfn] 三子图已就绪：$DFN_DIR/{enc,df_dec,erb_dec}.onnx"
 }
 
-# ── YAMNet：TF Hub SavedModel -> ONNX（固定 3s 输入 = 48000 样本）────────────
-# YAMNet 官方提供 TF SavedModel（变量长度输入），需用 tf2onnx 转换为固定
-# 输入 [1, 48000] 的 ONNX。同时下载 class_map.csv（AudioSet 521 类类名）。
-#
-# 依赖：tensorflow-hub + tensorflow-cpu + tf2onnx（pip install）
-# 国内网络可能较慢（TF Hub 在 Google 域名），可手动下载后放到 $YAMNET_DIR。
+# ── YAMNet：预转换 ONNX 直接下载（15MB，固定 3s 输入 = 48000 样本）────────
+# YAMNet ONNX 模型（yamnet_3s.onnx）由 tf2onnx 从 TF Hub SavedModel 导出，
+# 输入固定 [1, 48000]（3s @ 16kHz），输出 scores [6,521] + embeddings [6,1024]。
+# 直接下载预转换 ONNX，无需本地 TF + tf2onnx 转换（省 ~4GB 内存）。
+# 同时下载 class_map.csv（AudioSet 521 类类名，~14KB）。
 download_yamnet() {
   local onnx_path="$YAMNET_DIR/yamnet_3s.onnx"
   local csv_path="$YAMNET_DIR/yamnet_class_map.csv"
 
-  # class_map.csv：从 GitHub 直接下载（小文件，~14KB）
+  # class_map.csv：从 GitHub 直接下载
   if [ ! -s "$csv_path" ]; then
     echo "[yamnet] 下载 yamnet_class_map.csv ..."
     "${CURL[@]}" -o "$csv_path" \
@@ -94,45 +93,21 @@ download_yamnet() {
     return 0
   fi
 
-  echo "[yamnet] 从 TF Hub 下载 YAMNet SavedModel 并转换为 ONNX ..."
-  echo "  （需 tensorflow-hub + tensorflow-cpu + tf2onnx）"
+  echo "[yamnet] 下载 yamnet_3s.onnx (15MB) ..."
+  # 预转换 ONNX 直接下载（MD5: 689a919ec4c6c2375dc2e88962e746e5）
+  "${CURL[@]}" -o "$onnx_path" \
+    "https://ftrg.zbox.filez.com/v2/delivery/data/95f00b0fc900458ba134f8b180b3f7a1/examples/yamnet/yamnet_3s.onnx" \
+    || { echo "[yamnet] 下载失败（网络？链接过期？）"; \
+         echo "  备选：从 TF Hub SavedModel 本地转换（需 tensorflow-hub + tf2onnx，~4GB 内存）"; \
+         return 1; }
 
-  local py; py="$(command -v python3 || command -v python)"
-
-  # 检查依赖
-  if ! "$py" -c "import tensorflow_hub; import tf2onnx" 2>/dev/null; then
-    echo "[yamnet] 安装转换依赖 ..."
-    "$py" -m pip install tensorflow-hub tensorflow-cpu tf2onnx 2>&1 | tail -3
+  # 校验文件大小（至少 14MB）
+  local sz; sz="$(stat -c%s "$onnx_path" 2>/dev/null || echo 0)"
+  if [ "$sz" -lt 14000000 ]; then
+    echo "[yamnet] 下载文件不完整（$sz bytes），删除"
+    rm -f "$onnx_path"; return 1
   fi
-
-  # 内联转换脚本：加载 TF Hub SavedModel -> 固定输入 -> tf2onnx 导出
-  "$py" - "$onnx_path" << 'PYEOF' || { echo "[yamnet] ONNX 转换失败"; return 1; }
-import sys, os, tempfile, shutil
-import numpy as np
-
-onnx_path = sys.argv[1]
-
-# 1. 加载 YAMNet SavedModel from TF Hub
-os.environ.setdefault('TFHUB_CACHE_DIR', tempfile.mkdtemp())
-import tensorflow_hub as hub
-print("[yamnet] 加载 TF Hub SavedModel ...")
-model = hub.load("https://tfhub.dev/google/yamnet/1")
-
-# 2. 用 concrete function 固定输入形状 [1, 48000]（3s @ 16kHz）
-import tensorflow as tf
-waveform = tf.TensorSpec(shape=[1, 48000], dtype=tf.float32, name="new_input")
-cf = model.signatures["serving_default"].get_concrete_function(waveform=waveform)
-
-# 3. tf2onnx 转换
-import tf2onnx
-print("[yamnet] 转换为 ONNX ...")
-model_proto, _ = tf2onnx.convert.from_function(
-    cf, input_signature=[waveform], output_path=onnx_path, opset=13
-)
-print(f"[yamnet] ONNX 已保存: {onnx_path} ({os.path.getsize(onnx_path)} bytes)")
-PYEOF
-
-  echo "[yamnet] yamnet_3s.onnx 已就绪：$onnx_path"
+  echo "[yamnet] yamnet_3s.onnx 已就绪：$onnx_path ($sz bytes)"
 }
 
 echo "目标目录：$DEST"

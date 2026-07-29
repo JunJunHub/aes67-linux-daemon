@@ -39,6 +39,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -100,6 +101,9 @@ class MlClassifier {
 
   struct Impl;  // PImpl 持有 ONNX session + 重采样器 + class_map
   std::unique_ptr<Impl> impl_;
+  // Resampler 有内部状态，不能并发调用。多 sensor 的 per-sink 线程
+  // 共享同一 MlClassifier 实例，用 mutex 保护重采样 + ONNX Run。
+  mutable std::mutex classify_mutex_;
 };
 
 }  // namespace noise

@@ -112,12 +112,10 @@ struct MlClassifier::Impl {
   std::string in_name;
   std::string scores_name;
   std::string embeddings_name;
-  // 48k->16k 重采样器。
+  // 48k->16k 重采样器（有内部状态，不能并发调用 -> classify_mutex_ 保护）。
   std::unique_ptr<Resampler> downsample;
   // class_map：AudioSet index -> display_name。
   std::unordered_map<int, std::string> class_map;
-  // 重采样暂存。
-  std::vector<float> pcm16k;
 };
 
 MlClassifier::MlClassifier() : impl_(std::make_unique<Impl>()) {}
@@ -216,12 +214,12 @@ std::optional<MlResult> MlClassifier::classify(const float* pcm48k,
     return std::nullopt;
 
   try {
-    // 1. 48k -> 16k 重采样。
+    // 1. 48k -> 16k 重采样（局部 buffer，线程安全：多 sensor 并发调用）。
     const size_t cap = impl_->downsample->max_output_for_input(n);
-    if (impl_->pcm16k.size() < cap)
-      impl_->pcm16k.resize(cap);
-    size_t n16 =
-        impl_->downsample->process(pcm48k, n, impl_->pcm16k.data(), cap);
+    std::vector<float> pcm16k(cap);
+    // Resampler 有内部状态，不能并发调用 -> 用 mutex 保护。
+    std::lock_guard<std::mutex> lock(classify_mutex_);
+    size_t n16 = impl_->downsample->process(pcm48k, n, pcm16k.data(), cap);
     if (n16 == 0)
       return std::nullopt;
 
@@ -229,7 +227,7 @@ std::optional<MlResult> MlClassifier::classify(const float* pcm48k,
     // YAMNet 输入固定 48000 样本；不足补零，超出截断。
     std::vector<float> input(kYamnetInputSamples, 0.0f);
     size_t copy_n = std::min(n16, kYamnetInputSamples);
-    std::memcpy(input.data(), impl_->pcm16k.data(), copy_n * sizeof(float));
+    std::memcpy(input.data(), pcm16k.data(), copy_n * sizeof(float));
 
     const Ort::MemoryInfo& mi = OnnxMemoryInfo();
     int64_t in_shape[] = {1, static_cast<int64_t>(kYamnetInputSamples)};
@@ -307,19 +305,18 @@ std::vector<float> MlClassifier::embed(const float* pcm48k, size_t n) const {
     return out;
 
   try {
-    // 1. 48k -> 16k 重采样。
+    // 1. 48k -> 16k 重采样（局部 buffer + mutex，线程安全）。
     const size_t cap = impl_->downsample->max_output_for_input(n);
-    if (impl_->pcm16k.size() < cap)
-      impl_->pcm16k.resize(cap);
-    size_t n16 =
-        impl_->downsample->process(pcm48k, n, impl_->pcm16k.data(), cap);
+    std::vector<float> pcm16k(cap);
+    std::lock_guard<std::mutex> lock(classify_mutex_);
+    size_t n16 = impl_->downsample->process(pcm48k, n, pcm16k.data(), cap);
     if (n16 == 0)
       return out;
 
     // 2. 构造输入张量 [1, 48000]。
     std::vector<float> input(kYamnetInputSamples, 0.0f);
     size_t copy_n = std::min(n16, kYamnetInputSamples);
-    std::memcpy(input.data(), impl_->pcm16k.data(), copy_n * sizeof(float));
+    std::memcpy(input.data(), pcm16k.data(), copy_n * sizeof(float));
 
     const Ort::MemoryInfo& mi = OnnxMemoryInfo();
     int64_t in_shape[] = {1, static_cast<int64_t>(kYamnetInputSamples)};

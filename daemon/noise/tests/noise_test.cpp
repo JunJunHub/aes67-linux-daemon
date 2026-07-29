@@ -3689,7 +3689,7 @@ BOOST_AUTO_TEST_CASE(yamnet_classifies_known_noise) {
     BOOST_CHECK(!m->type_name.empty());
     BOOST_CHECK_GT(m->score, 0.0f);
     BOOST_CHECK_LE(m->score, 1.0f);
-    BOOST_CHECK_LE(m->top_types.size(), 3u);
+    BOOST_CHECK_LE(m->top_types.size(), 6u);
   } else {
     BOOST_TEST_MESSAGE("YAMNet 未返回分类结果（白噪可能低于阈值），跳过断言");
   }

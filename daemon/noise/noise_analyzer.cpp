@@ -348,12 +348,21 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   auto candidates = classify_rule_based(power, kFftSize, sample_rate, frames,
                                         frame_size, sf_recomputed);
 
-  // 额外填充 Hum50Hz/60Hz 候选(Goertzel 精确数据,classify_rule_based 不再添加)
-  float hum_conf = clampf((peak_db - 10.0f) / 20.0f, 0.0f, 1.0f);
-  if (hum_conf > 0.1f) {
+  // 额外填充 Hum50Hz/60Hz 候选(Goertzel 精确数据)
+  // hum_conf: peak_db > 4dB 即开始报告。Goertzel 精确检测 50/60Hz 基频，
+  // 误判风险低（不同于 FFT bin 粗估）。peak_db 4-6dB 是弱 hum 但仍可识别。
+  float hum_conf = clampf((peak_db - 4.0f) / 16.0f, 0.0f, 1.0f);
+  if (hum_conf > 0.05f) {
     NoiseType hum_type =
         (peak_50hz >= peak_60hz) ? NoiseType::Hum50Hz : NoiseType::Hum60Hz;
     candidates.push_back({hum_type, hum_conf});
+    // Goertzel 检测到 hum 时，pink 候选不可靠（hum 谐波产生的斜率碰巧
+    // 接近 -3dB/oct 是假阳性）。移除 pink 候选，让 hum 成为唯一主类型。
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [](const NoiseTypeCandidate& c) {
+                                      return c.type == NoiseType::Pink;
+                                    }),
+                     candidates.end());
   }
 
   // 额外填充 Impulse 候选(需要时域数据)
@@ -493,17 +502,20 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
 
   const float bin_freq = sample_rate / fft_n;
 
-  // ── 规则 1: 白噪声(arch §3.3.4 L523)
-  // SF > 0.7,conf = clamp((SF - 0.7) / 0.3, 0, 1)
-  if (spectral_flatness > 0.7f) {
-    float conf = clampf((spectral_flatness - 0.7f) / 0.3f, 0.0f, 1.0f);
+  // ── 规则 1: 白噪声
+  // SF > 0.6,conf = clamp((SF - 0.6) / 0.4, 0, 1)
+  // 原 SF > 0.7 阈值偏高，合成白噪 SF≈0.84 -> conf 仅 0.47。
+  // 降至 0.6 使 conf 提升到 0.6+，同时不误判语音（语音 SF≈0.1-0.3）。
+  if (spectral_flatness > 0.6f) {
+    float conf = clampf((spectral_flatness - 0.6f) / 0.4f, 0.0f, 1.0f);
     if (conf > 0.1f)
       candidates.push_back({NoiseType::White, conf});
   }
 
-  // ── 规则 2: 粉红噪声(arch §3.3.4 L524)
-  // 频谱斜率 ≈ -3dB/oct,conf = 1 - |slope + 3| / 1.5
-  // 计算:在 log-freq vs power_db 空间做线性回归
+  // ── 规则 2: 粉红噪声
+  // 频谱斜率 ≈ -3dB/oct，容差 ±3dB（原 ±1.5dB 过严）。
+  // 真实粉红噪声斜率在 -2 到 -6 之间波动，±3dB 容差能覆盖。
+  // conf = 1 - |slope + 3| / 3.0
   {
     std::vector<float> log_freqs;
     std::vector<float> power_db;
@@ -517,7 +529,6 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
       power_db.push_back(10.0f * std::log10(power_spectrum[k - 1]));
     }
     if (log_freqs.size() >= 10) {
-      // 线性回归:power_db = a * log_freq + b
       float n = static_cast<float>(log_freqs.size());
       float sum_x = std::accumulate(log_freqs.begin(), log_freqs.end(), 0.0f);
       float sum_y = std::accumulate(power_db.begin(), power_db.end(), 0.0f);
@@ -530,7 +541,7 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
       if (std::abs(denom) > 1e-10f) {
         float slope = (n * sum_xy - sum_x * sum_y) / denom;
         // slope 单位:dB/oct(log2 频率)
-        float conf = 1.0f - std::abs(slope + 3.0f) / 1.5f;
+        float conf = 1.0f - std::abs(slope + 3.0f) / 3.0f;
         conf = clampf(conf, 0.0f, 1.0f);
         if (conf > 0.1f)
           candidates.push_back({NoiseType::Pink, conf});
@@ -539,29 +550,24 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   }
 
   // ── 规则 3: 工频哼声(Goertzel,在 analyze() 中计算)
-  // Resolution #2(Important #2):classify_rule_based 不再添加粗略 hum 候选。
-  // 原 FFT bin 1-3(93.75-281.25Hz)粗估会产生误判 -- 200Hz 纯音等非 hum
-  // 低频信号被误归为 Hum50Hz 且无法被 Goertzel 路径覆盖替换。
-  // hum 分类完全交由 analyze() 中的 Goertzel 精确检测(直接 DFT at
-  // 50/60/100/120/150/180 Hz,能正确区分 50 vs 60Hz)。
 
-  // ── 规则 4: 脉冲(时域,在 analyze() 中计算,此处不重复)
-  // analyze() 在调用 classify_rule_based 后追加 Impulse 候选。
+  // ── 规则 4: 脉冲(时域,在 analyze() 中计算)
 
-  // ── 规则 5: 宽带噪声(arch §3.3.4 L527)
-  // SF 0.3~0.7,conf = 1 - |SF - 0.5| / 0.2
-  if (spectral_flatness >= 0.3f && spectral_flatness <= 0.7f) {
-    float conf = 1.0f - std::abs(spectral_flatness - 0.5f) / 0.2f;
+  // ── 规则 5: 宽带噪声
+  // SF 0.15~0.6，conf = 1 - |SF - 0.375| / 0.225
+  // 原 SF 0.3~0.7 范围偏窄，真实环境噪声 SF 常 0.15-0.3，全部落入空档。
+  // 扩展到 0.15~0.6，中心 0.375，覆盖更多非平坦噪声。
+  // 语音 SF≈0.1-0.3，与宽带噪声重叠区 conf 低（<0.5），不会强误判。
+  if (spectral_flatness >= 0.15f && spectral_flatness <= 0.6f) {
+    float conf = 1.0f - std::abs(spectral_flatness - 0.375f) / 0.225f;
     conf = clampf(conf, 0.0f, 1.0f);
     if (conf > 0.1f)
       candidates.push_back({NoiseType::Broadband, conf});
   }
 
-  // ── 规则 6: 数字噪声(arch §3.3.4 L528)
-  // 高频(>8kHz)能量比"异常高",conf = clamp((hf_ratio - 0.5) / 0.3, 0, 1)
-  // Guard:arch 说"异常高" -- 平坦频谱(白噪)的 hf_ratio 自然 ≈0.67
-  // (因为 8-24kHz 占 0-24kHz 的 2/3),这不是"异常"。仅在频谱非平坦
-  // (SF < 0.6)时启用,避免白噪误判为 Digital。flat 噪声由 White 规则捕获。
+  // ── 规则 6: 数字噪声
+  // 高频(>8kHz)能量比异常高，conf = clamp((hf_ratio - 0.5) / 0.3, 0, 1)
+  // 仅在频谱非平坦(SF < 0.6)时启用，避免白噪误判。
   if (spectral_flatness < 0.6f) {
     float hf_energy = 0.0f;
     float total_energy = 0.0f;

@@ -155,6 +155,13 @@ class NoiseAnalyzer {
   // L3 节流：触发后冷却若干帧（~3s），避免持续未知噪声时每帧都跑 ONNX。
   size_t l3_cooldown_{0};
   static constexpr size_t kL3CooldownFrames = 300;  // 3s @10ms/帧
+  // L3 结果持久化：L3 触发频率低（每 3s 一次），但 metrics 快照每帧更新。
+  // 若不持久化，L3 结果仅在触发帧出现（1/300），其余帧被默认空值覆盖。
+  // last_l3_* 保存最近一次 L3 命中结果，每帧恢复到 result 中。
+  std::string last_l3_type_;
+  float last_l3_score_{0.0f};
+  std::vector<MlTypeScore> last_l3_top_types_;
+  bool l3_has_result_{false};
   // L3 触发判定 + classify 调用 + ml_* 字段填充。在 analyze() 末尾调用。
   void maybe_run_l3_(NoiseAnalysisResult& result,
                      const float* frames,

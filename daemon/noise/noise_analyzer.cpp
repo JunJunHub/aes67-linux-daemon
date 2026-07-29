@@ -185,11 +185,19 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   result.hum_strength_db = 0.0f;
   result.impulse_count = 0.0f;
   result.band_energy.fill(0.0f);
-  // L3 字段默认（source 默认 l1；L3 触发时 maybe_run_l3_ 覆盖）。
-  result.ml_noise_type.clear();
-  result.ml_noise_score = 0.0f;
-  result.ml_top_types.clear();
-  result.noise_type_source = "l1";
+  // L3 字段：恢复上次 L3 命中结果（持久化，避免 1/300 帧瞬态被覆盖）。
+  // maybe_run_l3_ 触发时更新 last_l3_*；未触发时恢复上次结果。
+  if (l3_has_result_) {
+    result.ml_noise_type = last_l3_type_;
+    result.ml_noise_score = last_l3_score_;
+    result.ml_top_types = last_l3_top_types_;
+    result.noise_type_source = "l3";
+  } else {
+    result.ml_noise_type.clear();
+    result.ml_noise_score = 0.0f;
+    result.ml_top_types.clear();
+    result.noise_type_source = "l1";
+  }
 
   if (frame_size == 0 || frames == nullptr)
     return result;
@@ -477,12 +485,17 @@ void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
   auto m = ml_classifier_->classify(window.data(), kYamnetWindowSamples);
   l3_cooldown_ = kL3CooldownFrames;  // 触发后冷却（无论命中）
   if (m.has_value()) {
+    // 持久化 L3 结果：后续帧恢复此结果，直到下次 L3 触发更新。
+    last_l3_type_ = m->type_name;
+    last_l3_score_ = m->score;
+    last_l3_top_types_ = m->top_types;
+    l3_has_result_ = true;
     result.noise_type_source = "l3";
     result.ml_noise_type = m->type_name;
     result.ml_noise_score = m->score;
     result.ml_top_types = std::move(m->top_types);
   }
-  // 未命中：保持 source="l1"（L1 的 Unknown），L3 已尽力。
+  // 未命中：保持上次 L3 结果（如有），L3 已尽力。
 }
 
 void NoiseAnalyzer::set_analysis_window_ms(uint32_t ms) {

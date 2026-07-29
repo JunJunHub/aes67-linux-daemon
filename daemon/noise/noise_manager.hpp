@@ -383,15 +383,11 @@ class NoiseManager {
   // deepfilternet init 推导模型路径。控制线程调用（main wiring，init 前）。
   void set_onnx_model_dir(const std::string& dir) { onnx_model_dir_ = dir; }
 
-  // Spec5 T3（D-S5.8）：注入 L3 ML 分类器 + 模板库。add_sensor 时转发到每个
-  // sensor 的 NoiseAnalyzer（L3 在 capture 线程调 classify，所有 sensor 共享
-  // 同一 MlClassifier/TemplateDB 实例）。空 shared_ptr -> L3 跳过。
-  // 控制线程调用（main wiring，init 前；已有 sensor 也会逐个 set）。
+  // 注入 L3 ML 分类器。add_sensor 时转发到每个 sensor 的 NoiseAnalyzer
+  // （L3 在 capture 线程调 classify，所有 sensor 共享同一 MlClassifier 实例）。
+  // 空 shared_ptr -> L3 跳过。控制线程调用（main wiring，init 前）。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
     ml_classifier_ = ml;
-  }
-  void set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
-    template_db_ = db;
   }
 
   // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。控制线程调用
@@ -477,11 +473,9 @@ class NoiseManager {
   mutable std::atomic<bool> load_in_progress_{false};
   // Spec5 T2：ONNX 模型目录（Config 注入，转发到 DenoiseProcessor）。
   std::string onnx_model_dir_;
-  // Spec5 T3：L3 ML 分类器 + 模板库（Config 注入，转发到各 sensor 的
-  // analyzer）。 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor
-  // 共享同一实例。
+  // L3 ML 分类器（Config 注入，转发到各 sensor 的 analyzer）。
+  // 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor 共享同一实例。
   std::shared_ptr<MlClassifier> ml_classifier_;
-  std::shared_ptr<NoiseTemplateDB> template_db_;
   // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
   std::shared_ptr<NoiseStore> noise_store_;
   // Spec6 T2：降噪总延迟变更转发回调（init-only，运行期不改）。

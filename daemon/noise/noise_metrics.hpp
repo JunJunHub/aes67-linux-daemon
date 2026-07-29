@@ -111,9 +111,9 @@ struct NoiseMetricsSnapshot {
   NoiseType noise_type{NoiseType::Unknown};
   float noise_type_confidence{0.0f};  // 分类置信度（区别于 noise_confidence）
   bool is_mixed{false};
-  // Spec5 T3（D-S5.8）：主结果来源层 "l1"|"l2"|"l3"（默认空=l1）。
+  // 主结果来源层 "l1"|"l2"|"l3"（默认空=l1）。
   // 由 collect() 从 NoiseAnalysisResult.noise_type_source 拷入。source="l3"
-  // 时权威类型为 l3_match_type（模板 label），noise_type 仍为 L1 的 Unknown。
+  // 时权威类型为 ml_noise_type（YAMNet 类名），noise_type 仍为 L1 的 Unknown。
   std::string noise_type_source;
   std::array<NoiseTypeCandidateSnapshot, kMaxNoiseCandidates>
       noise_candidates{};
@@ -158,12 +158,15 @@ struct NoiseMetricsSnapshot {
   // 在 switch_plugin 到非 passthrough 插件且该插件恢复 kOk 后清。告警引擎
   // 据此评估 plugin_degraded 规则（Warning）。
   bool plugin_degraded{false};
-  // Spec6 T1（D-S6.7）：L3 ML 分类结果字段暴露进快照（从
-  // NoiseAnalysisResult 拷入），供 /metrics + /history 序列化 + NoiseStore
-  // 持久化。l3_match_type 为 L3 匹配到的模板 label（空=未触发/未匹配），
-  // l3_similarity 为余弦相似度 [-1,1]。collect() 从 analysis 拷入。
-  std::string l3_match_type;
-  float l3_similarity{0.0f};
+  // L3 ML 分类结果字段暴露进快照（从 NoiseAnalysisResult 拷入），
+  // 供 /metrics + /history 序列化 + NoiseStore 持久化。
+  // ml_noise_type 为 YAMNet top-1 类名（空=未触发/未匹配），
+  // ml_noise_score 为 YAMNet top-1 分数 [0,1]。
+  // ml_top_types 为 top-3（分号分隔的 type:score 对，便于 CSV/JSON 序列化）。
+  std::string ml_noise_type;
+  float ml_noise_score{0.0f};
+  std::string
+      ml_top_types;  // 序列化： "Air conditioning:0.87;Mechanical fan:0.73"
 };
 
 // ④NoiseMetrics - 聚合 ①②③ 链路结果到 NoiseMetricsSnapshot。

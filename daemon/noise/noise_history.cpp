@@ -115,8 +115,9 @@ constexpr const char* kCreateMetricsSql =
     "is_alerting INTEGER,"
     "alert_level INTEGER,"
     "plugin_degraded INTEGER,"
-    "l3_match_type TEXT,"
-    "l3_similarity REAL,"
+    "ml_noise_type TEXT,"
+    "ml_noise_score REAL,"
+    "ml_top_types TEXT,"
     "PRIMARY KEY (sensor_id, timestamp_ms))";
 
 constexpr const char* kCreateAlertsSql =
@@ -218,9 +219,9 @@ void NoiseStore::insert_metrics(
       "ref_similarity,ref_noise_db,ref_delay_ms,alert_threshold_dbfs,"
       "hum_alert_threshold_db,snr_alert_threshold_db,"
       "ref_similarity_threshold,alert_debounce_periods,is_alerting,"
-      "alert_level,plugin_degraded,l3_match_type,l3_similarity) "
+      "alert_level,plugin_degraded,ml_noise_type,ml_noise_score,ml_top_types) "
       "VALUES "
-      "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
     std::cerr << "NoiseStore: prepare metrics insert failed: "
               << sqlite3_errmsg(db_) << "\n";
@@ -262,8 +263,9 @@ void NoiseStore::insert_metrics(
     sqlite3_bind_int(stmt, 29, s.is_alerting ? 1 : 0);
     sqlite3_bind_int(stmt, 30, static_cast<int>(s.alert_level));
     sqlite3_bind_int(stmt, 31, s.plugin_degraded ? 1 : 0);
-    sqlite3_bind_text(stmt, 32, s.l3_match_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 33, s.l3_similarity);
+    sqlite3_bind_text(stmt, 32, s.ml_noise_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 33, s.ml_noise_score);
+    sqlite3_bind_text(stmt, 34, s.ml_top_types.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
       std::cerr << "NoiseStore: metrics insert step failed: "
                 << sqlite3_errmsg(db_) << "\n";
@@ -330,7 +332,7 @@ std::vector<MetricsHistoryRecord> NoiseStore::query_metrics(
       "ref_similarity,ref_noise_db,ref_delay_ms,alert_threshold_dbfs,"
       "hum_alert_threshold_db,snr_alert_threshold_db,"
       "ref_similarity_threshold,alert_debounce_periods,is_alerting,"
-      "alert_level,plugin_degraded,l3_match_type,l3_similarity "
+      "alert_level,plugin_degraded,ml_noise_type,ml_noise_score,ml_top_types "
       "FROM metrics_history WHERE sensor_id=? AND timestamp_ms>=? AND "
       "timestamp_ms<=? ORDER BY timestamp_ms ASC";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -388,8 +390,10 @@ std::vector<MetricsHistoryRecord> NoiseStore::query_metrics(
     s.alert_level = static_cast<AlertLevel>(sqlite3_column_int(stmt, 28));
     s.plugin_degraded = sqlite3_column_int(stmt, 29) != 0;
     if (const unsigned char* t = sqlite3_column_text(stmt, 30))
-      s.l3_match_type = reinterpret_cast<const char*>(t);
-    s.l3_similarity = static_cast<float>(sqlite3_column_double(stmt, 31));
+      s.ml_noise_type = reinterpret_cast<const char*>(t);
+    s.ml_noise_score = static_cast<float>(sqlite3_column_double(stmt, 31));
+    if (const unsigned char* t = sqlite3_column_text(stmt, 32))
+      s.ml_top_types = reinterpret_cast<const char*>(t);
     // timestamp_ms 字段（快照内的相对帧计数）设为墙钟，与 DB 列一致，
     // 供 /history JSON 输出时间戳。
     s.timestamp_ms = r.timestamp_ms;

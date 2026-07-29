@@ -37,7 +37,7 @@
 
 #ifdef _USE_NOISE_
 #include "noise/noise_http.hpp"
-#include "noise/ml_classifier.hpp"  // Spec5 T3：L3 VGGish ML 分类
+#include "noise/ml_classifier.hpp"  // L3 YAMNet ML 分类
 #include "noise/noise_history.hpp"  // Spec6 T1：NoiseStore SQLite 仓储
 #include "noise/noise_manager.hpp"
 #include "noise/noise_template_db.hpp"
@@ -211,10 +211,9 @@ int main(int argc, char* argv[]) {
           std::make_shared<NoiseSessionManagerBridge>(pcm_capture);
       auto noise_manager = std::make_shared<noise::NoiseManager>(*noise_bridge);
       noise_manager->set_onnx_model_dir(config->get_onnx_model_dir());
-      // Spec5 T3：L3 VGGish ML 分类器 + 模板库（须在 load_status/add_sensor 前
-      // 注入，使恢复的 sensor 的 NoiseAnalyzer 持有 ml_classifier +
-      // template_db； 为空/加载失败 -> available()=false，L3 跳过，L1+L2
-      // 不受影响）。
+      // L3 YAMNet ML 分类器（须在 load_status/add_sensor 前注入，使恢复的
+      // sensor 的 NoiseAnalyzer 持有 ml_classifier；为空/加载失败 ->
+      // available()=false，L3 跳过，L1+L2 不受影响）。
       auto noise_template_db = std::make_shared<noise::NoiseTemplateDB>();
       if (!config->get_noise_template_dir().empty()) {
         noise_template_db->load(config->get_noise_template_dir());
@@ -224,7 +223,6 @@ int main(int argc, char* argv[]) {
         ml_classifier->init(config->get_ml_model_path());
       }
       noise_manager->set_ml_classifier(ml_classifier);
-      noise_manager->set_template_db(noise_template_db);
       // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。非空
       // noise_db_path 时创建 NoiseStore + 启动 history housekeeper 线程
       // （控制线程定时 drain pending -> SQLite）。空 -> 历史持久化禁用。
@@ -343,7 +341,7 @@ int main(int argc, char* argv[]) {
       // 注册 /api/noise/* 路由（sensor + template，arch §5.1/§5.3）。
       // http_server.init() 之后调用（svr_ 已配置，未 listen）。
       noise::register_noise_routes(http_server.server(), *noise_manager,
-                                   *noise_template_db, ml_classifier);
+                                   *noise_template_db);
 #endif
 
       /* load session status from file */

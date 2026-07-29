@@ -75,11 +75,19 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   latest_.noise_type = analysis.primary_type;
   latest_.noise_type_confidence = analysis.primary_confidence;
   latest_.is_mixed = analysis.is_mixed;
-  // Spec5 T3：主结果来源层（l1/l2/l3）。
+  // 主结果来源层（l1/l2/l3）。
   latest_.noise_type_source = analysis.noise_type_source;
-  // Spec6 T1（D-S6.7）：L3 分类结果字段暴露（从 NoiseAnalysisResult 拷入）。
-  latest_.l3_match_type = analysis.l3_match_type;
-  latest_.l3_similarity = analysis.l3_similarity;
+  // L3 分类结果字段暴露（从 NoiseAnalysisResult 拷入）。
+  latest_.ml_noise_type = analysis.ml_noise_type;
+  latest_.ml_noise_score = analysis.ml_noise_score;
+  // ml_top_types 序列化为 "type:score;type:score" 字符串。
+  latest_.ml_top_types.clear();
+  for (size_t i = 0; i < analysis.ml_top_types.size(); ++i) {
+    if (i > 0)
+      latest_.ml_top_types += ";";
+    latest_.ml_top_types += analysis.ml_top_types[i].type_name + ":" +
+                            std::to_string(analysis.ml_top_types[i].score);
+  }
   // candidates：vector -> 定长 array（最多 3，避免 per-call 堆分配）。
   size_t n = std::min(analysis.candidates.size(), kMaxNoiseCandidates);
   for (size_t i = 0; i < n; ++i) {

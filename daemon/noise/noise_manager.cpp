@@ -440,7 +440,7 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
 
   // ③ 分析源选择（arch §3.3.1）：
   //   denoise_enabled=true  -> NoisePCM (out->noise = original - denoised)
-  //                            纯噪声分量，分类最准
+  //                            纯噪声分量，L1 频域分析最准
   //   denoise_enabled=false -> OriginalPCM (pcm)
   const float* analysis_pcm = pcm;
   size_t analysis_n = n;
@@ -448,8 +448,11 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
     analysis_pcm = out->noise;
     analysis_n = dn;
   }
+  // L3 (YAMNet) 传入原始 PCM：YAMNet 多标签分类需完整混合音频，
+  // 能同时识别语音+噪声，白名单过滤 Speech 后报告噪声类型。
+  // 降噪开启时噪声分量是失真残留，YAMNet 无法有效分类。
   NoiseAnalysisResult ar =
-      ctx.analyzer->analyze(analysis_pcm, analysis_n, detection);
+      ctx.analyzer->analyze(analysis_pcm, analysis_n, detection, pcm, n);
   *ctx.last_analysis =
       ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
 

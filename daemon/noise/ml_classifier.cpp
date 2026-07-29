@@ -42,7 +42,7 @@ constexpr size_t kYamnetInputSamples = 48000;  // 3s @16k
 constexpr size_t kYamnetNumClasses = 521;      // AudioSet 类别数
 constexpr size_t kYamnetNumFrames = 6;         // 3s -> 6 帧（0.5s/帧）
 constexpr size_t kTopN = 3;                    // 返回 top-3
-constexpr float kMinScore = 0.1f;              // 最低报告分数
+constexpr float kMinScore = 0.05f;             // 最低报告分数
 
 // sanitize：非有限 -> 0。
 inline float sanitize(float v) {
@@ -50,52 +50,58 @@ inline float sanitize(float v) {
 }
 
 // 噪声相关类别白名单（AudioSet index）。
-// 排除语音、音乐、动物、自然声等非噪声类别。
+// 排除语音、音乐、动物等非噪声类别。
 // 来源：yamnet_class_map.csv 中与噪声诊断相关的 index。
 constexpr int kNoiseClassIndices[] = {
-    32,   // Humming
-    79,   // Hiss
-    105,  // Roar
-    125,  // Buzz
-    130,  // Rattle
-    277,  // Wind
-    279,  // Wind noise (microphone)
-    293,  // Crackle
-    300,  // Motor vehicle (road)
-    320,  // Motorcycle
-    321,  // Traffic noise, roadway noise
-    323,  // Train
-    330,  // Aircraft engine
-    331,  // Jet engine
-    337,  // Engine
-    338,  // Light engine (high frequency)
-    342,  // Medium engine (mid frequency)
-    343,  // Heavy engine (low frequency)
-    344,  // Engine knocking
-    353,  // Knock
-    355,  // Squeak
-    371,  // Vacuum cleaner
-    382,  // Alarm
-    390,  // Siren
-    392,  // Buzzer
-    406,  // Mechanical fan
-    407,  // Air conditioning
-    428,  // Burst, pop
-    434,  // Crack
-    448,  // Pump (liquid)
-    454,  // Thump, thud
-    469,  // Scrape
-    478,  // Clang
-    482,  // Whir
-    485,  // Clicking
-    487,  // Rumble
-    490,  // Hum
-    507,  // Noise
-    508,  // Environmental noise
-    509,  // Static
-    510,  // Mains hum
-    514,  // White noise
-    515,  // Pink noise
+    32,   // Humming -- 嗡鸣
+    79,   // Hiss -- 嘶嘶声
+    105,  // Roar -- 轰鸣
+    125,  // Buzz -- 蜂鸣
+    130,  // Rattle -- 咔嗒声
+    277,  // Wind -- 风声
+    279,  // Wind noise (microphone) -- 麦克风风噪
+    282,  // Water -- 水声
+    286,  // Stream -- 溪流声
+    293,  // Crackle -- 爆裂声
+    300,  // Motor vehicle (road) -- 机动车
+    320,  // Motorcycle -- 摩托车
+    321,  // Traffic noise, roadway noise -- 交通噪声
+    323,  // Train -- 火车
+    330,  // Aircraft engine -- 飞机引擎
+    331,  // Jet engine -- 喷气引擎
+    337,  // Engine -- 引擎
+    338,  // Light engine (high frequency) -- 轻型引擎（高频）
+    342,  // Medium engine (mid frequency) -- 中型引擎（中频）
+    343,  // Heavy engine (low frequency) -- 重型引擎（低频）
+    344,  // Engine knocking -- 引擎爆震
+    353,  // Knock -- 敲击
+    355,  // Squeak -- 吱吱声
+    371,  // Vacuum cleaner -- 吸尘器
+    382,  // Alarm -- 警报
+    390,  // Siren -- 警笛
+    392,  // Buzzer -- 蜂鸣器
+    406,  // Mechanical fan -- 机械风扇
+    407,  // Air conditioning -- 空调
+    428,  // Burst, pop -- 爆裂、砰声
+    434,  // Crack -- 断裂声
+    438,  // Liquid -- 液体声
+    443,  // Pour -- 倾倒声
+    444,  // Trickle, dribble -- 滴漏声
+    448,  // Pump (liquid) -- 泵（液体）
+    454,  // Thump, thud -- 沉闷撞击
+    469,  // Scrape -- 刮擦声
+    478,  // Clang -- 哐当声
+    482,  // Whir -- 旋转嗡声
+    485,  // Clicking -- 咔哒声
+    487,  // Rumble -- 隆隆声
+    490,  // Hum -- 嗡嗡声
+    504,  // Outside, rural or natural -- 户外/自然环境声
+    507,  // Noise -- 噪声（通用）
+    508,  // Environmental noise -- 环境噪声
+    509,  // Static -- 静电噪声
+    510,  // Mains hum -- 工频哼声
+    514,  // White noise -- 白噪声
+    515,  // Pink noise -- 粉红噪声
 };
 constexpr size_t kNoiseClassCount =
     sizeof(kNoiseClassIndices) / sizeof(kNoiseClassIndices[0]);

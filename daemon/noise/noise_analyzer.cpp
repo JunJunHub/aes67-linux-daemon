@@ -179,7 +179,9 @@ void NoiseAnalyzer::set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
 NoiseAnalysisResult NoiseAnalyzer::analyze(
     const float* frames,
     size_t frame_size,
-    const NoiseDetectionResult& detection) {
+    const NoiseDetectionResult& detection,
+    const float* original_pcm,
+    size_t original_n) {
   NoiseAnalysisResult result{};
   result.is_speech = detection.is_speech;
 
@@ -194,8 +196,13 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
     return result;
 
   // L3 PCM 累积 + 分类：独立于 VAD 和 L1。
-  // YAMNet 多标签分类能处理混合音频（语音+噪声），不受 VAD 门控。
-  maybe_run_l3_(result, frames, frame_size);
+  // L3 优先使用原始音频（YAMNet 多标签分类需完整混合音频，能同时识别
+  // 语音+噪声，白名单过滤掉 Speech 后报告噪声类型）。降噪开启时噪声分量
+  // 是失真残留，YAMNet 无法有效分类。无原始音频时回退到 frames。
+  const float* l3_pcm =
+      (original_pcm && original_n > 0) ? original_pcm : frames;
+  size_t l3_n = (original_pcm && original_n > 0) ? original_n : frame_size;
+  maybe_run_l3_(result, l3_pcm, l3_n);
 
   // L1 频域分析：始终运行，不受 VAD 门控。
   // 降噪开启时分析输入是噪声分量（纯噪声），VAD 无意义。

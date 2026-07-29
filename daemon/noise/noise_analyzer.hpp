@@ -23,15 +23,15 @@ class NoiseTemplateDB;  // L2 kNN 检索的模板库（前向声明）
 
 // 噪声类型(arch §3.3.6 L548)。
 enum class NoiseType {
-  Clean,
-  White,
-  Pink,
-  Hum50Hz,
-  Hum60Hz,
-  Impulse,
-  Broadband,
-  Digital,
-  Unknown
+  Clean,      // 干净（无噪声）
+  White,      // 白噪声（平坦频谱）
+  Pink,       // 粉红噪声（-3dB/oct 斜率）
+  Hum50Hz,    // 50Hz 工频哼声
+  Hum60Hz,    // 60Hz 工频哼声
+  Impulse,    // 脉冲噪声
+  Broadband,  // 宽带噪声
+  Digital,    // 数字噪声（高频异常）
+  Unknown     // 未知
 };
 
 // 分析输入源(arch §3.3.6 L551)。
@@ -107,9 +107,18 @@ class NoiseAnalyzer {
   NoiseAnalyzer();
   ~NoiseAnalyzer();  // out-of-line：ml_classifier_ shared_ptr<MlClassifier>
                      // 需完整类型
+  // 分析一帧音频。
+  //   frames/frame_size：L1/L2 分析输入（降噪开启时为噪声分量，关闭时为原始
+  //   PCM） detection：VAD + SNR + SF 检测结果
+  //   original_pcm/original_n：原始音频（L3 用，YAMNet
+  //   多标签分类需完整混合音频。
+  //     为空时 L3 回退到 frames。降噪开启时 L3 应传原始 PCM 而非噪声分量，
+  //     因为 YAMNet 能同时识别语音+噪声，白名单过滤掉 Speech 后报告噪声类型。）
   NoiseAnalysisResult analyze(const float* frames,
                               size_t frame_size,
-                              const NoiseDetectionResult& detection);
+                              const NoiseDetectionResult& detection,
+                              const float* original_pcm = nullptr,
+                              size_t original_n = 0);
 
   // 注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1 不受影响）。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml);
@@ -150,7 +159,8 @@ class NoiseAnalyzer {
   float last_l3_score_{0.0f};
   std::vector<MlTypeScore> last_l3_top_types_;
   bool l3_has_result_{false};
-  // L3 触发判定 + classify 调用 + ml_* 字段填充。在 analyze() 末尾调用。
+  // L3 触发判定 + classify 调用 + ml_* 字段填充。在 analyze() 中调用。
+  // frames/frame_size 为 L3 分析输入（优先原始音频）。
   void maybe_run_l3_(NoiseAnalysisResult& result,
                      const float* frames,
                      size_t frame_size);

@@ -115,6 +115,10 @@ constexpr const char* kCreateMetricsSql =
     "is_alerting INTEGER,"
     "alert_level INTEGER,"
     "plugin_degraded INTEGER,"
+    "is_speech INTEGER,"
+    "l2_match_id INTEGER,"
+    "l2_match_name TEXT,"
+    "l2_similarity REAL,"
     "ml_noise_type TEXT,"
     "ml_noise_score REAL,"
     "ml_top_types TEXT,"
@@ -212,16 +216,19 @@ void NoiseStore::insert_metrics(
   const char* sql =
       "INSERT OR REPLACE INTO metrics_history "
       "(sensor_id,timestamp_ms,is_noisy,noise_confidence,estimated_snr_db,"
-      "noise_type,noise_type_confidence,is_mixed,noise_type_source,"
+      "noise_type,noise_type_confidence,is_mixed,"
       "noise_candidates,noise_candidates_count,noise_level_dbfs,"
       "spectral_centroid_hz,spectral_flatness,hum_strength_db,denoise_enabled,"
       "denoise_dry_wet,input_level_dbfs,output_level_dbfs,noise_reduction_db,"
       "ref_similarity,ref_noise_db,ref_delay_ms,alert_threshold_dbfs,"
       "hum_alert_threshold_db,snr_alert_threshold_db,"
       "ref_similarity_threshold,alert_debounce_periods,is_alerting,"
-      "alert_level,plugin_degraded,ml_noise_type,ml_noise_score,ml_top_types) "
+      "alert_level,plugin_degraded,is_speech,l2_match_id,l2_match_name,"
+      "l2_similarity,ml_noise_type,ml_noise_score,ml_top_types) "
       "VALUES "
-      "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+      "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+      ",?"
+      ")";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
     std::cerr << "NoiseStore: prepare metrics insert failed: "
               << sqlite3_errmsg(db_) << "\n";
@@ -238,34 +245,36 @@ void NoiseStore::insert_metrics(
     sqlite3_bind_int(stmt, 6, static_cast<int>(s.noise_type));
     sqlite3_bind_double(stmt, 7, s.noise_type_confidence);
     sqlite3_bind_int(stmt, 8, s.is_mixed ? 1 : 0);
-    sqlite3_bind_text(stmt, 9, s.noise_type_source.c_str(), -1,
-                      SQLITE_TRANSIENT);
     std::string cand = candidates_to_str(s);
-    sqlite3_bind_text(stmt, 10, cand.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(stmt, 11, static_cast<int>(s.noise_candidates_count));
-    sqlite3_bind_double(stmt, 12, s.noise_level_dbfs);
-    sqlite3_bind_double(stmt, 13, s.spectral_centroid_hz);
-    sqlite3_bind_double(stmt, 14, s.spectral_flatness);
-    sqlite3_bind_double(stmt, 15, s.hum_strength_db);
-    sqlite3_bind_int(stmt, 16, s.denoise_enabled ? 1 : 0);
-    sqlite3_bind_double(stmt, 17, s.denoise_dry_wet);
-    sqlite3_bind_double(stmt, 18, s.input_level_dbfs);
-    sqlite3_bind_double(stmt, 19, s.output_level_dbfs);
-    sqlite3_bind_double(stmt, 20, s.noise_reduction_db);
-    sqlite3_bind_double(stmt, 21, s.ref_similarity);
-    sqlite3_bind_double(stmt, 22, s.ref_noise_db);
-    sqlite3_bind_double(stmt, 23, s.ref_delay_ms);
-    sqlite3_bind_double(stmt, 24, s.alert_threshold_dbfs);
-    sqlite3_bind_double(stmt, 25, s.hum_alert_threshold_db);
-    sqlite3_bind_double(stmt, 26, s.snr_alert_threshold_db);
-    sqlite3_bind_double(stmt, 27, s.ref_similarity_threshold);
-    sqlite3_bind_int(stmt, 28, static_cast<int>(s.alert_debounce_periods));
-    sqlite3_bind_int(stmt, 29, s.is_alerting ? 1 : 0);
-    sqlite3_bind_int(stmt, 30, static_cast<int>(s.alert_level));
-    sqlite3_bind_int(stmt, 31, s.plugin_degraded ? 1 : 0);
-    sqlite3_bind_text(stmt, 32, s.ml_noise_type.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_double(stmt, 33, s.ml_noise_score);
-    sqlite3_bind_text(stmt, 34, s.ml_top_types.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, cand.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 10, static_cast<int>(s.noise_candidates_count));
+    sqlite3_bind_double(stmt, 11, s.noise_level_dbfs);
+    sqlite3_bind_double(stmt, 12, s.spectral_centroid_hz);
+    sqlite3_bind_double(stmt, 13, s.spectral_flatness);
+    sqlite3_bind_double(stmt, 14, s.hum_strength_db);
+    sqlite3_bind_int(stmt, 15, s.denoise_enabled ? 1 : 0);
+    sqlite3_bind_double(stmt, 16, s.denoise_dry_wet);
+    sqlite3_bind_double(stmt, 17, s.input_level_dbfs);
+    sqlite3_bind_double(stmt, 18, s.output_level_dbfs);
+    sqlite3_bind_double(stmt, 19, s.noise_reduction_db);
+    sqlite3_bind_double(stmt, 20, s.ref_similarity);
+    sqlite3_bind_double(stmt, 21, s.ref_noise_db);
+    sqlite3_bind_double(stmt, 22, s.ref_delay_ms);
+    sqlite3_bind_double(stmt, 23, s.alert_threshold_dbfs);
+    sqlite3_bind_double(stmt, 24, s.hum_alert_threshold_db);
+    sqlite3_bind_double(stmt, 25, s.snr_alert_threshold_db);
+    sqlite3_bind_double(stmt, 26, s.ref_similarity_threshold);
+    sqlite3_bind_int(stmt, 27, static_cast<int>(s.alert_debounce_periods));
+    sqlite3_bind_int(stmt, 28, s.is_alerting ? 1 : 0);
+    sqlite3_bind_int(stmt, 29, static_cast<int>(s.alert_level));
+    sqlite3_bind_int(stmt, 30, s.plugin_degraded ? 1 : 0);
+    sqlite3_bind_int(stmt, 31, s.is_speech ? 1 : 0);
+    sqlite3_bind_int(stmt, 32, static_cast<int>(s.l2_match_id));
+    sqlite3_bind_text(stmt, 33, s.l2_match_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 34, s.l2_similarity);
+    sqlite3_bind_text(stmt, 35, s.ml_noise_type.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_double(stmt, 36, s.ml_noise_score);
+    sqlite3_bind_text(stmt, 37, s.ml_top_types.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
       std::cerr << "NoiseStore: metrics insert step failed: "
                 << sqlite3_errmsg(db_) << "\n";
@@ -325,14 +334,15 @@ std::vector<MetricsHistoryRecord> NoiseStore::query_metrics(
   sqlite3_stmt* stmt = nullptr;
   const char* sql =
       "SELECT timestamp_ms,is_noisy,noise_confidence,estimated_snr_db,"
-      "noise_type,noise_type_confidence,is_mixed,noise_type_source,"
+      "noise_type,noise_type_confidence,is_mixed,"
       "noise_candidates,noise_candidates_count,noise_level_dbfs,"
       "spectral_centroid_hz,spectral_flatness,hum_strength_db,denoise_enabled,"
       "denoise_dry_wet,input_level_dbfs,output_level_dbfs,noise_reduction_db,"
       "ref_similarity,ref_noise_db,ref_delay_ms,alert_threshold_dbfs,"
       "hum_alert_threshold_db,snr_alert_threshold_db,"
       "ref_similarity_threshold,alert_debounce_periods,is_alerting,"
-      "alert_level,plugin_degraded,ml_noise_type,ml_noise_score,ml_top_types "
+      "alert_level,plugin_degraded,is_speech,l2_match_id,l2_match_name,"
+      "l2_similarity,ml_noise_type,ml_noise_score,ml_top_types "
       "FROM metrics_history WHERE sensor_id=? AND timestamp_ms>=? AND "
       "timestamp_ms<=? ORDER BY timestamp_ms ASC";
   if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -356,43 +366,46 @@ std::vector<MetricsHistoryRecord> NoiseStore::query_metrics(
         static_cast<float>(sqlite3_column_double(stmt, 5));
     s.is_mixed = sqlite3_column_int(stmt, 6) != 0;
     if (const unsigned char* t = sqlite3_column_text(stmt, 7))
-      s.noise_type_source = reinterpret_cast<const char*>(t);
-    if (const unsigned char* t = sqlite3_column_text(stmt, 8))
       str_to_candidates(reinterpret_cast<const char*>(t), s);
-    s.noise_candidates_count = static_cast<size_t>(sqlite3_column_int(stmt, 9));
+    s.noise_candidates_count = static_cast<size_t>(sqlite3_column_int(stmt, 8));
     // guard count vs parsed
     if (s.noise_candidates_count > kMaxNoiseCandidates)
       s.noise_candidates_count = kMaxNoiseCandidates;
-    s.noise_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 10));
+    s.noise_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 9));
     s.spectral_centroid_hz =
-        static_cast<float>(sqlite3_column_double(stmt, 11));
-    s.spectral_flatness = static_cast<float>(sqlite3_column_double(stmt, 12));
-    s.hum_strength_db = static_cast<float>(sqlite3_column_double(stmt, 13));
-    s.denoise_enabled = sqlite3_column_int(stmt, 14) != 0;
-    s.denoise_dry_wet = static_cast<float>(sqlite3_column_double(stmt, 15));
-    s.input_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 16));
-    s.output_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 17));
-    s.noise_reduction_db = static_cast<float>(sqlite3_column_double(stmt, 18));
-    s.ref_similarity = static_cast<float>(sqlite3_column_double(stmt, 19));
-    s.ref_noise_db = static_cast<float>(sqlite3_column_double(stmt, 20));
-    s.ref_delay_ms = static_cast<float>(sqlite3_column_double(stmt, 21));
+        static_cast<float>(sqlite3_column_double(stmt, 10));
+    s.spectral_flatness = static_cast<float>(sqlite3_column_double(stmt, 11));
+    s.hum_strength_db = static_cast<float>(sqlite3_column_double(stmt, 12));
+    s.denoise_enabled = sqlite3_column_int(stmt, 13) != 0;
+    s.denoise_dry_wet = static_cast<float>(sqlite3_column_double(stmt, 14));
+    s.input_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 15));
+    s.output_level_dbfs = static_cast<float>(sqlite3_column_double(stmt, 16));
+    s.noise_reduction_db = static_cast<float>(sqlite3_column_double(stmt, 17));
+    s.ref_similarity = static_cast<float>(sqlite3_column_double(stmt, 18));
+    s.ref_noise_db = static_cast<float>(sqlite3_column_double(stmt, 19));
+    s.ref_delay_ms = static_cast<float>(sqlite3_column_double(stmt, 20));
     s.alert_threshold_dbfs =
-        static_cast<float>(sqlite3_column_double(stmt, 22));
+        static_cast<float>(sqlite3_column_double(stmt, 21));
     s.hum_alert_threshold_db =
-        static_cast<float>(sqlite3_column_double(stmt, 23));
+        static_cast<float>(sqlite3_column_double(stmt, 22));
     s.snr_alert_threshold_db =
-        static_cast<float>(sqlite3_column_double(stmt, 24));
+        static_cast<float>(sqlite3_column_double(stmt, 23));
     s.ref_similarity_threshold =
-        static_cast<float>(sqlite3_column_double(stmt, 25));
+        static_cast<float>(sqlite3_column_double(stmt, 24));
     s.alert_debounce_periods =
-        static_cast<uint32_t>(sqlite3_column_int(stmt, 26));
-    s.is_alerting = sqlite3_column_int(stmt, 27) != 0;
-    s.alert_level = static_cast<AlertLevel>(sqlite3_column_int(stmt, 28));
-    s.plugin_degraded = sqlite3_column_int(stmt, 29) != 0;
-    if (const unsigned char* t = sqlite3_column_text(stmt, 30))
+        static_cast<uint32_t>(sqlite3_column_int(stmt, 25));
+    s.is_alerting = sqlite3_column_int(stmt, 26) != 0;
+    s.alert_level = static_cast<AlertLevel>(sqlite3_column_int(stmt, 27));
+    s.plugin_degraded = sqlite3_column_int(stmt, 28) != 0;
+    s.is_speech = sqlite3_column_int(stmt, 29) != 0;
+    s.l2_match_id = static_cast<uint32_t>(sqlite3_column_int(stmt, 30));
+    if (const unsigned char* t = sqlite3_column_text(stmt, 31))
+      s.l2_match_name = reinterpret_cast<const char*>(t);
+    s.l2_similarity = static_cast<float>(sqlite3_column_double(stmt, 32));
+    if (const unsigned char* t = sqlite3_column_text(stmt, 33))
       s.ml_noise_type = reinterpret_cast<const char*>(t);
-    s.ml_noise_score = static_cast<float>(sqlite3_column_double(stmt, 31));
-    if (const unsigned char* t = sqlite3_column_text(stmt, 32))
+    s.ml_noise_score = static_cast<float>(sqlite3_column_double(stmt, 34));
+    if (const unsigned char* t = sqlite3_column_text(stmt, 35))
       s.ml_top_types = reinterpret_cast<const char*>(t);
     // timestamp_ms 字段（快照内的相对帧计数）设为墙钟，与 DB 列一致，
     // 供 /history JSON 输出时间戳。

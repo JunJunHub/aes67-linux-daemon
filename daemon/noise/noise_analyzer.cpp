@@ -15,7 +15,8 @@
 #include <numeric>
 #include <vector>
 
-#include "ml_classifier.hpp"  // L3 ML 分类（YAMNet）
+#include "ml_classifier.hpp"      // L3 ML 分类（YAMNet）
+#include "noise_template_db.hpp"  // L2 Bark 模板匹配
 
 namespace noise {
 
@@ -171,32 +172,22 @@ void NoiseAnalyzer::set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
   ml_classifier_ = std::move(ml);
 }
 
+void NoiseAnalyzer::set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
+  template_db_ = std::move(db);
+}
+
 NoiseAnalysisResult NoiseAnalyzer::analyze(
     const float* frames,
     size_t frame_size,
     const NoiseDetectionResult& detection) {
   NoiseAnalysisResult result{};
-  result.primary_type = NoiseType::Unknown;
-  result.primary_confidence = 0.0f;
-  result.is_mixed = false;
-  result.noise_level_dbfs = -120.0f;
-  result.spectral_centroid_hz = 0.0f;
-  result.spectral_flatness = 0.0f;
-  result.hum_strength_db = 0.0f;
-  result.impulse_count = 0.0f;
-  result.band_energy.fill(0.0f);
+  result.is_speech = detection.is_speech;
+
   // L3 字段：恢复上次 L3 命中结果（持久化，避免 1/300 帧瞬态被覆盖）。
-  // maybe_run_l3_ 触发时更新 last_l3_*；未触发时恢复上次结果。
   if (l3_has_result_) {
     result.ml_noise_type = last_l3_type_;
     result.ml_noise_score = last_l3_score_;
     result.ml_top_types = last_l3_top_types_;
-    result.noise_type_source = "l3";
-  } else {
-    result.ml_noise_type.clear();
-    result.ml_noise_score = 0.0f;
-    result.ml_top_types.clear();
-    result.noise_type_source = "l1";
   }
 
   if (frame_size == 0 || frames == nullptr)
@@ -204,15 +195,12 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
 
   // L3 PCM 累积 + 分类：独立于 VAD 和 L1。
   // YAMNet 多标签分类能处理混合音频（语音+噪声），不受 VAD 门控。
-  // L3 与 L1 是互补维度（频域特征 vs 声源识别），并行运行互不门控。
   maybe_run_l3_(result, frames, frame_size);
 
-  // arch §3.3.1:分析 OriginalPCM(降噪关闭)时,需 VAD 过滤语音段,仅在
-  // 非语音段做频谱分析。speech 帧不是噪声 -> 跳过 L1 分析。
-  // L3 已在上面处理（PCM 累积不受 VAD 影响）。
-  if (detection.is_speech) {
-    return result;
-  }
+  // L1 频域分析：始终运行，不受 VAD 门控。
+  // 降噪开启时分析输入是噪声分量（纯噪声），VAD 无意义。
+  // 降噪关闭时 L1 规则本身不会误判语音为噪声（语音 SF≈0.1-0.3，不触发
+  // White/Pink；语音基频 80-300Hz，不触发 Hum50/60）。
 
   const float sample_rate = static_cast<float>(kDefaultSampleRate);
 
@@ -405,9 +393,20 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   if (!result.candidates.empty()) {
     result.primary_type = result.candidates[0].type;
     result.primary_confidence = result.candidates[0].confidence;
-    // 混合:candidates.size() >= 2 && candidates[1].confidence > 0.3
     result.is_mixed =
         result.candidates.size() >= 2 && result.candidates[1].confidence > 0.3f;
+  }
+
+  // ── L2 Bark 模板匹配（每帧，用当前 band_energy 匹配用户模板库）──
+  if (template_db_) {
+    auto [tid, sim] = template_db_->match(result.band_energy);
+    if (tid > 0) {
+      result.l2_match_id = tid;
+      result.l2_similarity = sim;
+      const Template* t = template_db_->get_template(tid);
+      if (t)
+        result.l2_match_name = t->name;
+    }
   }
 
   return result;
@@ -464,7 +463,6 @@ void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
     last_l3_score_ = m->score;
     last_l3_top_types_ = m->top_types;
     l3_has_result_ = true;
-    result.noise_type_source = "l3";
     result.ml_noise_type = m->type_name;
     result.ml_noise_score = m->score;
     result.ml_top_types = std::move(m->top_types);

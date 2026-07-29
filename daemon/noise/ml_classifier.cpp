@@ -162,10 +162,12 @@ void MlClassifier::load_class_map(const std::string& model_path) {
       continue;
     // 剩余部分为 display_name（可能含逗号+引号）。
     std::getline(ss, name);
-    // 去除首尾引号。
+    // 去除首尾引号 + Windows 换行符 \r。
     if (!name.empty() && name.front() == '"')
       name = name.substr(1);
     if (!name.empty() && name.back() == '"')
+      name.pop_back();
+    if (!name.empty() && name.back() == '\r')
       name.pop_back();
     try {
       int idx = std::stoi(idx_str);

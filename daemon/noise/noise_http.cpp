@@ -128,8 +128,11 @@ void append_snapshot_fields(std::stringstream& ss,
      << indent << "\"noise_type_confidence\": " << s.noise_type_confidence
      << ",\n"
      << indent << "\"is_mixed\": " << bool_str(s.is_mixed) << ",\n"
-     << indent << "\"noise_type_source\": \""
-     << escape_json(s.noise_type_source) << "\",\n"
+     << indent << "\"is_speech\": " << bool_str(s.is_speech) << ",\n"
+     << indent << "\"l2_match_id\": " << s.l2_match_id << ",\n"
+     << indent << "\"l2_match_name\": \"" << escape_json(s.l2_match_name)
+     << "\",\n"
+     << indent << "\"l2_similarity\": " << s.l2_similarity << ",\n"
      << indent << "\"estimated_snr_db\": " << s.estimated_snr_db;
   if (include_denoise_enabled) {
     ss << ",\n"
@@ -308,7 +311,8 @@ std::string history_records_to_csv(
   ss << "sensor_id,timestamp_ms,noise_level_dbfs,noise_type,"
         "noise_type_confidence,estimated_snr_db,spectral_flatness,hum_strength_"
         "db,denoise_enabled,noise_reduction_db,is_alerting,alert_level,"
-        "plugin_degraded,ml_noise_type,ml_noise_score,ml_top_types\n";
+        "plugin_degraded,is_speech,l2_match_name,l2_similarity,ml_noise_type,"
+        "ml_noise_score,ml_top_types\n";
   for (const auto& r : records) {
     const auto& s = r.snapshot;
     ss << static_cast<unsigned>(r.sensor_id) << "," << r.timestamp_ms << ","
@@ -319,8 +323,10 @@ std::string history_records_to_csv(
        << (s.denoise_enabled ? 1 : 0) << "," << s.noise_reduction_db << ","
        << (s.is_alerting ? 1 : 0) << ","
        << csv_escape(alert_level_to_string(s.alert_level)) << ","
-       << (s.plugin_degraded ? 1 : 0) << "," << csv_escape(s.ml_noise_type)
-       << "," << s.ml_noise_score << "," << csv_escape(s.ml_top_types) << "\n";
+       << (s.plugin_degraded ? 1 : 0) << "," << (s.is_speech ? 1 : 0) << ","
+       << csv_escape(s.l2_match_name) << "," << s.l2_similarity << ","
+       << csv_escape(s.ml_noise_type) << "," << s.ml_noise_score << ","
+       << csv_escape(s.ml_top_types) << "\n";
   }
   return ss.str();
 }

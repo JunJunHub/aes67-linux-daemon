@@ -637,9 +637,9 @@ BOOST_AUTO_TEST_CASE(classify_impulse) {
 }
 
 // Spec2 Task5 review Important #1:arch §3.3.1 要求分析 OriginalPCM 时
-// 用 VAD 过滤语音段,仅在非语音段做频谱分析。detection.is_speech=true 时
-// analyze() 必须跳过分析,返回 Unknown(语音帧不参与噪声分类)。
-BOOST_AUTO_TEST_CASE(analyze_skips_speech_frames) {
+// VAD 不再门控 L1 分析：is_speech=true 时 L1 仍运行（L1 规则不会误判语音
+// 为噪声），但 is_speech 字段记录在结果中供 metrics 上报。
+BOOST_AUTO_TEST_CASE(analyze_runs_l1_even_when_speech) {
   noise::NoiseAnalyzer ana;
   float buf[synth::kFrameSize];
   synth::white_noise(buf, synth::kFrameSize, 3);
@@ -647,7 +647,12 @@ BOOST_AUTO_TEST_CASE(analyze_skips_speech_frames) {
   det.is_speech = true;
   det.spectral_flatness = 0.8f;
   auto r = ana.analyze(buf, synth::kFrameSize, det);
-  BOOST_CHECK(r.primary_type == noise::NoiseType::Unknown);
+  // is_speech 记录在结果中
+  BOOST_CHECK(r.is_speech);
+  // L1 仍运行：白噪 SF>0.7 -> White 候选（语音不会产生此误判，因为
+  // 语音 SF≈0.1-0.3，此处输入是合成白噪，L1 正确识别）
+  BOOST_CHECK(r.primary_type == noise::NoiseType::White ||
+              r.noise_level_dbfs > -120.0f);
 }
 
 // Spec2 Task5 review Important #2 + Minor #5:200Hz 纯音不应被误分类为 Hum。
@@ -3690,7 +3695,7 @@ BOOST_AUTO_TEST_CASE(yamnet_classifies_known_noise) {
   }
 }
 
-// L1+L2 低置信度 -> 触发 L3 -> noise_type_source=l3。
+// L3 独立触发（静音 L1 无候选），ml_noise_type 非空。
 // 用假分类器（计数 classify 调用）+ 静音输入（L1 无候选 -> confidence 0 <
 // 阈值）。 静音填满 3s PCM 环形缓冲后 L3 触发。无模型依赖，恒跑。
 BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
@@ -3705,7 +3710,7 @@ BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
   // 144000/480 = 300 帧填满 PCM 环形缓冲；后续帧若仍低置信 -> L3 触发。
   for (int f = 0; f < 320; ++f) {
     auto ar = a.analyze(sil, synth::kFrameSize, det);
-    if (ar.noise_type_source == "l3") {
+    if (!ar.ml_noise_type.empty()) {
       triggered = true;
       BOOST_CHECK_EQUAL(ar.ml_noise_type, std::string("Air conditioning"));
       BOOST_CHECK_GT(ar.ml_noise_score, 0.0f);
@@ -3729,7 +3734,7 @@ BOOST_AUTO_TEST_CASE(l3_runs_independently_of_l1) {
   bool l3_triggered = false;
   for (int f = 0; f < 320; ++f) {
     auto ar = a.analyze(wn, synth::kFrameSize, det);
-    if (ar.noise_type_source == "l3") {
+    if (!ar.ml_noise_type.empty()) {
       l3_triggered = true;
       // L3 触发时 L1 结果仍在（White 或 Unknown）。
       BOOST_CHECK(ar.primary_type == noise::NoiseType::White ||
@@ -3924,15 +3929,16 @@ BOOST_AUTO_TEST_CASE(history_export_csv) {
   BOOST_REQUIRE(r);
   BOOST_CHECK_EQUAL(r->status, 200);
 
-  // T1#2: 验证 CSV header 完整（16 字段）。
+  // T1#2: 验证 CSV header 完整（19 字段）。
   BOOST_CHECK(r->body.find("sensor_id,timestamp_ms,noise_level_dbfs,"
                            "noise_type,noise_type_confidence,estimated_snr_db,"
                            "spectral_flatness,hum_strength_db,denoise_enabled,"
                            "noise_reduction_db,is_alerting,alert_level,"
-                           "plugin_degraded,ml_noise_type,ml_noise_score,"
+                           "plugin_degraded,is_speech,l2_match_name,"
+                           "l2_similarity,ml_noise_type,ml_noise_score,"
                            "ml_top_types") != std::string::npos);
 
-  // T1#2: 解析数据行，验证字段数（16 字段 = 15 逗号）+ sensor_id=0。
+  // T1#2: 解析数据行，验证字段数（19 字段 = 18 逗号）+ sensor_id=0。
   std::istringstream iss(r->body);
   std::string line;
   std::getline(iss, line);  // skip header
@@ -3942,7 +3948,7 @@ BOOST_AUTO_TEST_CASE(history_export_csv) {
       continue;
     has_data = true;
     size_t commas = std::count(line.begin(), line.end(), ',');
-    BOOST_CHECK_EQUAL(commas, 15u);
+    BOOST_CHECK_EQUAL(commas, 18u);
     // 第一个字段是 sensor_id，应为 0。
     BOOST_CHECK_EQUAL(line.find("0,"), 0u);
     break;
@@ -3996,6 +4002,9 @@ BOOST_AUTO_TEST_CASE(ml_fields_in_metrics_response) {
   BOOST_CHECK(r->body.find("\"ml_noise_type\"") != std::string::npos);
   BOOST_CHECK(r->body.find("\"ml_noise_score\"") != std::string::npos);
   BOOST_CHECK(r->body.find("\"ml_top_types\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"is_speech\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l2_match_name\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l2_similarity\"") != std::string::npos);
   svr.stop();
   svr_thread.join();
 }

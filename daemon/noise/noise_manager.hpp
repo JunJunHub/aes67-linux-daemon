@@ -389,6 +389,11 @@ class NoiseManager {
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
     ml_classifier_ = ml;
   }
+  // 注入 L2 模板库。add_sensor 时转发到每个 sensor 的 NoiseAnalyzer。
+  // 空 shared_ptr -> L2 跳过。
+  void set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
+    template_db_ = std::move(db);
+  }
 
   // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。控制线程调用
   // （main wiring，init 前；非空时启动 history housekeeper 线程）。空
@@ -476,6 +481,8 @@ class NoiseManager {
   // L3 ML 分类器（Config 注入，转发到各 sensor 的 analyzer）。
   // 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor 共享同一实例。
   std::shared_ptr<MlClassifier> ml_classifier_;
+  // L2 模板库（Config 注入，转发到各 sensor 的 analyzer）。
+  std::shared_ptr<NoiseTemplateDB> template_db_;
   // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
   std::shared_ptr<NoiseStore> noise_store_;
   // Spec6 T2：降噪总延迟变更转发回调（init-only，运行期不改）。

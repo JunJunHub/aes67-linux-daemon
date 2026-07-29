@@ -37,43 +37,43 @@ enum class NoiseType {
 // 分析输入源(arch §3.3.6 L551)。
 enum class AnalysisSource { OriginalPCM, NoisePCM, ResidualPCM };
 
-// 候选噪声类型 + 置信度(arch §3.3.6 L554-557)。
+// L1 候选噪声类型 + 置信度(arch §3.3.6 L554-557)。
 struct NoiseTypeCandidate {
   NoiseType type;    // 候选噪声类型
   float confidence;  // 置信度 [0, 1]
 };
 
-// 噪声分析结果(arch §3.3.6 L559-579)。
+// 噪声分析结果。L1/L2/L3 三层并行上报，各有独立字段。
 struct NoiseAnalysisResult {
-  // 主结果(最高置信度候选)
-  NoiseType primary_type;
-  float primary_confidence;  // 主类型置信度 [0, 1]
+  // VAD 结果（从 detection 拷入，供 metrics 上报）
+  bool is_speech{false};
 
-  // top-N 候选(按置信度降序),用于混合噪声场景
-  // 最多 3 个,仅包含 confidence > 0.1 的候选
-  std::vector<NoiseTypeCandidate> candidates;
+  // ── L1 规则式分类（频域特征：White/Pink/Hum/Broadband 等）──
+  NoiseType primary_type{NoiseType::Unknown};
+  float primary_confidence{0.0f};              // L1 主类型置信度 [0, 1]
+  std::vector<NoiseTypeCandidate> candidates;  // top-3 候选（confidence > 0.1）
+  bool is_mixed{
+      false};  // candidates.size() >= 2 && candidates[1].confidence > 0.3
 
-  // 是否为混合噪声(多个候选置信度接近)
-  // 判定条件:candidates.size() >= 2 && candidates[1].confidence > 0.3
-  bool is_mixed;
+  // ── L2 Bark 模板匹配（用户自定义噪声模板）──
+  // 每帧用 32 维 Bark 频带能量与模板库做余弦相似度匹配。
+  // similarity > 0.75 才视为匹配；无模板库 / 无匹配 -> 空值。
+  uint32_t l2_match_id{0};    // 匹配到的模板 id（0=未匹配）
+  std::string l2_match_name;  // 模板名称
+  float l2_similarity{0.0f};  // 余弦相似度 [0, 1]
 
-  // 量化指标
-  float noise_level_dbfs;      // 噪声级 (dBFS)
-  float spectral_centroid_hz;  // 频谱质心
-  float spectral_flatness;     // 频谱平坦度 [0, 1],暴露给 UI
-  float hum_strength_db;       // 工频哼声强度 (dB)
-  float impulse_count;         // 脉冲计数/秒
-  std::array<float, 32> band_energy;  // 1/3 倍频程能量(L2 模板匹配特征向量)
-
-  // L3 ML 分类结果（YAMNet 端到端分类）。仅当 L1+L2 均未识别
-  // （primary_confidence < 阈值）且 MlClassifier 可用时填充。
-  // noise_type_source 标识主结果的来源层："l1"（L1 规则式，默认）
-  // / "l2"（Bark 模板）/ "l3"（YAMNet ML）。当 source="l3" 时，主类型权威值
-  // 为 ml_noise_type（YAMNet 类名），primary_type 仍为 L1 的 Unknown。
-  std::string ml_noise_type;  // YAMNet top-1 类名（空=未触发/未匹配）
+  // ── L3 YAMNet 分类（端到端声源识别）──
+  std::string ml_noise_type;              // YAMNet top-1 类名
   float ml_noise_score{0.0f};             // YAMNet top-1 分数 [0, 1]
   std::vector<MlTypeScore> ml_top_types;  // YAMNet top-3（白名单内）
-  std::string noise_type_source;  // 主结果来源层 "l1"|"l2"|"l3"（默认空=l1）
+
+  // ── 量化指标 ──
+  float noise_level_dbfs{-120.0f};    // 噪声级 (dBFS)
+  float spectral_centroid_hz{0.0f};   // 频谱质心
+  float spectral_flatness{0.0f};      // 频谱平坦度 [0, 1]
+  float hum_strength_db{0.0f};        // 工频哼声强度 (dB)
+  float impulse_count{0.0f};          // 脉冲计数/秒
+  std::array<float, 32> band_energy;  // 1/3 倍频程能量（L2 特征向量）
 };
 
 // 逐帧特征(arch §3.3.7 L610-619)。
@@ -112,9 +112,9 @@ class NoiseAnalyzer {
                               const NoiseDetectionResult& detection);
 
   // 注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1 不受影响）。
-  // 控制线程调用（add_sensor 后），由 NoiseManager 转发同一 shared_ptr
-  // 给所有 sensor 的 analyzer 共享。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml);
+  // 注入 L2 模板库。空 shared_ptr -> L2 跳过。
+  void set_template_db(std::shared_ptr<NoiseTemplateDB> db);
 
  private:
   // L1: 规则式分类(各规则输出置信度)
@@ -125,6 +125,9 @@ class NoiseAnalyzer {
       const float* frames,
       size_t frame_size,
       float spectral_flatness);
+
+  // ── L2 Bark 模板匹配（用户自定义噪声模板）──
+  std::shared_ptr<NoiseTemplateDB> template_db_;
 
   // ── L3 ML 分类层（YAMNet 端到端分类，独立于 L1）──
   // L3 分类器（可选，空则跳过）。

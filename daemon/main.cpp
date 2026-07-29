@@ -223,6 +223,7 @@ int main(int argc, char* argv[]) {
         ml_classifier->init(config->get_ml_model_path());
       }
       noise_manager->set_ml_classifier(ml_classifier);
+      noise_manager->set_template_db(noise_template_db);
       // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。非空
       // noise_db_path 时创建 NoiseStore + 启动 history housekeeper 线程
       // （控制线程定时 drain pending -> SQLite）。空 -> 历史持久化禁用。

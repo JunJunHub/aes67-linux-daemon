@@ -68,19 +68,22 @@ void NoiseMetrics::collect(const DenoiseResult& denoise,
   (void)denoise;
   // ② 检测结果
   latest_.is_noisy = detection.is_noisy;
+  latest_.is_speech = detection.is_speech;
   latest_.noise_confidence = detection.confidence;
   latest_.estimated_snr_db = detection.estimated_snr_db;
 
-  // ③ 分析结果
+  // ③ 分析结果 -- L1/L2/L3 三层并行
+  // L1
   latest_.noise_type = analysis.primary_type;
   latest_.noise_type_confidence = analysis.primary_confidence;
   latest_.is_mixed = analysis.is_mixed;
-  // 主结果来源层（l1/l2/l3）。
-  latest_.noise_type_source = analysis.noise_type_source;
-  // L3 分类结果字段暴露（从 NoiseAnalysisResult 拷入）。
+  // L2
+  latest_.l2_match_id = analysis.l2_match_id;
+  latest_.l2_match_name = analysis.l2_match_name;
+  latest_.l2_similarity = analysis.l2_similarity;
+  // L3
   latest_.ml_noise_type = analysis.ml_noise_type;
   latest_.ml_noise_score = analysis.ml_noise_score;
-  // ml_top_types 序列化为 "type:score;type:score" 字符串。
   latest_.ml_top_types.clear();
   for (size_t i = 0; i < analysis.ml_top_types.size(); ++i) {
     if (i > 0)

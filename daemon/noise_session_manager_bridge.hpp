@@ -29,6 +29,7 @@ class NoiseSessionManagerBridge : public noise::NoiseAudioBridge {
   bool is_sink_receiving(uint8_t sink_id) const override;
   uint32_t get_sample_rate() const override;
   uint8_t get_sink_channel_count(uint8_t sink_id) const override;
+  std::vector<uint8_t> get_sink_channel_map(uint8_t sink_id) const override;
 
   void set_ptp_status_callback(PtpStatusCallback cb) override;
   void set_period_lifecycle_callbacks(PeriodBeginCallback begin,

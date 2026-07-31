@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #ifdef _USE_NOISE_
 #include "noise/rcu_ptr.hpp"
@@ -85,6 +86,8 @@ class PcmCaptureService
   bool is_sink_receiving(uint8_t sink_id) const;
   uint32_t get_sample_rate() const;
   uint8_t get_sink_channel_count(uint8_t sink_id) const;
+  // 查询 sink 的 channel_map（来自 SessionManager::StreamSink.map）。
+  std::vector<uint8_t> get_sink_channel_map(uint8_t sink_id) const;
   bool is_capturing() const;
 
   // ── 测试专用（FAKE_DRIVER 下驱动 fake_capture_loop，不依赖

@@ -179,6 +179,9 @@ class NoiseAudioBridgeStub : public noise::NoiseAudioBridge {
   bool is_sink_receiving(uint8_t) const override { return false; }
   uint32_t get_sample_rate() const override { return 48000; }
   uint8_t get_sink_channel_count(uint8_t) const override { return 1; }
+  std::vector<uint8_t> get_sink_channel_map(uint8_t) const override {
+    return {};
+  }
   void set_ptp_status_callback(
       noise::NoiseAudioBridge::PtpStatusCallback) override {}
   void set_period_lifecycle_callbacks(

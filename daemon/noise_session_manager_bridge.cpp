@@ -69,6 +69,12 @@ uint8_t NoiseSessionManagerBridge::get_sink_channel_count(
   return pcm_capture_ ? pcm_capture_->get_sink_channel_count(sink_id) : 0;
 }
 
+std::vector<uint8_t> NoiseSessionManagerBridge::get_sink_channel_map(
+    uint8_t sink_id) const {
+  return pcm_capture_ ? pcm_capture_->get_sink_channel_map(sink_id)
+                      : std::vector<uint8_t>{};
+}
+
 void NoiseSessionManagerBridge::set_ptp_status_callback(PtpStatusCallback cb) {
   ptp_cb_ = std::move(cb);
 }

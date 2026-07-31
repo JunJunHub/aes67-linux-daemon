@@ -146,12 +146,16 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
   // Spec3 T8b（C2 修复）：向 Bridge 注册 FrameProvider，使 PcmCaptureService
   // 分发的 ALSA period 帧经 Bridge 解复用后路由到 on_frame（arch §3.7 L791
-  // "向 Bridge 注册 FrameProvider"）。此前 add_sensor 不注册 frame provider，
-  // 生产 pipeline 永不运行 on_frame -> metrics 留默认 -> /denoised 404。
-  // channel_map 默认 {0}（Phase 1 单通道，arch §4.2 "channels 恒为 1"）。
-  // NoiseSensorConfig 无 map 字段，Phase 1 固定 channel 0。
+  // "向 Bridge 注册 FrameProvider"）。
+  // channel_map 从 Bridge 查询（真实场景：SessionManager::StreamSink.map，
+  // 用户通过 PUT /api/sink/:id 配置；FAKE 场景：sink 配置的 map 指向
+  // fake_pcm_source 目录下对应 channel 的 WAV）。
+  // 返回空时用 {0} 兜底（兼容旧配置，channel 0）。
+  std::vector<uint8_t> ch_map = bridge_.get_sink_channel_map(sink_id);
+  if (ch_map.empty())
+    ch_map = {0};
   bridge_.register_frame_provider(
-      sink_id, {0},
+      sink_id, ch_map,
       [this](uint8_t sid, const float* frames, size_t n, uint8_t /*ch*/) {
         on_frame(sid, frames, n);
       });

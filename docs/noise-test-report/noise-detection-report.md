@@ -184,7 +184,7 @@ SID | ESC-50 类别      | L1        | L3                      score
 
 ### 4.6 修复的并发验证阻断 bug
 
-64 路验证暴露并修复了 4 个使 FAKE 测试与真实场景行为不一致的 bug：
+64 路验证暴露并修复了 5 个使 FAKE 测试与真实场景行为不一致的 bug：
 
 1. **`fake_capture_loop` 不读 config 通道数**：硬用 `test_channels_`（默认 2），
    配 `streamer_channels=64` 仍只分发 2 通道。修复：优先用 config 值

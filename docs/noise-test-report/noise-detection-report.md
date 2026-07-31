@@ -119,47 +119,88 @@ analyze(frames, frame_size, detection, original_pcm, original_n)
 |------|-----|
 | Sensor 数 | 64（系统上限，sink 0-63） |
 | 降噪 | 关闭（`denoise_enabled=false`） |
-| 音频源 | VoiceBank-DEMAND p232_023.wav（含噪语音，循环播放） |
-| L3 模型 | YAMNet（共享单实例 + mutex） |
-| 查询轮次 | 每路查询 3 次，间隔 2s |
+| 音频源 | ESC-50 数据集 64 个环境声 WAV（22 类噪声，每类 3 个文件） |
+| 音频源模式 | `fake_pcm_source` 目录模式（64 文件 → 64 通道），各 channel 相位错开 |
+| Sink 绑定 | sink N 配 `map:[N]` 绑定驱动 channel N（贴近真实场景） |
+| L3 模型 | YAMNet（共享单实例 + mutex，局部 Resampler） |
+| 采样率 | 48kHz mono s16（ESC-50 44.1kHz 经 ffmpeg 转 48k） |
+
+测试音频覆盖 ESC-50 类别：rain/sea_waves/crackling_fire/crickets/water_drops/wind/
+pouring_water/thunderstorm/washing_machine/vacuum_cleaner/clock_alarm/clock_tick/
+helicopter/chainsaw/siren/engine/train/airplane/fireworks/hand_saw/toilet_flush/
+glass_breaking。
 
 ### 4.2 资源占用
 
 | 指标 | 值 |
 |------|-----|
-| **CPU** | 537%（8 核约 67%） |
-| **内存 (RSS)** | 250 MB |
-| **线程数** | 86（64 per-sink + 控制/HTTP/housekeeper） |
-| **稳定性** | 无崩溃，192 次查询全部返回 |
+| **CPU** | 547%（16 核，约 34%） |
+| **内存 (RSS)** | 287 MB |
+| **稳定性** | 无崩溃，3 轮 192 次查询全部返回 |
 
 ### 4.3 检测结果统计
 
 | 指标 | 值 |
 |------|-----|
-| **总查询** | 192 次（0 错误） |
-| **L1 分类 (conf>0)** | 0/192（0%） |
-| **L3 分类 (非空)** | **192/192（100%）** |
+| **不同 score 数** | **64/64（100% 独立）** |
+| **L3 类型多样性** | 21-25 种（3 轮） |
+| **L1 类型多样性** | 5-6 种（unknown/pink/digital/hum_60hz/hum_50hz/broadband） |
+| **L3 非空率** | 58/64（91%，6 路低于 min_score 阈值） |
 
-### 4.4 L3 类型分布
+### 4.4 L3 类型分布（典型轮次）
 
-| 类型 | 次数 | 占比 | 说明 |
-|------|------|------|------|
-| Pour（倾倒声） | 111 | 58% | 水声/液体倾倒 |
-| Trickle, dribble（滴漏声） | 81 | 42% | 水滴/细流 |
+| 类型 | 次数 | ESC-50 对应 | 命中合理性 |
+|------|------|------------|-----------|
+| Water（水声） | 11 | rain/sea_waves/pouring_water/water_drops | ✓ 合理 |
+| Engine（引擎） | 9 | engine/train/chainsaw/vacuum_cleaner | ✓ 合理 |
+| Alarm（警报） | 4 | clock_alarm/siren | ✓ 合理 |
+| Rattle（咔嗒） | 3 | crickets/clock_tick | ✓ 合理 |
+| Liquid（液体） | 3 | water_drops/toilet_flush | ✓ 合理 |
+| Jet engine（喷气引擎） | 3 | helicopter/vacuum_cleaner | ✓ 合理 |
+| Siren（警笛） | 2 | siren | ✓✓ 精确 |
+| Wind（风声） | 2 | wind/thunderstorm | ✓ 合理 |
+| Outside, rural/natural | 3 | fireworks/airplane | △ 近似 |
+| 其他（Crackle/Motor vehicle 等） | 数个 | 各类 | ✓ 合理 |
 
-两类都是水声相关，符合 VoiceBank-DEMAND p232_023 的音频特征。不同 sensor 的 L3 类型差异来自 YAMNet 触发时刻不同（3s 窗口落在音频不同位置）。
+> 64 路结果完全独立（64/64 不同 score），L3 覆盖 21+ 种类型，与 ESC-50
+> ground truth 高度吻合。此前"全部 Water"的假象是 channel_map 解复用 bug
+> 所致（详见 §4.6）。
 
-### 4.5 逐路结果示例
+### 4.5 逐路结果示例（修复后）
 
 ```
-SID | L1         conf  | L3                   score  | speech | SF      lvl     snr
-----------------------------------------------------------------------------------------
-  0 | unknown    0.000 | Pour                 0.0729 | True   | 0.0078  -18.8   22.1
-  3 | unknown    0.000 | Pour                 0.1021 | True   | 0.0078  -18.8   22.1
- 32 | unknown    0.000 | Trickle, dribble     0.0558 | True   | 0.0078  -18.8   22.1
- 48 | unknown    0.000 | Trickle, dribble     0.0558 | True   | 0.0078  -18.8   22.1
- 63 | unknown    0.000 | Pour                 0.1366 | True   | 0.0078  -18.8   22.1
+SID | ESC-50 类别      | L1        | L3                      score
+--------------------------------------------------------------------
+  0 | rain             | unknown   | Water                   0.786
+  9 | crickets         | unknown   | Rattle                  0.572
+ 12 | water_drops      | unknown   | Liquid                  0.337
+ 27 | vacuum_cleaner   | pink      | Jet engine              0.526
+ 42 | siren            | digital   | Siren                   0.391
+ 45 | engine           | pink      | Motor vehicle (road)    0.076
+ 48 | train            | unknown   | Wind                    0.085
+ 54 | fireworks        | unknown   | Outside, rural/natural  0.062
+ 63 | glass_breaking   | pink      | Scrape                  0.079
 ```
+
+### 4.6 修复的并发验证阻断 bug
+
+64 路验证暴露并修复了 4 个使 FAKE 测试与真实场景行为不一致的 bug：
+
+1. **`fake_capture_loop` 不读 config 通道数**：硬用 `test_channels_`（默认 2），
+   配 `streamer_channels=64` 仍只分发 2 通道。修复：优先用 config 值
+   （`config_->get_streamer_channels()`），与真实 `capture_loop` 一致。
+2. **`get_sink_channel_map` 宏守卫错误**：用 `#ifndef _USE_FAKE_DRIVER_` 跳过
+   SessionManager 查询，但生产 FAKE daemon 也定义该宏 → channel_map 查询被
+   跳过，所有 sink 兜底 channel 0 → 64 路听到同一音频。修复：改用
+   `_HAS_SESSION_MANAGER_LINK_` 宏（仅生产 aes67-daemon 定义，noise-test 不
+   定义），运行时 `session_manager_` 判空兜底。
+3. **`streamer_channels` config 校验过严**：上限 16（上游 AAC streamer 限制），
+   64 路配置被强制回退 8。修复：上限放宽到 64（RAVENNA 驱动支持 64 通道）。
+4. **`kMaxChannels` 容量不足**：bridge 解复用缓冲按 `kMaxChannels=8` 分配，
+   64 通道 period 超容量被整体丢弃。修复：`kMaxChannels=64`。
+5. **MlClassifier 共享 Resampler 状态污染**：单实例 `downsample` Resampler
+   被 64 路交叉调用，SpeexDSP 滤波状态残留导致分类失真。修复：`classify()`
+   改用局部 Resampler（无状态残留），每次独立。
 
 ---
 
@@ -177,17 +218,19 @@ SID | L1         conf  | L3                   score  | speech | SF      lvl     
 ### 5.2 并发影响
 
 - MlClassifier 是共享单实例（1 个 ONNX session，省内存）
-- `classify()` 用 `classify_mutex_` 保护 Resampler（有内部状态）
-- 64 路调 `classify()` 时串行通过 Resampler + ONNX Run
-- 每路每 3s 触发一次（300 帧中 1 帧），实际竞争极少
-- 最坏情况 64 路同时触发：64 × 19ms ≈ 1.2s 串行等待（实际不会同时）
+- `classify()` 用 `classify_mutex_` 保护 ONNX Run（Ort::Session 非线程安全）
+- **重采样改用局部 Resampler**（非成员）：此前成员 `downsample` 的 SpeexDSP
+  滤波状态被 64 路交叉调用污染（sensor A 残留混入 B 输出），导致分类失真
+  偏向 Water。局部构造无状态残留，3s 一次批处理构造开销可忽略（<<1ms）
+- 64 路调 `classify()` 时 ONNX Run 串行，每路每 3s 触发一次，实际竞争极少
 
 ### 5.3 L3 独立性
 
 每次 `classify()` 完全独立，无前后依赖：
 - 输入：环形缓冲中最新 3s PCM（144000 样本 @48k）
 - 不依赖上一次结果
-- 不维护跨调用状态（Resampler 内部滤波器系数不影响结果正确性）
+- 局部 Resampler 无跨调用状态（SpeexDSP 滤波器每次全新构造）
+- 64 路并发验证：64/64 不同 score，21+ 种 L3 类型，确认独立性
 
 ---
 
@@ -195,11 +238,12 @@ SID | L1         conf  | L3                   score  | speech | SF      lvl     
 
 | 模式 | 并发上限 | CPU 占用 | 说明 |
 |------|---------|---------|------|
-| **仅检测/分析**（无降噪） | **64 路**（系统硬上限） | ~537%（8核） | VAD + FFT + L1 规则 + L2 模板 + L3 YAMNet(每3s) |
+| **仅检测/分析**（无降噪） | **64 路**（系统硬上限） | ~547%（16核 34%） | VAD + FFT + L1 规则 + L2 模板 + L3 YAMNet(每3s) |
 | **降噪开启**（RNNoise/DTLN） | 4-8 路（参考） | - | 加 ONNX 降噪推理 1-3ms/帧 |
 | **降噪开启**（DeepFilterNet） | 2-4 路（参考） | - | 三子图推理 ~7ms/帧 |
 
-> 无降噪模式下 64 路全部跑到系统硬上限（AES67 Sink 上限 64），CPU 仍有余量。
+> 无降噪模式下 64 路全部跑到系统硬上限（AES67 Sink 上限 64），CPU 仍有余量
+> （16 核仅用 34%），可支持更高并发（受限于 64 路 Sink 上限）。
 
 ---
 

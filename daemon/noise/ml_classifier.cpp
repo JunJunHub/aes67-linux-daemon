@@ -112,8 +112,6 @@ struct MlClassifier::Impl {
   std::string in_name;
   std::string scores_name;
   std::string embeddings_name;
-  // 48k->16k 重采样器（有内部状态，不能并发调用 -> classify_mutex_ 保护）。
-  std::unique_ptr<Resampler> downsample;
   // class_map：AudioSet index -> display_name。
   std::unordered_map<int, std::string> class_map;
 };
@@ -201,8 +199,6 @@ bool MlClassifier::init(const std::string& model_path) {
     impl_->session.reset();
     return false;
   }
-  // 重采样器：48k -> 16k（YAMNet native）。
-  impl_->downsample = std::make_unique<Resampler>(48000, kYamnetSampleRate);
   // 加载 class_map CSV。
   load_class_map(model_path);
   return true;
@@ -214,12 +210,18 @@ std::optional<MlResult> MlClassifier::classify(const float* pcm48k,
     return std::nullopt;
 
   try {
-    // 1. 48k -> 16k 重采样（局部 buffer，线程安全：多 sensor 并发调用）。
-    const size_t cap = impl_->downsample->max_output_for_input(n);
+    // 1. 48k -> 16k 重采样。
+    // 用局部 Resampler 而非成员 impl_->downsample：MlClassifier 是所有 sensor
+    // 共享的单实例，成员 Resampler 的 SpeexDSP 滤波状态会被多路并发调用交叉
+    // 污染（sensor A 的滤波残留混入 sensor B 的输出），导致分类失真偏向某
+    // 类（64 路并发验证中全部偏向 Water）。局部构造无状态残留，每次独立。
+    // classify_mutex_ 仍保护 ONNX Run（Ort::Session 非线程安全）。
+    // 3s 一次的批处理，局部构造 SpeexDSP 开销可忽略（<<1ms）。
+    Resampler downsample(48000, kYamnetSampleRate);
+    const size_t cap = downsample.max_output_for_input(n);
     std::vector<float> pcm16k(cap);
-    // Resampler 有内部状态，不能并发调用 -> 用 mutex 保护。
     std::lock_guard<std::mutex> lock(classify_mutex_);
-    size_t n16 = impl_->downsample->process(pcm48k, n, pcm16k.data(), cap);
+    size_t n16 = downsample.process(pcm48k, n, pcm16k.data(), cap);
     if (n16 == 0)
       return std::nullopt;
 
@@ -305,11 +307,12 @@ std::vector<float> MlClassifier::embed(const float* pcm48k, size_t n) const {
     return out;
 
   try {
-    // 1. 48k -> 16k 重采样（局部 buffer + mutex，线程安全）。
-    const size_t cap = impl_->downsample->max_output_for_input(n);
+    // 1. 48k -> 16k 重采样（局部 Resampler，避免共享状态污染，同 classify）。
+    Resampler downsample(48000, kYamnetSampleRate);
+    const size_t cap = downsample.max_output_for_input(n);
     std::vector<float> pcm16k(cap);
     std::lock_guard<std::mutex> lock(classify_mutex_);
-    size_t n16 = impl_->downsample->process(pcm48k, n, pcm16k.data(), cap);
+    size_t n16 = downsample.process(pcm48k, n, pcm16k.data(), cap);
     if (n16 == 0)
       return out;
 

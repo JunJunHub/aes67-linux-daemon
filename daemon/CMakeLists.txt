@@ -58,6 +58,10 @@ if(WITH_NOISE)
   list(APPEND SOURCES pcm_capture_service.cpp noise_session_manager_bridge.cpp)
 endif()
 add_executable(aes67-daemon ${SOURCES})
+# aes67-daemon 始终链接 session_manager.cpp（SOURCES），可查询
+# SessionManager::get_sink（channel_map）。noise-test 不链接该 .cpp，
+# pcm_capture_service.cpp 用 _HAS_SESSION_MANAGER_LINK_ 守卫编译期引用。
+target_compile_definitions(aes67-daemon PRIVATE -D_HAS_SESSION_MANAGER_LINK_)
 
 if(ENABLE_TESTS)
     add_subdirectory(tests)

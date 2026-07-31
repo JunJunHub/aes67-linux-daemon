@@ -70,7 +70,11 @@ std::shared_ptr<Config> Config::parse(const std::string& filename,
     config.max_tic_frame_size_ = 1024;
   if (config.sample_rate_ == 0)
     config.sample_rate_ = 48000;
-  if (config.streamer_channels_ < 2 || config.streamer_channels_ > 16)
+  // streamer_channels：RAVENNA ALSA 驱动支持最多 64 通道（arch §4.2
+  // kMaxChannels=64）。上限 64 而非上游的 16：noise 模块需 64 路并发检测，
+  // 真实驱动场景下 64 路 sink 各绑定不同 channel。AAC streamer（faac）若
+  // 启用且 channels 超出其能力，由 streamer 自身处理，不在 config 层硬限。
+  if (config.streamer_channels_ < 2 || config.streamer_channels_ > 64)
     config.streamer_channels_ = 8;
   if (config.streamer_file_duration_ < 1 || config.streamer_file_duration_ > 4)
     config.streamer_file_duration_ = 1;

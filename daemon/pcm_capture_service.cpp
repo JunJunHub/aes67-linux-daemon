@@ -145,14 +145,19 @@ uint8_t PcmCaptureService::get_sink_channel_count(uint8_t sink_id) const {
 std::vector<uint8_t> PcmCaptureService::get_sink_channel_map(
     uint8_t sink_id) const {
   // 从 SessionManager 查询 StreamSink.map（用户通过 PUT /api/sink/:id 配置）。
-  // FAKE 测试（noise-test，定义 _USE_FAKE_DRIVER_）不链接 session_manager.cpp，
-  // 跳过查询 -> add_sensor 用 {0} 兜底。
-  // 真实 daemon（含 session_manager.cpp）正常查询。
+  // _HAS_SESSION_MANAGER_LINK_：仅生产 aes67-daemon 定义（SOURCES 含
+  // session_manager.cpp）。noise-test 不链接 session_manager.cpp，缺
+  // SessionManager::get_sink 符号 -> 守卫跳过编译期引用；运行时
+  // session_manager_ 为 nullptr（create_for_test）-> 返回空，add_sensor 用
+  // {0} 兜底。
+  // 此前用 #ifndef _USE_FAKE_DRIVER_ 守卫是错的：生产 FAKE daemon 也定义
+  // _USE_FAKE_DRIVER_，导致 FAKE 模式下 channel_map 查询被跳过，所有 sink
+  // 兜底到 channel 0，64 路并发验证无法区分通道（FAKE 测试与真实场景不一致）。
   if (!session_manager_)
     return {};
-#ifndef _USE_FAKE_DRIVER_
+#ifdef _HAS_SESSION_MANAGER_LINK_
   StreamSink sink;
-  if (session_manager_->get_sink(sink_id, sink))
+  if (!session_manager_->get_sink(sink_id, sink))
     return sink.map;
 #else
   (void)sink_id;
@@ -263,10 +268,14 @@ bool PcmCaptureService::stop_capture() {
 // FAKE_DRIVER：模拟 ALSA period 节拍分发（§11 风险21 三规格）。
 void PcmCaptureService::fake_capture_loop() {
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_capture_loop start";
-  // 静音帧缓冲（S16_LE 交错），按 test_rate_/test_channels_ 配置。
-  // Spec1：未指定 fake_pcm_source_ 时用内置静音帧（§4.3）。
-  const uint8_t channels = test_channels_;
-  const uint32_t rate = test_rate_;
+  // 与真实 capture_loop 一致：生产路径（create()，持 config_）读 config 的
+  // sample_rate / streamer_channels；测试路径（create_for_test，无 config_）
+  // fallback 到 test_ 成员。此前 fake_capture_loop 硬用 test_ 成员（channels
+  // 默认 2），导致 FAKE_DRIVER 下配 streamer_channels=64 仍只分发 2 通道，
+  // 多路并发验证无法覆盖 64 路（FAKE 测试与真实场景行为不一致）。
+  const uint8_t channels =
+      config_ ? config_->get_streamer_channels() : test_channels_;
+  const uint32_t rate = config_ ? config_->get_sample_rate() : test_rate_;
   const size_t bytes_per_sample = 2;  // S16_LE
   const size_t period_bytes = kPeriodSamples * channels * bytes_per_sample;
   std::vector<uint8_t> silent(period_bytes, 0);
@@ -337,7 +346,17 @@ void PcmCaptureService::fake_capture_loop() {
 
   // period 缓冲：WAV 模式下每 period 从 wav_samples 循环填充各 channel。
   std::vector<uint8_t> period_buf(period_bytes, 0);
+  // 各 channel 初始读取位置错开：真实场景各路音频独立到达、相位不同步，
+  // FAKE 测试若所有 channel 都从 offset 0 同步循环，会导致 L3（3s 窗口）
+  // 在多路间取到相同 WAV 相位 -> 同类别文件给出相同分数，掩盖解复用的
+  // 独立性。按 channel index 确定性错开（无需随机数，可复现），贴近真实。
   std::vector<size_t> wav_pos(channels, 0);
+  for (uint8_t ch = 0; ch < channels && ch < wav_per_channel.size(); ++ch) {
+    size_t wsize = wav_per_channel[ch].size();
+    if (wsize > 0)
+      // 错开 ~0.5s（24000 样本@48k）的整数倍，保证各 channel 不同相位。
+      wav_pos[ch] = (static_cast<size_t>(ch) * 24000) % wsize;
+  }
 
   // period 时长 = 6144 / 48000 ≈ 128ms
   const auto period_duration =

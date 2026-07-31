@@ -86,7 +86,10 @@ class NoiseSessionManagerBridge : public noise::NoiseAudioBridge {
   // 风险18）。on_pcm_frame 用前 kSubFrame 个位置做 S16->float 解复用。
   std::vector<float> convert_buffer_;
   static constexpr size_t kMaxPeriodSamples = 6144;
-  static constexpr uint8_t kMaxChannels = 8;
+  // RAVENNA ALSA 驱动最多 64 通道（与 config streamer_channels 上限一致）。
+  // 此前为 8：64 路并发验证时 frame_count*64 > kMaxPeriodSamples*8 -> 整
+  // period 丢弃 -> 所有 sensor 收不到帧。提到 64 容纳全通道解复用。
+  static constexpr uint8_t kMaxChannels = 64;
   // DenoiseProcessor max_frame_（480 样本/子帧）。
   static constexpr size_t kSubFrame = 480;
 };

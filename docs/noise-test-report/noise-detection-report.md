@@ -351,7 +351,7 @@ L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次
 | 64 路 + DeepFilterNet | 855%（53%） | 1157 MB | 0 | 三子图 ONNX，每路 ~14MB session |
 
 > 测试方法：`noise-testset/concurrent64/run_denoise_capacity.sh`，
-> 64 路 sink 各 `map:[N]`，全部 sensor 切同一 plugin，逐档 N=4→8→16→32→64
+> 64 路 sink 各 `map:[N]`，全部 sensor 切同一降噪 plugin，逐档 N=4→8→16→32→64
 > 递增，每档测 CPU/RSS/degraded/xrun。三 plugin 64 路全开均 0 degraded、
 > 0 xrun，CPU < 900%（16 核×56%）。
 

@@ -12,9 +12,9 @@
 
 | 项目 | 配置 |
 |------|------|
-| OS | Linux 7.0.0-28-generic |
+| OS | Linux 7.0.0-28-generic VMWare-Ubuntu24.04）|
 | CPU | 16 核 |
-| 内存 | 8.7 GB |
+| 内存 | 7.8 GB |
 | 构建方式 | out-of-source（daemon/build/） |
 | 编译选项 | FAKE_DRIVER=ON, WITH_NOISE=ON, WITH_STREAMER=ON, WITH_AVAHI=OFF, ENABLE_TESTS=ON |
 | 模型目录 | `noise_models/`（worktree 内子目录布局） |
@@ -228,6 +228,36 @@ SID | ESC-50 类别      | L1        | L3                      score
    改用局部 Resampler（无状态残留），每次独立。
 
 ### 4.7 L1 规则式分类优化（64 路验证驱动）
+
+#### L1 识别原理与判断逻辑概要
+
+L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次 FFT，从频谱
+形态判断噪声类型，输出 6 种 `NoiseType` 之一 + 连续置信度（top-3 候选）。
+定位为"信号形态分类"，与 L3 的"声源识别"互补——L1 回答"这是什么形状的
+频谱"，L3 回答"这是什么声源"。
+
+**判断逻辑（`classify_rule_based` + `analyze` 中的 Goertzel/时域检测）**：
+
+| 类型 | 核心特征 | 判定条件 | 置信度 |
+|------|----------|----------|--------|
+| **White** | 频谱平坦 | 频谱平坦度 SF > 0.6 | (SF-0.6)/0.4 |
+| **Pink** | -3dB/oct 斜率 | SF≥0.2 + 斜率 -3±2dB/oct + R²软降 | (1-\|slope+3\|/2) × R²/0.4 |
+| **Hum50/60Hz** | 工频基频+谐波 | Goertzel 检测 50/60Hz 基频存在 + 谐波组峰值比周围>4dB | (peak_db-4)/16 |
+| **Broadband** | 中等平坦度 | SF 0.15-0.6（Pink 不存在时） | 1-\|SF-0.375\|/0.225 |
+| **Digital** | 宽带高频连续噪声 | 高频能量比>0.5 + 高频平坦度≥0.15 | (hf_ratio-0.5)/0.3 |
+| **Impulse** | 时域幅度突变 | 帧内 max_dev > 6σ | (max_dev-6)/6 |
+| **Unknown** | 以上均不命中 | — | 0 |
+
+关键守卫（§4.7 优化新增，避免误判）：
+- Pink：SF≥0.2 守卫（真实粉噪 SF 0.2-0.5，低频重自然声 SF 0.01-0.08 不命中）
+- Digital：高频平坦度硬门槛（crickets 谐波尖峰 hf_flatness<0.15 不命中）
+- Broadband：Pink 候选 conf>0.3 时跳过（避免粉噪被 Broadband 抢首位）
+- Hum：基频存在性守卫（max(e50,e60) ≥ 0.3×hum_peak，防谐波泄漏误判）
+
+每帧输出的量化指标同时上报：`spectral_flatness`、`spectral_centroid_hz`、
+`hum_strength_db`、`impulse_count`，供告警引擎和 L2/L3 参考。
+
+---
 
 64 路 ESC-50 验证暴露 L1 规则对真实环境声的误判，做 3 处守卫优化：
 

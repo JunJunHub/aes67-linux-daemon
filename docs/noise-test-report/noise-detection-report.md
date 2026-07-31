@@ -338,14 +338,45 @@ L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次
 
 ## 6. 并发能力总结
 
-| 模式 | 并发上限 | CPU 占用 | 说明 |
-|------|---------|---------|------|
-| **仅检测/分析**（无降噪） | **64 路**（系统硬上限） | ~547%（16核 34%） | VAD + FFT + L1 规则 + L2 模板 + L3 YAMNet(每3s) |
-| **降噪开启**（RNNoise/DTLN） | 4-8 路（参考） | - | 加 ONNX 降噪推理 1-3ms/帧 |
-| **降噪开启**（DeepFilterNet） | 2-4 路（参考） | - | 三子图推理 ~7ms/帧 |
+### 6.1 实测容量（64 路 Sink 上限，16 核，FAKE_DRIVER）
 
-> 无降噪模式下 64 路全部跑到系统硬上限（AES67 Sink 上限 64），CPU 仍有余量
-> （16 核仅用 34%），可支持更高并发（受限于 64 路 Sink 上限）。
+在同一 64 路 ESC-50 检测基础上，全部 64 路开启同一 plugin 降噪，实测资源
+占用（干净基线，3 轮稳定，`plugin_degraded` 全 0）：
+
+| 模式 | CPU | RSS | degraded | 说明 |
+|------|-----|-----|----------|------|
+| 仅检测/分析（无降噪） | 383%（24%） | 278 MB | 0 | VAD+FFT+L1+L2+L3(每3s) |
+| 64 路 + RNNoise | 652%（41%） | 298 MB | 0 | RNNoise 极轻量（C 实现），+20MB |
+| 64 路 + DTLN | 747%（47%） | 661 MB | 0 | ONNX 推理，每路 ~6MB session |
+| 64 路 + DeepFilterNet | 855%（53%） | 1157 MB | 0 | 三子图 ONNX，每路 ~14MB session |
+
+> 测试方法：`noise-testset/concurrent64/run_denoise_capacity.sh`，
+> 64 路 sink 各 `map:[N]`，全部 sensor 切同一 plugin，逐档 N=4→8→16→32→64
+> 递增，每档测 CPU/RSS/degraded/xrun。三 plugin 64 路全开均 0 degraded、
+> 0 xrun，CPU < 900%（16 核×56%）。
+
+### 6.2 结论
+
+| 模式 | 并发上限 | 瓶颈 | 说明 |
+|------|---------|------|------|
+| 仅检测/分析 | **64 路**（Sink 上限） | 无 | CPU 仅 24%，远未饱和 |
+| RNNoise 降噪 | **64 路** | 无 | CPU 41%，内存 +20MB，可满载 |
+| DTLN 降噪 | **64 路** | 内存（每路 6MB） | CPU 47%，64 路 RSS 661MB |
+| DeepFilterNet 降噪 | **64 路** | **内存**（每路 14MB） | CPU 53%，但 64 路 RSS 1.16GB |
+
+**关键结论**：
+1. **三路降噪均支持 64 路满载并发**（Sink 硬上限），无 plugin_degraded、无 xrun。
+   旧报告"4-8 路/2-4 路"严重低估——实测 16 核下三 plugin 64 路全开 CPU < 56%。
+2. **瓶颈是内存而非 CPU**：DeepFilterNet 每路 ONNX session 占 ~14MB，
+   64 路 +880MB；若内存受限，可减少 DFN 路数或用 RNNoise（+20MB 总量）。
+3. **CPU 仍有余量**：最重的 DFN 64 路 CPU 855%（16 核×53%），理论上可超
+   64 路更多并发（受限于 AES67 Sink 64 路硬上限，无法在此环境验证更高）。
+4. **混合策略可行**：64 路中部分 RNNoise（轻）+ 部分 DFN（重）能进一步
+   优化内存/CPU 平衡，按需配置。
+
+> 实测环境为 16 核 VMWare 虚拟机；真实硬件（更多核/更大内存）容量更高。
+> FAKE_DRIVER 模式下 fake_capture_loop 占用部分 CPU，真实驱动场景 CPU
+> 略低（真实 capture 由 ALSA 驱动内核侧处理，不在 daemon 进程）。
 
 ---
 

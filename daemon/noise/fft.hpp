@@ -79,19 +79,24 @@ inline void FftBluestein(std::vector<Complex>& a, int sign) {
   while (m < 2 * n - 1)
     m <<= 1;
 
-  // chirp 因子 w[k] = exp(sign * -i π k² / N)（bluestein 标准定义）。
-  // a 与 b 的卷积 = ifft(fft(a)·fft(b))，其中 b 为 w 的共轭卷积核。
+  // chirp 因子 W[k] = exp(-i π k² / N)（正变换 sign=-1 时的标准定义）。
+  // 标准 Bluestein：X[k] = W[k] * Σ_n (x[n]*W[n]) * conj(W[k-n])
+  //   fa[k] = x[k] * W[k]   （chirp 乘信号）
+  //   fb[k] = conj(W[k])    （共轭卷积核）
+  //   result[k] = conv[k] * W[k]
+  // 代码中 ang = sign*(-πk²/N)，sign=-1 → w=exp(iπk²/N)=conj(W)，
+  // 因此 fa 和 result 需用 conj(w)，fb 用 w。
   std::vector<Complex> fa(m, Complex(0, 0));
   std::vector<Complex> fb(m, Complex(0, 0));
   for (size_t k = 0; k < n; ++k) {
-    // angle = sign * -π k² / N  （平方模 n 防 overflow）
+    // angle = sign * -π k² / N  （平方模 2n 防 overflow）
     const float k2 = static_cast<float>((k * k) % (2 * n));
     const float ang = sign * (-kPi * k2) / static_cast<float>(n);
     const Complex w(std::cos(ang), std::sin(ang));
-    fa[k] = a[k] * w;
-    fb[k] = w;  // w[k]
+    fa[k] = a[k] * std::conj(w);  // x[k] * W[k]
+    fb[k] = w;                    // conj(W[k])
     if (k != 0)
-      fb[m - k] = w;  // 共轭对称延拓（w[-k]=w[k] 因 k² 对称）
+      fb[m - k] = w;  // 共轭对称延拓（conj(W[-k])=conj(W[k]) 因 k² 对称）
   }
   FftRadix2(fa, -1);
   FftRadix2(fb, -1);
@@ -99,12 +104,12 @@ inline void FftBluestein(std::vector<Complex>& a, int sign) {
     fa[i] *= fb[i];
   FftRadix2(fa, +1);  // 逆变换（含 1/M 归一化）
 
-  // 提取前 N 点并乘 w[k] 完成变换。
+  // 提取前 N 点并乘 conj(w)[k] 完成变换（W[k] = conj(w)）。
   for (size_t k = 0; k < n; ++k) {
     const float k2 = static_cast<float>((k * k) % (2 * n));
     const float ang = sign * (-kPi * k2) / static_cast<float>(n);
     const Complex w(std::cos(ang), std::sin(ang));
-    a[k] = fa[k] * w;
+    a[k] = fa[k] * std::conj(w);  // conv[k] * W[k]
   }
   if (sign > 0) {
     const float inv = 1.0f / static_cast<float>(n);

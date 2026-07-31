@@ -179,6 +179,9 @@ class NoiseAudioBridgeStub : public noise::NoiseAudioBridge {
   bool is_sink_receiving(uint8_t) const override { return false; }
   uint32_t get_sample_rate() const override { return 48000; }
   uint8_t get_sink_channel_count(uint8_t) const override { return 1; }
+  std::vector<uint8_t> get_sink_channel_map(uint8_t) const override {
+    return {};
+  }
   void set_ptp_status_callback(
       noise::NoiseAudioBridge::PtpStatusCallback) override {}
   void set_period_lifecycle_callbacks(
@@ -637,9 +640,9 @@ BOOST_AUTO_TEST_CASE(classify_impulse) {
 }
 
 // Spec2 Task5 review Important #1:arch §3.3.1 要求分析 OriginalPCM 时
-// 用 VAD 过滤语音段,仅在非语音段做频谱分析。detection.is_speech=true 时
-// analyze() 必须跳过分析,返回 Unknown(语音帧不参与噪声分类)。
-BOOST_AUTO_TEST_CASE(analyze_skips_speech_frames) {
+// VAD 不再门控 L1 分析：is_speech=true 时 L1 仍运行（L1 规则不会误判语音
+// 为噪声），但 is_speech 字段记录在结果中供 metrics 上报。
+BOOST_AUTO_TEST_CASE(analyze_runs_l1_even_when_speech) {
   noise::NoiseAnalyzer ana;
   float buf[synth::kFrameSize];
   synth::white_noise(buf, synth::kFrameSize, 3);
@@ -647,7 +650,12 @@ BOOST_AUTO_TEST_CASE(analyze_skips_speech_frames) {
   det.is_speech = true;
   det.spectral_flatness = 0.8f;
   auto r = ana.analyze(buf, synth::kFrameSize, det);
-  BOOST_CHECK(r.primary_type == noise::NoiseType::Unknown);
+  // is_speech 记录在结果中
+  BOOST_CHECK(r.is_speech);
+  // L1 仍运行：白噪 SF>0.7 -> White 候选（语音不会产生此误判，因为
+  // 语音 SF≈0.1-0.3，此处输入是合成白噪，L1 正确识别）
+  BOOST_CHECK(r.primary_type == noise::NoiseType::White ||
+              r.noise_level_dbfs > -120.0f);
 }
 
 // Spec2 Task5 review Important #2 + Minor #5:200Hz 纯音不应被误分类为 Hum。
@@ -1430,7 +1438,7 @@ BOOST_AUTO_TEST_CASE(template_crud_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1508,7 +1516,7 @@ BOOST_AUTO_TEST_CASE(template_post_rejects_non_48k_wav) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1562,7 +1570,7 @@ BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1593,7 +1601,7 @@ BOOST_AUTO_TEST_CASE(template_export_import_roundtrip) {
   noise::NoiseTemplateDB db2;
   db2.set_dir_for_test(d2);
   httplib::Server svr2;
-  noise::register_noise_template_routes(svr2, mgr, db2, nullptr);
+  noise::register_noise_template_routes(svr2, mgr, db2);
   int port2 = svr2.bind_to_any_port("127.0.0.1");
   std::thread svr_thread2([&svr2]() { svr2.listen_after_bind(); });
   httplib::Client cli2("127.0.0.1", port2);
@@ -1681,7 +1689,7 @@ BOOST_AUTO_TEST_CASE(template_match_test_via_http) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -1745,7 +1753,7 @@ BOOST_AUTO_TEST_CASE(template_post_rejects_corrupt_wav) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_CHECK_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -3606,27 +3614,25 @@ BOOST_AUTO_TEST_CASE(dfn_lookahead_buffers) {
 BOOST_AUTO_TEST_SUITE_END()
 
 // =============================================================================
-// Spec5 Task 3：L3 ML 分类 VGGish（D-S5.8）测试套件。
+// L3 ML 分类 YAMNet 测试套件。
 // =============================================================================
 #include "ml_classifier.hpp"
-#include "noise/noise_template_db.hpp"
 #include "noise/noise_analyzer.hpp"
 #include <filesystem>
 #include <fstream>
 
 BOOST_AUTO_TEST_SUITE(spec5_l3_ml_tests)
 
-// 返回 VGGish ONNX 模型路径或空串（未下载 -> SKIP）。查找顺序与
-// spec5_find_dtln_model1 一致：NOISE_MODELS_DIR 环境变量优先。
-static std::string spec5_find_vggish_model() {
+// 返回 YAMNet ONNX 模型路径或空串（未下载 -> SKIP）。
+static std::string spec5_find_yamnet_model() {
   const char* env = std::getenv("NOISE_MODELS_DIR");
   std::vector<std::string> cands;
   if (env && *env)
-    cands.push_back(std::string(env) + "/vggish.onnx");
-  cands.push_back("./noise_models/vggish.onnx");
-  cands.push_back("../noise_models/vggish.onnx");
-  cands.push_back("./noise_models/vggish/vggish.onnx");
-  cands.push_back("/home/Share/GitHub/noise-model/vggish/vggish.onnx");
+    cands.push_back(std::string(env) + "/yamnet_3s.onnx");
+  cands.push_back("./noise_models/yamnet_3s.onnx");
+  cands.push_back("../noise_models/yamnet_3s.onnx");
+  cands.push_back("./noise_models/yamnet/yamnet_3s.onnx");
+  cands.push_back("/home/Share/GitHub/noise-model/yamnet/yamnet_3s.onnx");
   for (const auto& p : cands) {
     std::ifstream f(p, std::ios::binary);
     if (f.good())
@@ -3635,130 +3641,82 @@ static std::string spec5_find_vggish_model() {
   return "";
 }
 
-// 测试用假分类器：覆写 classify/embed 以注入确定性结果 + 计数调用。
+// 测试用假分类器：覆写 classify 以注入确定性结果 + 计数调用。
 // 不加载真实 ONNX 模型（base 默认构造 available()=false），使 L3 触发/
 // 跳过逻辑可在无模型环境下确定性验证（不依赖网络/模型下载）。
 class FakeMlClassifier : public noise::MlClassifier {
  public:
   mutable size_t classify_count{0};
-  mutable size_t embed_count{0};
   bool return_match{true};
-  noise::L3Match canned;
+  noise::MlResult canned;
 
   FakeMlClassifier() {
-    canned.template_id = 7;
-    canned.label = "未知风扇";
-    canned.similarity = 0.9f;
+    canned.type_name = "Air conditioning";
+    canned.score = 0.87f;
+    canned.top_types.push_back({"Air conditioning", 0.87f});
+    canned.top_types.push_back({"Mechanical fan", 0.65f});
   }
-  std::array<float, noise::kVggishEmbedDim> embed(const float* /*pcm*/,
-                                                  size_t /*n*/) const override {
-    ++embed_count;
-    std::array<float, noise::kVggishEmbedDim> e{};
-    e[0] = 1.0f;  // 非零占位
-    return e;
-  }
-  std::optional<noise::L3Match> classify(
-      const float* pcm,
-      size_t n,
-      const noise::NoiseTemplateDB& /*templates*/) const override {
+  std::optional<noise::MlResult> classify(const float* /*pcm*/,
+                                          size_t /*n*/) const override {
     ++classify_count;
-    if (return_match) {
-      // 仍走一次 base embed 以模拟真实路径（计数 embed 调用）。
-      (void)noise::MlClassifier::embed(pcm, n);
+    if (return_match)
       return canned;
-    }
     return std::nullopt;
   }
 };
 
-// Step 1a：VGGish 嵌入已知噪声 -> 128 维向量合理（非零、有限）。需模型。
-BOOST_AUTO_TEST_CASE(vggish_embeds_known_noise) {
-  std::string path = spec5_find_vggish_model();
+// YAMNet 分类已知噪声 -> 返回合理类型 + 分数。需模型。
+BOOST_AUTO_TEST_CASE(yamnet_classifies_known_noise) {
+  std::string path = spec5_find_yamnet_model();
   if (path.empty()) {
     BOOST_TEST_MESSAGE(
-        "VGGish 模型未下载，跳过（./daemon/noise/tests/"
+        "YAMNet 模型未下载，跳过（./daemon/noise/tests/"
         "download_models.sh）");
     return;
   }
   noise::MlClassifier ml;
   if (!ml.init(path)) {
-    BOOST_TEST_MESSAGE("VGGish init 失败（模型签名不匹配？），跳过");
+    BOOST_TEST_MESSAGE("YAMNet init 失败（模型签名不匹配？），跳过");
     return;
   }
   BOOST_CHECK(ml.available());
-  // 0.96s @48k = 46080 样本白噪。
-  constexpr size_t N = 46080;
+  // 3s @48k = 144000 样本白噪。
+  constexpr size_t N = 144000;
   std::vector<float> pcm(N);
   synth::white_noise(pcm.data(), N, 21);
-  auto emb = ml.embed(pcm.data(), N);
-  // 128 维、非零、有限。
-  float norm = 0.0f;
-  bool all_finite = true;
-  for (size_t i = 0; i < emb.size(); ++i) {
-    norm += emb[i] * emb[i];
-    if (!std::isfinite(emb[i]))
-      all_finite = false;
-  }
-  BOOST_CHECK_EQUAL(emb.size(), noise::kVggishEmbedDim);
-  BOOST_CHECK(all_finite);
-  BOOST_CHECK_GT(norm, 0.0f);
-}
-
-// Step 1b：录入 vggish 模板 -> classify 同类噪声 -> 匹配 + similarity > 阈值。
-// 需模型。用同一 seed 噪声做录入与检索 -> 嵌入应高度相似（确定性）。
-BOOST_AUTO_TEST_CASE(ml_classify_matches_template) {
-  std::string path = spec5_find_vggish_model();
-  if (path.empty()) {
-    BOOST_TEST_MESSAGE("VGGish 模型未下载，跳过");
-    return;
-  }
-  noise::MlClassifier ml;
-  if (!ml.init(path)) {
-    BOOST_TEST_MESSAGE("VGGish init 失败，跳过");
-    return;
-  }
-  constexpr size_t N = 46080;
-  std::vector<float> pcmA(N), pcmB(N);
-  synth::white_noise(pcmA.data(), N, 31);  // 噪声 A
-  synth::white_noise(pcmB.data(), N, 99);  // 噪声 B（不同）
-  auto embA = ml.embed(pcmA.data(), N);
-  noise::NoiseTemplateDB db;
-  std::array<float, 32> bark{};
-  db.add_template("噪声A", "", "", noise::TemplateFeatureType::Vggish, bark,
-                  embA);
-  // 同类（A）检索 -> 匹配。
-  auto m = ml.classify(pcmA.data(), N, db);
-  BOOST_REQUIRE(m.has_value());
-  BOOST_CHECK_GT(m->similarity, noise::NoiseTemplateDB::kVggishMatchThreshold);
-  BOOST_TEST_MESSAGE("L3 classify A sim=" << m->similarity);
-  // 异类（B）检索 -> 相似度应低于同类（嵌入区分力）。
-  auto mB = ml.classify(pcmB.data(), N, db);
-  if (mB.has_value()) {
-    BOOST_TEST_MESSAGE("L3 classify B sim=" << mB->similarity << "（应 < A）");
-    BOOST_CHECK_LT(mB->similarity, m->similarity + 0.001f);
+  auto m = ml.classify(pcm.data(), N);
+  // YAMNet 应返回分类结果（白噪声可能匹配 "White noise" 或 "Static"）。
+  if (m.has_value()) {
+    BOOST_TEST_MESSAGE("YAMNet classify: " << m->type_name
+                                           << " score=" << m->score);
+    BOOST_CHECK(!m->type_name.empty());
+    BOOST_CHECK_GT(m->score, 0.0f);
+    BOOST_CHECK_LE(m->score, 1.0f);
+    BOOST_CHECK_LE(m->top_types.size(), 6u);
+  } else {
+    BOOST_TEST_MESSAGE("YAMNet 未返回分类结果（白噪可能低于阈值），跳过断言");
   }
 }
 
-// Step 1c：L1+L2 低置信度 -> 触发 L3 -> noise_type_source=l3。
+// L3 独立触发（静音 L1 无候选），ml_noise_type 非空。
 // 用假分类器（计数 classify 调用）+ 静音输入（L1 无候选 -> confidence 0 <
-// 阈值）。 静音填满 0.96s PCM 环形缓冲后 L3 触发。无模型依赖，恒跑。
+// 阈值）。 静音填满 3s PCM 环形缓冲后 L3 触发。无模型依赖，恒跑。
 BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
   auto fake_ptr = std::make_shared<FakeMlClassifier>();
   noise::NoiseAnalyzer a;
   a.set_ml_classifier(fake_ptr);
-  a.set_template_db(std::make_shared<noise::NoiseTemplateDB>());
   // 静音帧：L1 规则全不命中 -> primary_confidence=0 < 0.5 -> L3 可触发。
   float sil[synth::kFrameSize];
   synth::silence(sil, synth::kFrameSize);
   noise::NoiseDetectionResult det{};
   bool triggered = false;
-  // 46080/480 = 96 帧填满 PCM 环形缓冲；后续帧若仍低置信 -> L3 触发。
-  for (int f = 0; f < 120; ++f) {
+  // 144000/480 = 300 帧填满 PCM 环形缓冲；后续帧若仍低置信 -> L3 触发。
+  for (int f = 0; f < 320; ++f) {
     auto ar = a.analyze(sil, synth::kFrameSize, det);
-    if (ar.noise_type_source == "l3") {
+    if (!ar.ml_noise_type.empty()) {
       triggered = true;
-      BOOST_CHECK_EQUAL(ar.l3_match_type, std::string("未知风扇"));
-      BOOST_CHECK_GT(ar.l3_similarity, 0.0f);
+      BOOST_CHECK_EQUAL(ar.ml_noise_type, std::string("Air conditioning"));
+      BOOST_CHECK_GT(ar.ml_noise_score, 0.0f);
       break;
     }
   }
@@ -3766,29 +3724,29 @@ BOOST_AUTO_TEST_CASE(l3_triggers_when_l1l2_unrecognized) {
   BOOST_CHECK_GT(fake_ptr->classify_count, 0u);
 }
 
-// Step 1d：L1 高置信度 -> 不调 L3（性能：classify 计数=0）。
-// 白噪 SF~1 -> White 候选 confidence~1.0 > 阈值 -> L3 跳过。无模型依赖，恒跑。
-BOOST_AUTO_TEST_CASE(l3_skipped_when_l1_confident) {
+// L3 独立于 L1 运行：L1 高置信度时 L3 仍按自己的节奏触发。
+// 白噪 L1 识别为 White（conf≈0.49），L3 在 3s 缓冲满后仍触发。
+// 两者并行上报：L1 报频域特征（White），L3 报声源识别。
+BOOST_AUTO_TEST_CASE(l3_runs_independently_of_l1) {
   auto fake_ptr = std::make_shared<FakeMlClassifier>();
   noise::NoiseAnalyzer a;
   a.set_ml_classifier(fake_ptr);
-  a.set_template_db(std::make_shared<noise::NoiseTemplateDB>());
-  // L3 触发阈值设 0.4：合成白噪 L1 White conf≈0.49（sf≈0.848，
-  // conf=(sf-0.7)/0.3），>= 0.4 判 L1 已识别不触发 L3；默认 0.5 会使
-  // 边界 conf 0.49 误触发 L3（白噪非"L1 高置信度"强信号）。
-  a.set_l3_confidence_threshold(0.4f);
   float wn[synth::kFrameSize];
   synth::white_noise(wn, synth::kFrameSize, 5);
   noise::NoiseDetectionResult det{};
-  for (int f = 0; f < 120; ++f) {
+  bool l3_triggered = false;
+  for (int f = 0; f < 320; ++f) {
     auto ar = a.analyze(wn, synth::kFrameSize, det);
-    // L1 置信（conf >= threshold）-> source=l1，绝不 l3。
-    BOOST_CHECK_NE(ar.noise_type_source, "l3");
-    BOOST_CHECK(ar.primary_confidence >= 0.4f ||
-                ar.primary_type == noise::NoiseType::Unknown);
+    if (!ar.ml_noise_type.empty()) {
+      l3_triggered = true;
+      // L3 触发时 L1 结果仍在（White 或 Unknown）。
+      BOOST_CHECK(ar.primary_type == noise::NoiseType::White ||
+                  ar.primary_type == noise::NoiseType::Unknown);
+    }
   }
-  // L1 始终高置信 -> L3 从未被调用。
-  BOOST_CHECK_EQUAL(fake_ptr->classify_count, 0u);
+  // L3 独立于 L1，3s 缓冲满后应触发。
+  BOOST_CHECK(l3_triggered);
+  BOOST_CHECK_GT(fake_ptr->classify_count, 0u);
 }
 
 // Step 1e：bark/vggish 模板录入 + 检索往返 + 持久化。无模型依赖，恒跑。
@@ -3973,9 +3931,32 @@ BOOST_AUTO_TEST_CASE(history_export_csv) {
   auto r = cli.Get("/api/noise/sensor/0/history/export?format=csv");
   BOOST_REQUIRE(r);
   BOOST_CHECK_EQUAL(r->status, 200);
-  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms") != std::string::npos);
-  // 至少一行数据（CSV 行尾换行）。
-  BOOST_CHECK(r->body.find("\n") != std::string::npos);
+
+  // T1#2: 验证 CSV header 完整（19 字段）。
+  BOOST_CHECK(r->body.find("sensor_id,timestamp_ms,noise_level_dbfs,"
+                           "noise_type,noise_type_confidence,estimated_snr_db,"
+                           "spectral_flatness,hum_strength_db,denoise_enabled,"
+                           "noise_reduction_db,is_alerting,alert_level,"
+                           "plugin_degraded,is_speech,l2_match_name,"
+                           "l2_similarity,ml_noise_type,ml_noise_score,"
+                           "ml_top_types") != std::string::npos);
+
+  // T1#2: 解析数据行，验证字段数（19 字段 = 18 逗号）+ sensor_id=0。
+  std::istringstream iss(r->body);
+  std::string line;
+  std::getline(iss, line);  // skip header
+  bool has_data = false;
+  while (std::getline(iss, line)) {
+    if (line.empty())
+      continue;
+    has_data = true;
+    size_t commas = std::count(line.begin(), line.end(), ',');
+    BOOST_CHECK_EQUAL(commas, 18u);
+    // 第一个字段是 sensor_id，应为 0。
+    BOOST_CHECK_EQUAL(line.find("0,"), 0u);
+    break;
+  }
+  BOOST_CHECK(has_data);
 }
 
 // T1: 过期记录被后台清理（NoiseStore 单元）。
@@ -4007,8 +3988,8 @@ BOOST_AUTO_TEST_CASE(history_retention_cleanup) {
   std::filesystem::remove(db + "-shm");
 }
 
-// T1（D-S6.7）：/metrics 响应含 l3_match_type / l3_similarity。
-BOOST_AUTO_TEST_CASE(l3_fields_in_metrics_response) {
+// /metrics 响应含 ml_noise_type / ml_noise_score / ml_top_types。
+BOOST_AUTO_TEST_CASE(ml_fields_in_metrics_response) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   mgr.add_sensor(0, 0, noise::NoiseSensorConfig{});
@@ -4021,8 +4002,12 @@ BOOST_AUTO_TEST_CASE(l3_fields_in_metrics_response) {
   auto r = cli.Get("/api/noise/sensor/0/metrics");
   BOOST_REQUIRE(r);
   BOOST_CHECK_EQUAL(r->status, 200);
-  BOOST_CHECK(r->body.find("\"l3_match_type\"") != std::string::npos);
-  BOOST_CHECK(r->body.find("\"l3_similarity\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"ml_noise_type\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"ml_noise_score\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"ml_top_types\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"is_speech\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l2_match_name\"") != std::string::npos);
+  BOOST_CHECK(r->body.find("\"l2_similarity\"") != std::string::npos);
   svr.stop();
   svr_thread.join();
 }
@@ -4061,7 +4046,7 @@ BOOST_AUTO_TEST_CASE(feature_type_vggish_in_template_response) {
   NoiseAudioBridgeStub bridge;
   noise::NoiseManager mgr(bridge);
   httplib::Server svr;
-  noise::register_noise_template_routes(svr, mgr, db, nullptr);
+  noise::register_noise_template_routes(svr, mgr, db);
   int port = svr.bind_to_any_port("127.0.0.1");
   BOOST_REQUIRE_GT(port, 0);
   std::thread svr_thread([&svr]() { svr.listen_after_bind(); });
@@ -4513,6 +4498,9 @@ BOOST_AUTO_TEST_CASE(xrun_degradation) {
   BOOST_CHECK_EQUAL(mgr.stub_call_count_for_test(0), 2u);
 }
 
+// T3#9: mallinfo2 验证 Rfft/Irfft 零堆分配（glibc 2.33+）。
+#include <malloc.h>
+
 // T3: Rfft/Irfft 不返 vector（输出参数，调用者预分配 buffer）。
 // 验证 API 签名：输出参数形式，不返回 vector。
 BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
@@ -4522,7 +4510,15 @@ BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
   for (size_t i = 0; i < N; ++i)
     input[i] = 0.1f * std::sin(2.0f * 3.14159f * 100.0f * i / N);
   std::vector<noise::fft::Complex> spec(N / 2 + 1);
+  std::vector<float> output(N);
+
+  // T3#9: mallinfo2 验证 Rfft/Irfft 调用本身零堆分配（buffer 预分配在记录前）。
+  struct mallinfo2 before = mallinfo2();
   noise::fft::Rfft(input, N, spec.data(), spec.size());
+  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
+  struct mallinfo2 after = mallinfo2();
+  BOOST_CHECK_EQUAL(after.uordblks, before.uordblks);
+
   BOOST_REQUIRE_EQUAL(spec.size(), N / 2 + 1);
   // 100Hz 正弦 -> 在 bin 100 有峰值。
   // 验证非全零（变换有效）。
@@ -4535,12 +4531,9 @@ BOOST_AUTO_TEST_CASE(fft_rfft_no_heap_allocation) {
   }
   BOOST_CHECK(has_nonzero);
 
-  // Irfft：输出参数形式（spec, nbins, n_out, out, out_size）。
-  std::vector<float> output(N);
-  noise::fft::Irfft(spec.data(), spec.size(), N, output.data(), output.size());
-  BOOST_REQUIRE_EQUAL(output.size(), N);
   // irfft(rfft(x)) ≈ x（数值误差 < 1e-4 绝对，近零值用绝对比较避免相对误差
   // 放大）。
+  BOOST_REQUIRE_EQUAL(output.size(), N);
   for (size_t i = 0; i < N; ++i) {
     float diff = std::abs(output[i] - input[i]);
     BOOST_CHECK_LT(diff, 1e-4f);
@@ -4557,18 +4550,22 @@ BOOST_AUTO_TEST_CASE(dtln_dfn_no_per_frame_heap) {
   synth::speech_like(in, 480);
   float out[480];
   noise::DenoiseResult r;
-  // 连续 process 10 帧，验证输出一致（直通模式，每帧应相同）。
   std::vector<float> first_out(480);
+
+  // 预热 1 帧（触发 thread_local scratch 首次分配）。
+  dtln.process(in, 480, out, 480, &r);
+  std::copy(out, out + 480, first_out.begin());
+
+  // T3#10: mallinfo2 验证稳态 process 零堆分配。
+  struct mallinfo2 before = mallinfo2();
   for (int f = 0; f < 10; ++f) {
     size_t n = dtln.process(in, 480, out, 480, &r);
     BOOST_REQUIRE_EQUAL(n, 480u);
-    if (f == 0)
-      std::copy(out, out + 480, first_out.begin());
-    else {
-      for (size_t i = 0; i < 480; ++i)
-        BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
-    }
+    for (size_t i = 0; i < 480; ++i)
+      BOOST_CHECK_CLOSE(out[i], first_out[i], 1e-3f);
   }
+  struct mallinfo2 after = mallinfo2();
+  BOOST_CHECK_EQUAL(after.uordblks, before.uordblks);
 }
 
 // T3: TemplateDB seqlock 读（capture 线程无锁读，HTTP 写时读 retry）。

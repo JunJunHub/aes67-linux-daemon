@@ -236,6 +236,21 @@ class NoiseManager {
   //   返回的 DenoiseOutput* 在下次 on_period_end swap 前有效（arch §11
   //   风险23）。
   const DenoiseOutput* get_denoise_output(uint8_t sink_id) const;
+  const DenoiseOutput* get_current_denoise_output(uint8_t sink_id) const;
+
+  // Per-sensor PCM ring buffer（流式 AAC 编码用）。
+  // on_frame_impl_ 写入（capture 线程），stream_aac_encode 读取（HTTP 线程），
+  // 互斥锁保护，无数据撕裂。容量 2s（96000 样本），溢出时丢弃最旧。
+  struct PcmRing {
+    std::mutex mutex;
+    std::deque<float> original, denoised, noise;
+  };
+  std::shared_ptr<PcmRing> get_pcm_ring(uint8_t sensor_id);
+  // 从 ring 取最多 max_n 个样本，返回实际取到的数量。
+  size_t drain_pcm_ring(std::shared_ptr<PcmRing> ring,
+                        int channel,
+                        float* out,
+                        size_t max_n);
 
   // ── Spec4 Task 3：SSE broadcaster 访问器（HTTP SSE 路由用）──
   // NoiseManager 持有 per-sensor 的 metrics_broadcaster_ + pcm_broadcaster_
@@ -368,15 +383,16 @@ class NoiseManager {
   // deepfilternet init 推导模型路径。控制线程调用（main wiring，init 前）。
   void set_onnx_model_dir(const std::string& dir) { onnx_model_dir_ = dir; }
 
-  // Spec5 T3（D-S5.8）：注入 L3 ML 分类器 + 模板库。add_sensor 时转发到每个
-  // sensor 的 NoiseAnalyzer（L3 在 capture 线程调 classify，所有 sensor 共享
-  // 同一 MlClassifier/TemplateDB 实例）。空 shared_ptr -> L3 跳过。
-  // 控制线程调用（main wiring，init 前；已有 sensor 也会逐个 set）。
+  // 注入 L3 ML 分类器。add_sensor 时转发到每个 sensor 的 NoiseAnalyzer
+  // （L3 在 capture 线程调 classify，所有 sensor 共享同一 MlClassifier 实例）。
+  // 空 shared_ptr -> L3 跳过。控制线程调用（main wiring，init 前）。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml) {
     ml_classifier_ = ml;
   }
+  // 注入 L2 模板库。add_sensor 时转发到每个 sensor 的 NoiseAnalyzer。
+  // 空 shared_ptr -> L2 跳过。
   void set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
-    template_db_ = db;
+    template_db_ = std::move(db);
   }
 
   // Spec6 T1（D-S6.1）：注入 NoiseStore（SQLite 历史仓储）。控制线程调用
@@ -462,10 +478,10 @@ class NoiseManager {
   mutable std::atomic<bool> load_in_progress_{false};
   // Spec5 T2：ONNX 模型目录（Config 注入，转发到 DenoiseProcessor）。
   std::string onnx_model_dir_;
-  // Spec5 T3：L3 ML 分类器 + 模板库（Config 注入，转发到各 sensor 的
-  // analyzer）。 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor
-  // 共享同一实例。
+  // L3 ML 分类器（Config 注入，转发到各 sensor 的 analyzer）。
+  // 空 shared_ptr -> L3 跳过（L1+L2 不受影响）。所有 sensor 共享同一实例。
   std::shared_ptr<MlClassifier> ml_classifier_;
+  // L2 模板库（Config 注入，转发到各 sensor 的 analyzer）。
   std::shared_ptr<NoiseTemplateDB> template_db_;
   // Spec6 T1（D-S6.1）：SQLite 历史仓储（可选，空 -> 禁用持久化）。
   std::shared_ptr<NoiseStore> noise_store_;
@@ -542,6 +558,9 @@ class NoiseManager {
     std::shared_ptr<SseBroadcaster> pcm_noise;
   };
   std::map<uint8_t, SensorBroadcasters> sse_broadcasters_;
+  // Per-sensor PCM ring buffer（流式 AAC 编码用）。
+  std::map<uint8_t, std::shared_ptr<PcmRing>> pcm_rings_;
+  std::mutex pcm_rings_mutex_;
   // 保护 sse_broadcasters_ map 的并发访问：add_sensor/remove_sensor
   // （控制线程写）vs push_sse_events（capture 线程读）vs get_*_broadcaster
   // （HTTP 线程读）。与 ref_mutex_ 同模式：短临界区（map lookup + 指针
@@ -643,7 +662,7 @@ class NoiseManager {
     void run(NoiseManager* mgr, uint8_t sink_id);
   };
   std::map<uint8_t, std::shared_ptr<SinkQueue>> sink_queues_;
-  std::mutex
+  mutable std::mutex
       sink_queues_mutex_;  // 保护 sink_queues_ map（add/remove vs dispatch）
   void start_sink_thread_(uint8_t sink_id);
   void stop_sink_thread_(uint8_t sink_id);

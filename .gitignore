@@ -94,10 +94,10 @@ CLAUDE.md
 .claude/*
 !.claude/rules/
 !.claude/rules/*.md
-# !.claude/skills/
-# !.claude/skills/README.md
-# !.claude/skills/*/
-# !.claude/skills/*/SKILL.md
+!.claude/skills/
+!.claude/skills/README.md
+!.claude/skills/*/
+!.claude/skills/*/SKILL.md
 # worktree 固定目录：所有 worktree 统一放此路径下（.claude/* 已覆盖忽略）
 .claude/worktrees/
 # .superpowers/

@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <numeric>
 #include <utility>
 #include <vector>
@@ -66,12 +67,12 @@ inline float calc_norm_alpha(uint32_t sr, size_t hop, float tau) {
   return std::exp(-static_cast<float>(hop) / (static_cast<float>(sr) * tau));
 }
 
-// mean_norm 初始化（libdf MEAN_NORM_INIT = [-2.77, -3.0]）。
-constexpr float kMeanNormInitMin = -2.77f;
-constexpr float kMeanNormInitMax = -3.0f;
-// unit_norm 初始化（libdf UNIT_NORM_INIT = [1e-6, 1.0]）。
-constexpr float kUnitNormInitMin = 1e-6f;
-constexpr float kUnitNormInitMax = 1.0f;
+// mean_norm 初始化（libdf MEAN_NORM_INIT = [-60.0, -90.0]，dB 域）。
+constexpr float kMeanNormInitMin = -60.0f;
+constexpr float kMeanNormInitMax = -90.0f;
+// unit_norm 初始化（libdf UNIT_NORM_INIT = [0.001, 0.0001]）。
+constexpr float kUnitNormInitMin = 0.001f;
+constexpr float kUnitNormInitMax = 0.0001f;
 
 }  // namespace
 
@@ -130,6 +131,7 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
     return false;
 
   // 模型目录：cfg.onnx_model_dir 或 cfg.model_path 所在目录。
+  // 先找 <dir>/deepfilternet/ 子目录，再回退 <dir>/ 平铺。
   std::string dir = cfg.onnx_model_dir;
   if (dir.empty() && !cfg.model_path.empty()) {
     auto slash = cfg.model_path.find_last_of('/');
@@ -140,6 +142,12 @@ bool DeepFilterNetAdapter::init(const PluginConfig& cfg) {
   std::string d = dir;
   if (!d.empty() && d.back() != '/')
     d += '/';
+  // 优先：<dir>/deepfilternet/{enc,df_dec,erb_dec}.onnx
+  // 回退：<dir>/{enc,df_dec,erb_dec}.onnx
+  if (std::ifstream(d + "deepfilternet/enc.onnx").fail())
+    d = dir + (dir.back() != '/' && !dir.empty() ? "/" : "");
+  else
+    d = d + "deepfilternet/";
 
   enc_ = CreateOnnxSession(d + "enc.onnx");
   df_dec_ = CreateOnnxSession(d + "df_dec.onnx");
@@ -460,8 +468,11 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
       // Spec6 T3：Irfft 改输出参数，time_block_ 预分配成员。
       fft::Irfft(spec_e_.data(), kFreq, kFft, time_block_.data(),
                  time_block_.size());
+      // fft.hpp 的 IFFT 含 1/N 归一化（原始 libdf 不含），需乘 N 补偿，
+      // 否则输出被缩小 N 倍（wnorm_=1/N 在 STFT 缩放 + IFFT 1/N = 双重缩放）。
+      const float istft_scale = static_cast<float>(kFft);
       for (size_t i = 0; i < kFft; ++i)
-        time_block_[i] *= window_[i];
+        time_block_[i] *= window_[i] * istft_scale;
       // Spec6 T3 review Important #3/#4：out_frame 改预分配 ring buffer slot，
       // 零 per-frame heap。直接写入 out_ring_[tail_]，然后推进 tail。
       std::array<float, kHop>& out_slot = out_ring_[out_ring_tail_];
@@ -490,8 +501,8 @@ bool DeepFilterNetAdapter::process_one_frame_(float& lsnr_out) {
   } catch (...) {
     // ONNX 失败：保持 history 与 delay_buf 同步（两者都不前进），匹配
     // pre-T2 行为（1b7bbd4）。non-causal window 在失败帧处保留旧 spec，
-    // 不劣于 pre-T2 causal 同路径；failure 路径已降级（D-S5.5 silence）。
-    // T2 不改 failure handling（见 spec6-plan T2 约束）。
+    // 不劣于 pre-T2 causal 同路径；failure 路径输出 orig（D-S5.5
+    // passthrough，见 process() 输出阶段 effective_dry_wet=0）。
     return false;
   }
 }
@@ -527,11 +538,8 @@ size_t DeepFilterNetAdapter::process(const float* in,
       continue;
     }
     failed = true;
-    // D-S5.5 偏差（reviewer final Important #2，文档化接受）：理想 memcpy
-    // in->out passthrough，但失败 hop 的对应输入 in_delay_ 需对齐（lookahead
-    // 缓冲 + 48k 流式），故用 silence 安全降级（sanitize 完整 + 10 帧界 +
-    // 最终切 passthrough，不喂下游错误样本）。真实 memcpy passthrough 延后
-    // 后续 spec。
+    // D-S5.5：失败 hop 填 silence 占位（保持流率），输出阶段 dry_wet 降为
+    // 0.0 使该段输出 = orig（in_delay_ 对齐），等价 memcpy passthrough。
     // Spec6 T3 review Important #4：passthrough 改预分配 ring slot（零 heap）。
     std::array<float, kHop>& passthrough_slot = out_ring_[out_ring_tail_];
     passthrough_slot.fill(0.0f);
@@ -553,6 +561,11 @@ size_t DeepFilterNetAdapter::process(const float* in,
     --out_ring_count_;
   }
 
+  // D-S5.5：ONNX 失败时 dry_wet 降为 0.0，输出 = orig（memcpy passthrough）。
+  // in_delay_ 与 out_fifo_ 同步 pop（算法延迟对齐），失败 hop 的 silence
+  // 对应位置的 in_delay_ 样本即原始输入，混合系数归零即等价 memcpy
+  // passthrough。
+  const float effective_dry_wet = failed ? 0.0f : dry_wet;
   size_t n_out = std::min(out_fifo_.size(), n_out_max);
   for (size_t i = 0; i < n_out; ++i) {
     float denoised = out_fifo_.front();
@@ -562,7 +575,8 @@ size_t DeepFilterNetAdapter::process(const float* in,
       orig = in_delay_.front();
       in_delay_.pop_front();
     }
-    out[i] = sanitize(dry_wet * denoised + (1.0f - dry_wet) * orig);
+    out[i] = sanitize(effective_dry_wet * denoised +
+                      (1.0f - effective_dry_wet) * orig);
   }
 
   if (result) {

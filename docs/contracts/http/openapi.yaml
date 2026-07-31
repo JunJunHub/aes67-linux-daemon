@@ -691,7 +691,8 @@ paths:
                   noise_type,noise_type_confidence,estimated_snr_db,
                   spectral_flatness,hum_strength_db,denoise_enabled,
                   noise_reduction_db,is_alerting,alert_level,plugin_degraded,
-                  l3_match_type,l3_similarity。其后每条记录一行。
+                  is_speech,l2_match_name,l2_similarity,ml_noise_type,
+                  ml_noise_score,ml_top_types。其后每条记录一行。
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -750,7 +751,7 @@ paths:
         通过 Server-Sent Events (SSE) 实时推送该传感器的指标快照（Spec4 Task 3）。
         约每 ALSA period（~128ms）推送一次事件，每个事件 data 字段为
         NoiseMetricsSnapshot 的子集 JSON（含 sensor_id 及关键检测/分析/降噪指标与
-        ref_* 比对结果，不含 timestamp_ms / noise_candidates / noise_type_source 等字段）。
+        ref_* 比对结果，不含 timestamp_ms / noise_candidates / l2_match_name / ml_noise_type 等字段）。
         传感器不存在时返回 404。客户端通过 EventSource 建立长连接接收。
       operationId: streamNoiseSensorMetrics
       parameters:
@@ -943,11 +944,9 @@ paths:
       tags: [Noise Template]
       summary: 录入新噪声模板
       description: |
-        上传一段噪声示例音频，系统提取特征存入模板库供实时匹配使用。
-        请求为 multipart/form-data，包含 WAV 音频文件和模板元信息（标签、描述、
-        特征类型）。feature_type=bark（默认）提取 32 维 Bark 频带能量；
-        feature_type=vggish 提取 128 维 VGGish 嵌入（需 ml_model_path
-        配置且模型已加载，否则返回 400）。WAV 须 48kHz PCM-16 mono，否则返回 400。
+        上传一段噪声示例音频，系统提取 32 维 Bark 频带能量特征存入模板库，
+        供 L2 实时模板匹配使用。请求为 multipart/form-data，包含 WAV 音频文件
+        和模板元信息（标签、描述）。WAV 须 48kHz PCM-16 mono，否则返回 400。
       operationId: createNoiseTemplate
       requestBody:
         required: true
@@ -961,7 +960,7 @@ paths:
                   type: string
                   format: binary
                   description: |
-                    噪声示例音频文件（WAV 格式，任意采样率，系统自动重采样到 48kHz）。
+                    噪声示例音频文件（WAV 格式，48kHz PCM-16 mono）。
                     建议时长 2-10 秒，包含目标噪声的典型片段。
                 label:
                   type: string
@@ -974,16 +973,6 @@ paths:
                   description: |
                     模板的详细描述（可选），如"机房精密空调低频隆隆声+风道共振"。
                     供运维人员理解模板含义。
-                feature_type:
-                  type: string
-                  description: |
-                    特征类型（可选，默认 bark）。
-                    bark=提取 32 维 Bark 频带能量（L2 模板匹配）；
-                    vggish=提取 128 维 VGGish 嵌入（L3 ML 分类，需 ml_model_path
-                    配置且 MlClassifier 可用，否则返回 400）。
-                  enum: [bark, vggish]
-                  default: bark
-                  example: bark
       responses:
         "200":
           description: 模板已创建
@@ -1603,9 +1592,11 @@ components:
         ml_model_path:
           type: string
           description: |
-            VGGish ML 模型文件路径（L3 分类用）。对应 Config::get_ml_model_path。
-            空字符串=不加载 VGGish，L3 分类跳过（L1+L2 仍可用，additive 降级）。
-            非空时指向 vggish.onnx（如 ./noise_models/vggish.onnx）。仅在 WITH_NOISE=ON 编译时有效。
+            YAMNet ML 模型文件路径（L3 声源分类用）。对应 Config::get_ml_model_path。
+            空字符串=不加载 YAMNet，L3 分类跳过（L1+L2 仍可用，additive 降级）。
+            非空时指向 yamnet_3s.onnx（如 ./noise_models/yamnet/yamnet_3s.onnx）。
+            模型同目录下的 yamnet_class_map.csv 自动加载（类名映射）。
+            仅在 WITH_NOISE=ON 编译时有效。
           example: ""
         fake_pcm_source:
           type: string
@@ -2070,28 +2061,44 @@ components:
           format: float
           description: 工频哼声强度（dB）。-65 以下为无哼声，-40 以上为明显哼声
           example: -65.0
-        noise_type_source:
-          type: string
+        is_speech:
+          type: boolean
           description: |
-            主噪声类型的来源层：l1（L1 规则式，默认）、l2（Bark 模板匹配）、
-            l3（VGGish ML 分类）。source="l3" 时权威类型为 l3_match_type（模板 label），
-            noise_type 仍为 L1 的 Unknown。对应 NoiseMetricsSnapshot.noise_type_source。
-          enum: [l1, l2, l3]
-          example: l1
-        l3_match_type:
-          type: string
+            VAD 语音活动检测结果。true 表示当前帧检测到语音。
+            注意：VAD 不再门控 L1 分析，is_speech 仅作信息上报。
+          example: false
+        l2_match_id:
+          type: integer
           description: |
-            L3 ML 分类匹配到的模板 label。来自 NoiseAnalysisResult.l3_match_type。
-            仅当 L1+L2 均未识别且 MlClassifier 可用并触发 L3 时填充；空表示未触发或未匹配。
-            noise_type_source="l3" 时为本次分类的权威噪声类型名。
-          example: "空调噪声"
-        l3_similarity:
+            L2 Bark 模板匹配到的模板 ID。0 表示未匹配或无模板库。
+            用户通过 POST /api/noise/template 录入自定义噪声样本。
+          example: 0
+        l2_match_name:
+          type: string
+          description: L2 匹配到的模板名称（空=未匹配）
+          example: ""
+        l2_similarity:
           type: number
           format: float
+          description: L2 Bark 频带余弦相似度 [0, 1]。> 0.75 才视为匹配
+          example: 0.0
+        ml_noise_type:
+          type: string
           description: |
-            L3 VGGish 嵌入余弦相似度 [-1, 1]。来自 NoiseAnalysisResult.l3_similarity，
-            仅 L3 触发时有效。
-          example: 0.89
+            L3 YAMNet 分类的 top-1 声源类名（如 "Air conditioning"、"White noise"）。
+            空=未触发或未匹配。YAMNet 每 3s 触发一次，结果 sticky 持久化。
+          example: "White noise"
+        ml_noise_score:
+          type: number
+          format: float
+          description: L3 YAMNet top-1 分数 [0, 1]
+          example: 0.67
+        ml_top_types:
+          type: string
+          description: |
+            L3 YAMNet top-3 分类结果（分号分隔的 type:score 对）。
+            仅含噪声相关类别（43 类白名单过滤）。
+          example: "White noise:0.67;Noise:0.57;Static:0.52"
 
     NoiseSensorConfig:
       type: object
@@ -2205,13 +2212,10 @@ components:
           type: boolean
           description: 是否为混合噪声（次高置信度 > 0.3 时为 true）
           example: false
-        noise_type_source:
-          type: string
-          description: |
-            主噪声类型的来源层：l1（L1 规则式，默认）、l2（Bark 模板）、
-            l3（VGGish ML）。对应 NoiseMetricsSnapshot.noise_type_source。
-          enum: [l1, l2, l3]
-          example: l1
+        is_speech:
+          type: boolean
+          description: VAD 语音活动检测结果。VAD 不再门控 L1 分析，仅作信息上报。
+          example: false
         noise_level_dbfs:
           type: number
           format: float
@@ -2283,6 +2287,32 @@ components:
             passthrough 并置 true；切换到非 passthrough 插件且恢复后清。
             告警引擎据此评估 plugin_degraded 规则（Warning）。
           example: false
+        l2_match_id:
+          type: integer
+          description: L2 Bark 模板匹配 ID（0=未匹配）
+          example: 0
+        l2_match_name:
+          type: string
+          description: L2 匹配模板名称
+          example: ""
+        l2_similarity:
+          type: number
+          format: float
+          description: L2 余弦相似度 [0, 1]
+          example: 0.0
+        ml_noise_type:
+          type: string
+          description: L3 YAMNet top-1 声源类名
+          example: "White noise"
+        ml_noise_score:
+          type: number
+          format: float
+          description: L3 YAMNet top-1 分数 [0, 1]
+          example: 0.67
+        ml_top_types:
+          type: string
+          description: L3 YAMNet top-3（type:score;type:score 格式）
+          example: "White noise:0.67;Noise:0.57;Static:0.52"
 
     # ──────────────────────────────────────────
     # 告警（Spec4 T4）
@@ -2430,17 +2460,17 @@ components:
         feature_type:
           type: string
           description: |
-            特征类型（默认 bark）。bark=32 维 Bark 频带能量（L2 模板匹配）；
-            vggish=128 维 VGGish 嵌入（L3 ML 分类）。对应 Template.feature_type。
-            POST /api/noise/template 录入时通过 feature_type 表单字段指定。
+            特征类型。bark=32 维 Bark 频带能量（L2 模板匹配，唯一支持的录入类型）。
+            vggish=历史遗留（L3 已改用 YAMNet，不再录入新 vggish 模板，
+            但旧模板仍保留）。对应 Template.feature_type。
           enum: [bark, vggish]
           default: bark
           example: bark
         vggish_embedding:
           type: array
           description: |
-            VGGish 128 维嵌入向量（可选）。仅 feature_type=vggish 时填充，
-            供 L3 kNN 检索。对应 Template.vggish_embedding。bark 模板为全零。
+            历史 VGGish 128 维嵌入向量。仅 feature_type=vggish 的旧模板有值。
+            L3 已迁移到 YAMNet，新录入模板均为 bark 类型，此字段为全零。
           items:
             type: number
             format: float
@@ -2547,7 +2577,7 @@ components:
         Server-Sent Events (SSE) 指标快照流（Spec4 Task 3）。
         约每 ALSA period（~128ms）推送一次事件，data 字段为 NoiseMetricsSnapshot 的
         子集 JSON（含 sensor_id 及关键检测/分析/降噪指标与 ref_* 比对结果，
-        不含 timestamp_ms / noise_candidates / noise_type_source 等字段）。
+        不含 timestamp_ms / noise_candidates / l2_match_name / ml_noise_type 等字段）。
         不发送 `event:` 与 `id:` 字段（事件以默认 "message" 类型投递）。连接建立时
         先发送 `: connected` 注释行。事件格式：
 

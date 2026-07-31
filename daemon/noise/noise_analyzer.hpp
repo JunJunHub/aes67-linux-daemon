@@ -14,65 +14,66 @@
 #include <string>
 #include <vector>
 
+#include "ml_classifier.hpp"   // MlClassifier, MlResult, MlTypeScore
 #include "noise_detector.hpp"  // NoiseDetectionResult
 
 namespace noise {
 
-class MlClassifier;        // Spec5 T3：L3 ML 分类器（前向声明，.cpp 内 include 全定义）
-class NoiseTemplateDB;     // Spec5 T3：L3 kNN 检索的模板库（前向声明）
+class NoiseTemplateDB;  // L2 kNN 检索的模板库（前向声明）
 
 // 噪声类型(arch §3.3.6 L548)。
 enum class NoiseType {
-  Clean,
-  White,
-  Pink,
-  Hum50Hz,
-  Hum60Hz,
-  Impulse,
-  Broadband,
-  Digital,
-  Unknown
+  Clean,      // 干净（无噪声）
+  White,      // 白噪声（平坦频谱）
+  Pink,       // 粉红噪声（-3dB/oct 斜率）
+  Hum50Hz,    // 50Hz 工频哼声
+  Hum60Hz,    // 60Hz 工频哼声
+  Impulse,    // 脉冲噪声
+  Broadband,  // 宽带噪声
+  Digital,    // 数字噪声（高频异常）
+  Unknown     // 未知
 };
 
 // 分析输入源(arch §3.3.6 L551)。
 enum class AnalysisSource { OriginalPCM, NoisePCM, ResidualPCM };
 
-// 候选噪声类型 + 置信度(arch §3.3.6 L554-557)。
+// L1 候选噪声类型 + 置信度(arch §3.3.6 L554-557)。
 struct NoiseTypeCandidate {
   NoiseType type;    // 候选噪声类型
   float confidence;  // 置信度 [0, 1]
 };
 
-// 噪声分析结果(arch §3.3.6 L559-579)。
+// 噪声分析结果。L1/L2/L3 三层并行上报，各有独立字段。
 struct NoiseAnalysisResult {
-  // 主结果(最高置信度候选)
-  NoiseType primary_type;
-  float primary_confidence;  // 主类型置信度 [0, 1]
+  // VAD 结果（从 detection 拷入，供 metrics 上报）
+  bool is_speech{false};
 
-  // top-N 候选(按置信度降序),用于混合噪声场景
-  // 最多 3 个,仅包含 confidence > 0.1 的候选
-  std::vector<NoiseTypeCandidate> candidates;
+  // ── L1 规则式分类（频域特征：White/Pink/Hum/Broadband 等）──
+  NoiseType primary_type{NoiseType::Unknown};
+  float primary_confidence{0.0f};              // L1 主类型置信度 [0, 1]
+  std::vector<NoiseTypeCandidate> candidates;  // top-3 候选（confidence > 0.1）
+  bool is_mixed{
+      false};  // candidates.size() >= 2 && candidates[1].confidence > 0.3
 
-  // 是否为混合噪声(多个候选置信度接近)
-  // 判定条件:candidates.size() >= 2 && candidates[1].confidence > 0.3
-  bool is_mixed;
+  // ── L2 Bark 模板匹配（用户自定义噪声模板）──
+  // 每帧用 32 维 Bark 频带能量与模板库做余弦相似度匹配。
+  // similarity > 0.75 才视为匹配；无模板库 / 无匹配 -> 空值。
+  uint32_t l2_match_id{0};    // 匹配到的模板 id（0=未匹配）
+  std::string l2_match_name;  // 模板名称
+  float l2_similarity{0.0f};  // 余弦相似度 [0, 1]
 
-  // 量化指标
-  float noise_level_dbfs;      // 噪声级 (dBFS)
-  float spectral_centroid_hz;  // 频谱质心
-  float spectral_flatness;     // 频谱平坦度 [0, 1],暴露给 UI
-  float hum_strength_db;       // 工频哼声强度 (dB)
-  float impulse_count;         // 脉冲计数/秒
-  std::array<float, 32> band_energy;  // 1/3 倍频程能量(L2 模板匹配特征向量)
+  // ── L3 YAMNet 分类（端到端声源识别）──
+  std::string ml_noise_type;              // YAMNet top-1 类名
+  float ml_noise_score{0.0f};             // YAMNet top-1 分数 [0, 1]
+  std::vector<MlTypeScore> ml_top_types;  // YAMNet top-3（白名单内）
 
-  // Spec5 T3（D-S5.8）：L3 ML 分类结果。仅当 L1+L2 均未识别
-  // （primary_confidence < 阈值）且 MlClassifier 可用时填充。
-  // noise_type_source 标识主结果的来源层："l1"（L1 规则式，默认）
-  // / "l2"（Bark 模板）/ "l3"（VGGish ML）。当 source="l3" 时，主类型权威值
-  // 为 l3_match_type（模板 label），primary_type 仍为 L1 的 Unknown。
-  std::string l3_match_type;      // L3 匹配到的模板 label（空=未触发/未匹配）
-  float l3_similarity{0.0f};      // L3 余弦相似度 [-1, 1]
-  std::string noise_type_source;  // 主结果来源层 "l1"|"l2"|"l3"（默认空=l1）
+  // ── 量化指标 ──
+  float noise_level_dbfs{-120.0f};    // 噪声级 (dBFS)
+  float spectral_centroid_hz{0.0f};   // 频谱质心
+  float spectral_flatness{0.0f};      // 频谱平坦度 [0, 1]
+  float hum_strength_db{0.0f};        // 工频哼声强度 (dB)
+  float impulse_count{0.0f};          // 脉冲计数/秒
+  std::array<float, 32> band_energy;  // 1/3 倍频程能量（L2 特征向量）
 };
 
 // 逐帧特征(arch §3.3.7 L610-619)。
@@ -104,21 +105,25 @@ std::array<float, 32> compute_bark_spectrum(const float* pcm,
 class NoiseAnalyzer {
  public:
   NoiseAnalyzer();
-  ~NoiseAnalyzer();  // out-of-line：ml_classifier_ shared_ptr<MlClassifier> 需完整类型
+  ~NoiseAnalyzer();  // out-of-line：ml_classifier_ shared_ptr<MlClassifier>
+                     // 需完整类型
+  // 分析一帧音频。
+  //   frames/frame_size：L1/L2 分析输入（降噪开启时为噪声分量，关闭时为原始
+  //   PCM） detection：VAD + SNR + SF 检测结果
+  //   original_pcm/original_n：原始音频（L3 用，YAMNet
+  //   多标签分类需完整混合音频。
+  //     为空时 L3 回退到 frames。降噪开启时 L3 应传原始 PCM 而非噪声分量，
+  //     因为 YAMNet 能同时识别语音+噪声，白名单过滤掉 Speech 后报告噪声类型。）
   NoiseAnalysisResult analyze(const float* frames,
                               size_t frame_size,
-                              const NoiseDetectionResult& detection);
-  void set_analysis_window_ms(uint32_t ms);  // 分析窗口(默认 2000ms)
+                              const NoiseDetectionResult& detection,
+                              const float* original_pcm = nullptr,
+                              size_t original_n = 0);
 
-  // Spec5 T3（D-S5.8）：注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1+L2 不受
-  // 影响，additive 向后兼容）。控制线程调用（add_sensor 后），由 NoiseManager
-  // 转发同一 shared_ptr 给所有 sensor 的 analyzer 共享。
+  // 注入 L3 ML 分类器。空 shared_ptr -> L3 跳过（L1 不受影响）。
   void set_ml_classifier(std::shared_ptr<MlClassifier> ml);
-  // Spec5 T3：注入模板库（L3 kNN 检索用）。空 -> L3 即使触发也无模板可检索。
-  // DB 自带 recursive_mutex 保护 capture 线程读 vs HTTP 写。
+  // 注入 L2 模板库。空 shared_ptr -> L2 跳过。
   void set_template_db(std::shared_ptr<NoiseTemplateDB> db);
-  // L3 触发阈值：primary_confidence < 阈值时调 L3。默认 0.5。
-  void set_l3_confidence_threshold(float t) { l3_threshold_ = t; }
 
  private:
   // L1: 规则式分类(各规则输出置信度)
@@ -130,34 +135,32 @@ class NoiseAnalyzer {
       size_t frame_size,
       float spectral_flatness);
 
-  // 逐帧特征环形缓冲(§3.3.7)
-  std::vector<FrameFeatures> feature_ring_;
-  size_t ring_head_{0};
-  size_t ring_count_{0};
-  uint32_t analysis_window_ms_{2000};
-  static constexpr size_t kRingCapacity = 200;  // 2s @ 10ms/frame
+  // ── L2 Bark 模板匹配（用户自定义噪声模板）──
+  std::shared_ptr<NoiseTemplateDB> template_db_;
 
-  // 窗口聚合(§3.3.7 L625):加权平均 bark_energy -> L2 输入
-  void aggregate_window();
-
-  // ── Spec5 T3：L3 ML 分类层（D-S5.8）──
+  // ── L3 ML 分类层（YAMNet 端到端分类，独立于 L1）──
   // L3 分类器（可选，空则跳过）。
   std::shared_ptr<MlClassifier> ml_classifier_;
-  // 模板库（L3 kNN 检索用，可选，空则 L3 无模板可检索）。
-  std::shared_ptr<NoiseTemplateDB> template_db_;
-  float l3_threshold_{0.5f};  // L1+L2 未识别阈值（primary_confidence < 此值触发 L3）
 
-  // L3 嵌入所需的 0.96s @48k PCM 环形缓冲。analyze() 每帧追加 analysis PCM，
-  // 攒满 46080 样本后 L3 触发时取最新一窗送 MlClassifier::embed。
+  // L3 分类所需的 3s @48k PCM 环形缓冲。analyze() 每帧追加 analysis PCM，
+  // 攒满 144000 样本后 L3 触发时取最新一窗送 MlClassifier::classify。
   // 单 capture 线程独占读写（per-sensor analyzer），无并发。
-  static constexpr size_t kVggishWindowSamples = 46080;  // 0.96s @48k
+  static constexpr size_t kYamnetWindowSamples = 144000;  // 3s @48k
   std::vector<float> pcm_ring_;
   size_t pcm_ring_head_{0};
   size_t pcm_ring_count_{0};
-  // L3 节流：触发后冷却若干帧（~0.96s），避免持续未知噪声时每帧都跑 ONNX。
+  // L3 节流：触发后冷却若干帧（~3s），避免持续未知噪声时每帧都跑 ONNX。
   size_t l3_cooldown_{0};
-  static constexpr size_t kL3CooldownFrames = 96;  // 0.96s @10ms/帧
-  // L3 触发判定 + classify 调用 + l3_* 字段填充。在 analyze() 末尾调用。
+  static constexpr size_t kL3CooldownFrames = 300;  // 3s @10ms/帧
+  // L3 结果持久化：L3 触发频率低（每 3s 一次），但 metrics 快照每帧更新。
+  // 若不持久化，L3 结果仅在触发帧出现（1/300），其余帧被默认空值覆盖。
+  // last_l3_* 保存最近一次 L3 命中结果，每帧恢复到 result 中。
+  std::string last_l3_type_;
+  float last_l3_score_{0.0f};
+  std::vector<MlTypeScore> last_l3_top_types_;
+  bool l3_has_result_{false};
+  // L3 触发判定 + classify 调用 + ml_* 字段填充。在 analyze() 中调用。
+  // frames/frame_size 为 L3 分析输入（优先原始音频）。
   void maybe_run_l3_(NoiseAnalysisResult& result,
                      const float* frames,
                      size_t frame_size);

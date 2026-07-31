@@ -115,9 +115,6 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   ctx.detector->set_sensitivity(cfg.sensitivity);
   // ③ NoiseAnalyzer（L1 规则式 + L2 模板匹配）。
   ctx.analyzer = std::make_shared<NoiseAnalyzer>();
-  // Spec5 T3：注入 L3 ML 分类器 + 模板库（main 装配 set_ml_classifier/
-  // set_template_db 后，add_sensor 时传给各 sensor analyzer；为空则 L3 跳过，
-  // L1+L2 不受影响）。
   ctx.analyzer->set_ml_classifier(ml_classifier_);
   ctx.analyzer->set_template_db(template_db_);
   // ④ NoiseMetrics（Spec3 Task 2 真聚合，替 Spec2 stub）。
@@ -149,12 +146,16 @@ bool NoiseManager::add_sensor(uint8_t sensor_id,
   retire_queue_.reclaim_older_than(sensor_table_.epoch());
   // Spec3 T8b（C2 修复）：向 Bridge 注册 FrameProvider，使 PcmCaptureService
   // 分发的 ALSA period 帧经 Bridge 解复用后路由到 on_frame（arch §3.7 L791
-  // "向 Bridge 注册 FrameProvider"）。此前 add_sensor 不注册 frame provider，
-  // 生产 pipeline 永不运行 on_frame -> metrics 留默认 -> /denoised 404。
-  // channel_map 默认 {0}（Phase 1 单通道，arch §4.2 "channels 恒为 1"）。
-  // NoiseSensorConfig 无 map 字段，Phase 1 固定 channel 0。
+  // "向 Bridge 注册 FrameProvider"）。
+  // channel_map 从 Bridge 查询（真实场景：SessionManager::StreamSink.map，
+  // 用户通过 PUT /api/sink/:id 配置；FAKE 场景：sink 配置的 map 指向
+  // fake_pcm_source 目录下对应 channel 的 WAV）。
+  // 返回空时用 {0} 兜底（兼容旧配置，channel 0）。
+  std::vector<uint8_t> ch_map = bridge_.get_sink_channel_map(sink_id);
+  if (ch_map.empty())
+    ch_map = {0};
   bridge_.register_frame_provider(
-      sink_id, {0},
+      sink_id, ch_map,
       [this](uint8_t sid, const float* frames, size_t n, uint8_t /*ch*/) {
         on_frame(sid, frames, n);
       });
@@ -441,18 +442,12 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
     detection = ctx.detector->process_frame(pcm, n);
   }
 
-  // ③ 分析源选择（arch §3.3.1）：
-  //   denoise_enabled=true  -> NoisePCM (out->noise = original - denoised)
-  //                            纯噪声分量，分类最准
-  //   denoise_enabled=false -> OriginalPCM (pcm)
-  const float* analysis_pcm = pcm;
-  size_t analysis_n = n;
-  if (ctx.denoise_enabled && out != nullptr && out->noise != nullptr) {
-    analysis_pcm = out->noise;
-    analysis_n = dn;
-  }
-  NoiseAnalysisResult ar =
-      ctx.analyzer->analyze(analysis_pcm, analysis_n, detection);
+  // ③ 分析源：L1/L2/L3 统一分析原始 PCM。
+  // 早期设计降噪开启时 L1 分析噪声分量（original - denoised），但噪声分量
+  // 是降噪器残留，频谱不规则、SF 极低（0.01-0.08），L1 规则几乎全部失配。
+  // 改为分析原始音频：L1 规则对语音安全（语音 SF≈0.1-0.3，不触发 White；
+  // 语音基频 80-300Hz，不触发 Hum50/60），能检测到真实噪声特征。
+  NoiseAnalysisResult ar = ctx.analyzer->analyze(pcm, n, detection, pcm, n);
   *ctx.last_analysis =
       ar;  // 供 get_analysis_result_for_test（共享指针，跨表可见）
 
@@ -471,6 +466,29 @@ void NoiseManager::process_pipeline_chunk(const SensorContext& ctx,
     denoised_rms = std::sqrt(denoised_rms / static_cast<float>(dn));
   }
   ctx.metrics->collect(denoise_result, detection, ar, input_rms, denoised_rms);
+
+  // Push to PCM ring buffer for streaming AAC encoding.
+  if (out != nullptr && out->denoised != nullptr && dn > 0) {
+    auto ring = get_pcm_ring(ctx.sink_id);
+    if (ring) {
+      std::lock_guard<std::mutex> rlock(ring->mutex);
+      for (size_t i = 0; i < dn; ++i) {
+        ring->original.push_back(out->original[i]);
+        ring->denoised.push_back(out->denoised[i]);
+        ring->noise.push_back(out->noise[i]);
+      }
+      // 限制缓冲 2s（96000 样本），各 channel 独立丢弃最旧。
+      // 原联动 pop_front 的问题：当原始流消费 original 但降噪流未消费
+      // denoised 时，denoised 持续增长触发 limit，original 被双重消费
+      // （流读取 + limit pop_front），导致原始流过早断流。
+      while (ring->original.size() > 96000)
+        ring->original.pop_front();
+      while (ring->denoised.size() > 96000)
+        ring->denoised.pop_front();
+      while (ring->noise.size() > 96000)
+        ring->noise.pop_front();
+    }
+  }
 }
 
 void NoiseManager::on_period_end() {
@@ -582,22 +600,7 @@ void NoiseManager::on_period_end() {
       if (has_alert_subscribers) {
         // 组装 SSE 事件 JSON（arch §C 告警事件格式）。
         // raise/clear 仅在状态转换时发生（罕见），JSON 组装可接受。
-        const char* level_str = "none";
-        switch (ev->level) {
-          case AlertLevel::Info:
-            level_str = "info";
-            break;
-          case AlertLevel::Warning:
-            level_str = "warning";
-            break;
-          case AlertLevel::Critical:
-            level_str = "critical";
-            break;
-          case AlertLevel::None:
-          default:
-            level_str = "none";
-            break;
-        }
+        const char* level_str = alert_level_to_string(ev->level);
         std::ostringstream ss;
         ss << "data: {\"sensor_id\": " << static_cast<unsigned>(id)
            << ", \"level\": \"" << level_str << "\"" << ", \"rule\": \""
@@ -728,6 +731,63 @@ const DenoiseOutput* NoiseManager::get_denoise_output(uint8_t sink_id) const {
     return ctx.denoise->get_output();
   }
   return nullptr;
+}
+
+const DenoiseOutput* NoiseManager::get_current_denoise_output(
+    uint8_t sink_id) const {
+  const SensorTable* tbl = sensor_table_.load();
+  if (tbl == nullptr)
+    return nullptr;
+  for (const auto& [id, ctx] : *tbl) {
+    (void)id;
+    if (ctx.sink_id != sink_id)
+      continue;
+    if (!ctx.denoise_enabled || !ctx.denoise)
+      return nullptr;
+    return ctx.denoise->get_current_output();
+  }
+  return nullptr;
+}
+
+std::shared_ptr<NoiseManager::PcmRing> NoiseManager::get_pcm_ring(
+    uint8_t sensor_id) {
+  std::lock_guard<std::mutex> lock(pcm_rings_mutex_);
+  auto it = pcm_rings_.find(sensor_id);
+  if (it == pcm_rings_.end()) {
+    auto ring = std::make_shared<PcmRing>();
+    pcm_rings_[sensor_id] = ring;
+    return ring;
+  }
+  return it->second;
+}
+
+size_t NoiseManager::drain_pcm_ring(std::shared_ptr<PcmRing> ring,
+                                    int channel,
+                                    float* out,
+                                    size_t max_n) {
+  if (!ring)
+    return 0;
+  std::lock_guard<std::mutex> lock(ring->mutex);
+  std::deque<float>* src = nullptr;
+  switch (channel) {
+    case 0:
+      src = &ring->original;
+      break;
+    case 1:
+      src = &ring->denoised;
+      break;
+    case 2:
+      src = &ring->noise;
+      break;
+  }
+  if (!src)
+    return 0;
+  size_t n = std::min(src->size(), max_n);
+  for (size_t i = 0; i < n; ++i) {
+    out[i] = src->front();
+    src->pop_front();
+  }
+  return n;
 }
 
 size_t NoiseManager::sensor_count_for_test() const {
@@ -1821,10 +1881,7 @@ void NoiseManager::stop_all_sink_threads_() {
 }
 
 bool NoiseManager::has_sink_queue_for_test(uint8_t sink_id) const {
-  // const 方法但需加锁（mutable mutex 不存在 -> 用 const_cast 绕过）。
-  // 测试钩子，非关键路径。
-  auto* self = const_cast<NoiseManager*>(this);
-  std::lock_guard<std::mutex> lock(self->sink_queues_mutex_);
+  std::lock_guard<std::mutex> lock(sink_queues_mutex_);
   return sink_queues_.find(sink_id) != sink_queues_.end();
 }
 

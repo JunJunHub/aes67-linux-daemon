@@ -58,6 +58,10 @@ if(WITH_NOISE)
   list(APPEND SOURCES pcm_capture_service.cpp noise_session_manager_bridge.cpp)
 endif()
 add_executable(aes67-daemon ${SOURCES})
+# aes67-daemon 始终链接 session_manager.cpp（SOURCES），可查询
+# SessionManager::get_sink（channel_map）。noise-test 不链接该 .cpp，
+# pcm_capture_service.cpp 用 _HAS_SESSION_MANAGER_LINK_ 守卫编译期引用。
+target_compile_definitions(aes67-daemon PRIVATE -D_HAS_SESSION_MANAGER_LINK_)
 
 if(ENABLE_TESTS)
     add_subdirectory(tests)
@@ -127,4 +131,13 @@ if(ENABLE_TESTS AND WITH_NOISE)
     target_compile_definitions(noise-test PRIVATE -D_USE_STREAMER_)
   endif()
   add_test(NAME noise-test COMMAND noise-test -p)
+
+  # noise_bench：降噪质量 + 并发性能基准工具（不依赖 Boost.Test）。
+  add_executable(noise-bench noise/tools/noise_bench.cpp)
+  target_link_libraries(noise-bench PRIVATE
+    "-Wl,--whole-archive"
+    noise
+    "-Wl,--no-whole-archive"
+    Threads::Threads)
+  target_compile_definitions(noise-bench PRIVATE -D_USE_NOISE_)
 endif()

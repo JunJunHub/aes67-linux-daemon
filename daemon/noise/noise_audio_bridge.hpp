@@ -26,6 +26,11 @@ class NoiseAudioBridge {
   virtual bool is_sink_receiving(uint8_t sink_id) const = 0;
   virtual uint32_t get_sample_rate() const = 0;
   virtual uint8_t get_sink_channel_count(uint8_t sink_id) const = 0;
+  // 查询 sink 的 channel_map（来自 SessionManager::StreamSink.map）。
+  // 真实场景：用户通过 PUT /api/sink/:id 配置 map 字段。
+  // FAKE 场景：sink 配置的 map 指向 fake_pcm_source 目录下对应 channel 的 WAV。
+  // 返回空 vector 表示 sink 不存在或未配置 map（调用方用 {0} 兜底）。
+  virtual std::vector<uint8_t> get_sink_channel_map(uint8_t sink_id) const = 0;
 
   using PtpStatusCallback = std::function<void(const std::string& status)>;
   virtual void set_ptp_status_callback(PtpStatusCallback cb) = 0;

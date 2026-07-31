@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <utility>
 #include <vector>
 
@@ -65,16 +66,21 @@ bool DtlnAdapter::init(const PluginConfig& cfg) {
   in_rate_ = cfg.sample_rate_in ? cfg.sample_rate_in : 48000;
 
   // 模型路径：cfg.model_path 优先（指向 model_1.onnx）；否则用 onnx_model_dir
-  // 推导（<dir>/model_1.onnx）。DTLN 无内置默认模型，路径为空时 init 失败
-  // -> DenoiseProcessor 切默认插件（passthrough）。
+  // 推导。先找 <dir>/dtln/model_1.onnx（按子目录布局），再回退
+  // <dir>/model_1.onnx。 DTLN 无内置默认模型，路径为空时 init 失败 -> 切
+  // passthrough。
   std::string m1 = cfg.model_path;
   if (m1.empty()) {
     if (cfg.onnx_model_dir.empty())
       return false;
-    m1 = cfg.onnx_model_dir;
-    if (!m1.empty() && m1.back() != '/' && m1.back() != '\\')
-      m1 += '/';
-    m1 += "model_1.onnx";
+    std::string dir = cfg.onnx_model_dir;
+    if (!dir.empty() && dir.back() != '/' && dir.back() != '\\')
+      dir += '/';
+    // 优先：<dir>/dtln/model_1.onnx
+    m1 = dir + "dtln/model_1.onnx";
+    // 回退：<dir>/model_1.onnx
+    if (std::ifstream(m1).fail())
+      m1 = dir + "model_1.onnx";
   }
   const std::string m2 = derive_sibling_model(m1);
 
@@ -285,13 +291,10 @@ size_t DtlnAdapter::process(const float* in,
       continue;
     }
     // Run 失败：置 kBypass。DenoiseProcessor 计连续 kBypass -> kError -> 切
-    // passthrough。 D-S5.5 偏差（reviewer final Important
-    // #2，文档化接受）：理想 memcpy in->out passthrough，但 DTLN 跨采样率（48k
-    // 输入经 down_ 重采样入 in_fifo16_，失败 hop 的对应输入需 48k->16k
-    // 重采样延迟输入 in_delay48_，复杂），故失败帧用 silence 安全降级（sanitize
-    // 完整 + 10 帧界 + 最终切 passthrough，不喂下游 错误样本）。真实 memcpy
-    // passthrough 延后后续 spec。
+    // passthrough。
     failed = true;
+    // D-S5.5：失败 hop 填 silence 占位（保持流率），输出阶段 dry_wet 降为
+    // 0.0 使该段输出 = orig（in_delay48_ 对齐），等价 memcpy passthrough。
     // 无条件 push kHop 个 0（不依赖 in_fifo16_ 状态；原条件 !in_fifo16_.empty()
     // 在 fifo 空时提前停 -> 输出 < kHop -> 流率失配 rate glitch）。
     for (size_t i = 0; i < kHop; ++i)
@@ -305,17 +308,20 @@ size_t DtlnAdapter::process(const float* in,
       up_scratch_.resize(up_cap);
     // up_->process 需连续缓冲；deque 非连续，先拷到连续缓冲。
     // Spec6 T3：预分配成员复用（零 per-frame heap）。
-    if (up_contig_.size() < out_fifo16_.size())
-      up_contig_.resize(out_fifo16_.size());
+    const size_t in16_size = out_fifo16_.size();
+    if (up_contig_.size() < in16_size)
+      up_contig_.resize(in16_size);
     std::copy(out_fifo16_.begin(), out_fifo16_.end(), up_contig_.begin());
     out_fifo16_.clear();
-    const size_t n48 = up_->process(up_contig_.data(), up_contig_.size(),
+    const size_t n48 = up_->process(up_contig_.data(), in16_size,
                                     up_scratch_.data(), up_scratch_.size());
     for (size_t i = 0; i < n48; ++i)
       out_fifo48_.push_back(up_scratch_[i]);
   }
 
   // 5. 输出：取 min(out_fifo48_.size(), n_out_max)，dry_wet 混合 + sanitize。
+  // D-S5.5：ONNX 失败时 dry_wet 降为 0.0，输出 = orig（memcpy passthrough）。
+  const float effective_dry_wet = failed ? 0.0f : dry_wet;
   size_t n_out = std::min(out_fifo48_.size(), n_out_max);
   for (size_t i = 0; i < n_out; ++i) {
     float denoised = out_fifo48_.front();
@@ -325,7 +331,7 @@ size_t DtlnAdapter::process(const float* in,
       orig = in_delay48_.front();
       in_delay48_.pop_front();
     }
-    float s = dry_wet * denoised + (1.0f - dry_wet) * orig;
+    float s = effective_dry_wet * denoised + (1.0f - effective_dry_wet) * orig;
     out[i] = sanitize(s);
   }
 

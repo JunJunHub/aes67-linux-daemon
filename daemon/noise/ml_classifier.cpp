@@ -1,80 +1,119 @@
 // daemon/noise/ml_classifier.cpp
-// Spec5 Task 3：L3 ML 分类实现 -- VGGish ONNX 嵌入 + kNN 检索（D-S5.8）。
+// L3 ML 分类实现 -- YAMNet ONNX 端到端多标签分类（VGGish -> YAMNet 迁移）。
 //
-// 嵌入流水线（identification §4.1 VGGish 预处理，canonical 配置）：
-//   0.96s @48k PCM(46080smp) -> 重采样 16k(15360smp) ->
-//   STFT(frame=400/25ms, hop=160/10ms, Hann, nfft=512) -> 96 帧 ->
-//   功率谱 |STFT|² -> 64 mel bins(125-7500Hz) -> log1p ->
-//   [1,96,64] log-mel -> VGGish ONNX -> [1,128] 嵌入。
+// 推理流水线：
+//   3s @48k PCM(144000smp) -> 重采样 16k(48000smp) ->
+//   YAMNet ONNX Run -> scores [6,521] 均值 -> [521] ->
+//   白名单过滤 -> 降序排序 -> top-3（score > 0.1）-> MlResult
 //
 // RT 安全契约（与 T2 adapter 同）：ONNX Run() 全程 try/catch，绝不向 RT 抛
-// 异常；失败 embed 返回全零、classify 返回 nullopt（L3 退化为未识别，L1+L2
-// 不受影响）。NaN/Inf 守卫：嵌入元素 sanitize 为有限值。
+// 异常；失败 classify 返回 nullopt（L3 退化为未识别，L1+L2 不受影响）。
+// NaN/Inf 守卫：分数 sanitize 为有限值。
 //
-// 模型签名约定见 ml_classifier.hpp。无法在无模型环境下验证此签名/mel 配置
-// 是否与最终 VGGish ONNX 严格匹配 -- 按 index 绑定 I/O（名字稳健）+ canonical
-// mel 参数，模型缺失时相关测试 SKIP。此为 Spec5 T3 已知 debt（见 report）。
+// 模型签名（yamnet_3s.onnx）：
+//   输入[0] = new_input [1, 48000]  float32
+//   输出[0] = embeddings [6, 1024]
+//   输出[1] = log_mel_spectrogram [336, 64]
+//   输出[2] = scores [6, 521]
+//   按 index 绑定 I/O（名字随导出版本变化，index 稳定，与 T2 adapter 同）。
 #include "ml_classifier.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <onnxruntime_cxx_api.h>
 
-#include "fft.hpp"
-#include "noise_template_db.hpp"
 #include "onnx_session.hpp"
 #include "resampler.hpp"
 
 namespace noise {
 
 namespace {
-// VGGish 预处理参数（identification §4.1 canonical）。
-constexpr uint32_t kVggishSampleRate = 16000;  // VGGish native 采样率
-constexpr size_t kVggishFrame = 400;           // 25ms @16k
-constexpr size_t kVggishHop = 160;             // 10ms @16k
-constexpr size_t kVggishNfft = 512;            // STFT FFT 点数（radix-2）
-constexpr size_t kVggishNumFrames = 96;        // 0.96s -> 96 帧
-constexpr size_t kVggishMelBins = 64;          // mel 滤波器组 bin 数
-constexpr float kVggishMelLo = 125.0f;         // mel 下限 (Hz)
-constexpr float kVggishMelHi = 7500.0f;        // mel 上限 (Hz)
-constexpr float kVggishLogOffset =
-    0.01f;  // canonical VGGish log(mel+0.01) 偏移
-
-// hz -> mel（HTK 公式：2595·log10(1+hz/700)）。
-inline float hz_to_mel(float hz) {
-  return 2595.0f * std::log10(1.0f + hz / 700.0f);
-}
-// mel -> hz。
-inline float mel_to_hz(float mel) {
-  return 700.0f * (std::pow(10.0f, mel / 2595.0f) - 1.0f);
-}
+// YAMNet 参数。
+constexpr uint32_t kYamnetSampleRate = 16000;  // YAMNet native 采样率
+constexpr size_t kYamnetInputSamples = 48000;  // 3s @16k
+constexpr size_t kYamnetNumClasses = 521;      // AudioSet 类别数
+constexpr size_t kYamnetNumFrames = 6;         // 3s -> 6 帧（0.5s/帧）
+constexpr size_t kTopN = 6;                    // 返回 top-6
+constexpr float kMinScore = 0.05f;             // 最低报告分数
 
 // sanitize：非有限 -> 0。
 inline float sanitize(float v) {
   return std::isfinite(v) ? v : 0.0f;
 }
+
+// 噪声相关类别白名单（AudioSet index）。
+// 排除语音、音乐、动物等非噪声类别。
+// 来源：yamnet_class_map.csv 中与噪声诊断相关的 index。
+constexpr int kNoiseClassIndices[] = {
+    32,   // Humming -- 嗡鸣
+    79,   // Hiss -- 嘶嘶声
+    105,  // Roar -- 轰鸣
+    125,  // Buzz -- 蜂鸣
+    130,  // Rattle -- 咔嗒声
+    277,  // Wind -- 风声
+    279,  // Wind noise (microphone) -- 麦克风风噪
+    282,  // Water -- 水声
+    286,  // Stream -- 溪流声
+    293,  // Crackle -- 爆裂声
+    300,  // Motor vehicle (road) -- 机动车
+    320,  // Motorcycle -- 摩托车
+    321,  // Traffic noise, roadway noise -- 交通噪声
+    323,  // Train -- 火车
+    330,  // Aircraft engine -- 飞机引擎
+    331,  // Jet engine -- 喷气引擎
+    337,  // Engine -- 引擎
+    338,  // Light engine (high frequency) -- 轻型引擎（高频）
+    342,  // Medium engine (mid frequency) -- 中型引擎（中频）
+    343,  // Heavy engine (low frequency) -- 重型引擎（低频）
+    344,  // Engine knocking -- 引擎爆震
+    353,  // Knock -- 敲击
+    355,  // Squeak -- 吱吱声
+    371,  // Vacuum cleaner -- 吸尘器
+    382,  // Alarm -- 警报
+    390,  // Siren -- 警笛
+    392,  // Buzzer -- 蜂鸣器
+    406,  // Mechanical fan -- 机械风扇
+    407,  // Air conditioning -- 空调
+    428,  // Burst, pop -- 爆裂、砰声
+    434,  // Crack -- 断裂声
+    438,  // Liquid -- 液体声
+    443,  // Pour -- 倾倒声
+    444,  // Trickle, dribble -- 滴漏声
+    448,  // Pump (liquid) -- 泵（液体）
+    454,  // Thump, thud -- 沉闷撞击
+    469,  // Scrape -- 刮擦声
+    478,  // Clang -- 哐当声
+    482,  // Whir -- 旋转嗡声
+    485,  // Clicking -- 咔哒声
+    487,  // Rumble -- 隆隆声
+    490,  // Hum -- 嗡嗡声
+    504,  // Outside, rural or natural -- 户外/自然环境声
+    507,  // Noise -- 噪声（通用）
+    508,  // Environmental noise -- 环境噪声
+    509,  // Static -- 静电噪声
+    510,  // Mains hum -- 工频哼声
+    514,  // White noise -- 白噪声
+    515,  // Pink noise -- 粉红噪声
+};
+constexpr size_t kNoiseClassCount =
+    sizeof(kNoiseClassIndices) / sizeof(kNoiseClassIndices[0]);
 }  // namespace
 
-// PImpl：把 onnxruntime 依赖 + mel 矩阵 + 重采样器隔离在 .cpp，
-// 使 ml_classifier.hpp 不 include onnxruntime_cxx_api.h（与 T2 adapter
-// 同手法）。
+// PImpl：把 onnxruntime 依赖 + 重采样器 + class_map 隔离在 .cpp。
 struct MlClassifier::Impl {
   std::unique_ptr<Ort::Session> session;
   std::string in_name;
-  std::string out_name;
-  // mel 滤波器组 [kVggishMelBins][nfft/2+1=257]（惰性建）。
-  std::vector<std::vector<float>> mel_filterbank;
-  bool mel_built{false};
-  // 48k->16k 重采样器（复用 T1 Resampler 原语）。
-  std::unique_ptr<Resampler> downsample;
-  // embed 暂存（复用容量，避免每次堆分配）。
-  std::vector<float> mel16;          // 重采样后 16k 样本
-  std::vector<float> logmel;         // [96*64] log-mel 平面
-  std::vector<float> scratch_frame;  // 单帧功率谱暂存
+  std::string scores_name;
+  std::string embeddings_name;
+  // class_map：AudioSet index -> display_name。
+  std::unordered_map<int, std::string> class_map;
 };
 
 MlClassifier::MlClassifier() : impl_(std::make_unique<Impl>()) {}
@@ -90,6 +129,58 @@ bool MlClassifier::available() const {
   return impl_ && impl_->session != nullptr;
 }
 
+void MlClassifier::load_class_map(const std::string& model_path) {
+  // 从 model_path 同目录查找 yamnet_class_map.csv。
+  // 路径格式：/path/to/yamnet_3s.onnx -> /path/to/yamnet_class_map.csv
+  auto last_sep = model_path.find_last_of("/\\");
+  std::string dir =
+      (last_sep != std::string::npos) ? model_path.substr(0, last_sep) : ".";
+  std::string csv_path = dir + "/yamnet_class_map.csv";
+
+  std::ifstream f(csv_path);
+  if (!f.is_open()) {
+    // 回退：尝试环境变量或已知路径。
+    const char* env = std::getenv("NOISE_MODELS_DIR");
+    if (env) {
+      csv_path = std::string(env) + "/yamnet_class_map.csv";
+      f.open(csv_path);
+    }
+  }
+  if (!f.is_open())
+    return;  // CSV 缺失：用 index 数字作为类名
+
+  std::string line;
+  std::getline(f, line);  // 跳过 header
+  while (std::getline(f, line)) {
+    // 格式：index,mid,display_name
+    // display_name 可能含逗号（引号包裹），如 "Trickle, dribble"
+    // 解析：index（到第一个逗号）, mid（到第二个逗号）, name（剩余全部）
+    size_t c1 = line.find(',');
+    if (c1 == std::string::npos)
+      continue;
+    size_t c2 = line.find(',', c1 + 1);
+    if (c2 == std::string::npos)
+      continue;
+    std::string idx_str = line.substr(0, c1);
+    // name = 第三个逗号后的全部内容
+    std::string name = line.substr(c2 + 1);
+    // 去除 Windows 换行符 \r（先于引号处理，因 \r 可能在引号之后）。
+    if (!name.empty() && name.back() == '\r')
+      name.pop_back();
+    // 去除首尾引号（CSV 引号包裹的字段）。
+    if (!name.empty() && name.front() == '"')
+      name = name.substr(1);
+    if (!name.empty() && name.back() == '"')
+      name.pop_back();
+    try {
+      int idx = std::stoi(idx_str);
+      impl_->class_map[idx] = name;
+    } catch (...) {
+      continue;
+    }
+  }
+}
+
 bool MlClassifier::init(const std::string& model_path) {
   if (impl_->session)
     return false;  // 已加载，不重载
@@ -98,160 +189,166 @@ bool MlClassifier::init(const std::string& model_path) {
   impl_->session = CreateOnnxSession(model_path);
   if (!impl_->session)
     return false;
-  // 按 index 缓存 I/O 名字（名字随导出版本变化，index 稳定，与 T2 adapter
-  // 同）。
+  // 按 index 缓存 I/O 名字。
   impl_->in_name = OnnxInputName(*impl_->session, 0);
-  impl_->out_name = OnnxOutputName(*impl_->session, 0);
-  if (impl_->in_name.empty() || impl_->out_name.empty()) {
+  // scores 是第 3 个输出（index=2）。
+  impl_->scores_name = OnnxOutputName(*impl_->session, 2);
+  // embeddings 是第 1 个输出（index=0），备用。
+  impl_->embeddings_name = OnnxOutputName(*impl_->session, 0);
+  if (impl_->in_name.empty() || impl_->scores_name.empty()) {
     impl_->session.reset();
     return false;
   }
-  // 重采样器：48k -> 16k（VGGish native）。
-  impl_->downsample = std::make_unique<Resampler>(48000, kVggishSampleRate);
+  // 加载 class_map CSV。
+  load_class_map(model_path);
   return true;
 }
 
-// 惰性构建 mel 滤波器组 [64][257]。每行一个 mel 三角滤波器，覆盖 fft bins。
-void MlClassifier::ensure_mel_filterbank() const {
-  if (impl_->mel_built)
-    return;
-  const size_t nbins = kVggishNfft / 2 + 1;  // 257
-  impl_->mel_filterbank.assign(kVggishMelBins, std::vector<float>(nbins, 0.0f));
-  const float mel_lo = hz_to_mel(kVggishMelLo);
-  const float mel_hi = hz_to_mel(kVggishMelHi);
-  // 64 个 mel bin -> 66 个 mel 边缘点。
-  for (size_t m = 0; m < kVggishMelBins; ++m) {
-    float mel_left = mel_lo + (mel_hi - mel_lo) * static_cast<float>(m) /
-                                  static_cast<float>(kVggishMelBins);
-    float mel_center = mel_lo + (mel_hi - mel_lo) * static_cast<float>(m + 1) /
-                                    static_cast<float>(kVggishMelBins);
-    float mel_right = mel_lo + (mel_hi - mel_lo) * static_cast<float>(m + 2) /
-                                   static_cast<float>(kVggishMelBins);
-    float f_left = mel_to_hz(mel_left);
-    float f_center = mel_to_hz(mel_center);
-    float f_right = mel_to_hz(mel_right);
-    // canonical VGGish（tf.signal.linear_to_mel_weight_matrix）：未归一化原始
-    // 三角权重（不做行和归一化）。归一化改变 mel 能量分布，喂给在未归一化 mel
-    // 上训练的 VGGish ONNX off-distribution 输入 -> embed 不可靠（review
-    // Important）。
-    for (size_t k = 0; k < nbins; ++k) {
-      float f = static_cast<float>(k) * (static_cast<float>(kVggishSampleRate) /
-                                         static_cast<float>(kVggishNfft));
-      if (f < f_left || f > f_right) {
-        continue;  // 三角滤波器外
+std::optional<MlResult> MlClassifier::classify(const float* pcm48k,
+                                               size_t n) const {
+  if (!available() || pcm48k == nullptr || n == 0)
+    return std::nullopt;
+
+  try {
+    // 1. 48k -> 16k 重采样。
+    // 用局部 Resampler 而非成员 impl_->downsample：MlClassifier 是所有 sensor
+    // 共享的单实例，成员 Resampler 的 SpeexDSP 滤波状态会被多路并发调用交叉
+    // 污染（sensor A 的滤波残留混入 sensor B 的输出），导致分类失真偏向某
+    // 类（64 路并发验证中全部偏向 Water）。局部构造无状态残留，每次独立。
+    // classify_mutex_ 仍保护 ONNX Run（Ort::Session 非线程安全）。
+    // 3s 一次的批处理，局部构造 SpeexDSP 开销可忽略（<<1ms）。
+    Resampler downsample(48000, kYamnetSampleRate);
+    const size_t cap = downsample.max_output_for_input(n);
+    std::vector<float> pcm16k(cap);
+    std::lock_guard<std::mutex> lock(classify_mutex_);
+    size_t n16 = downsample.process(pcm48k, n, pcm16k.data(), cap);
+    if (n16 == 0)
+      return std::nullopt;
+
+    // 2. 构造输入张量 [1, 48000]。
+    // YAMNet 输入固定 48000 样本；不足补零，超出截断。
+    std::vector<float> input(kYamnetInputSamples, 0.0f);
+    size_t copy_n = std::min(n16, kYamnetInputSamples);
+    std::memcpy(input.data(), pcm16k.data(), copy_n * sizeof(float));
+
+    const Ort::MemoryInfo& mi = OnnxMemoryInfo();
+    int64_t in_shape[] = {1, static_cast<int64_t>(kYamnetInputSamples)};
+    Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
+        mi, input.data(), input.size(), in_shape, 2);
+    const char* in_names[1] = {impl_->in_name.c_str()};
+    const char* out_names[1] = {impl_->scores_name.c_str()};
+
+    // 3. ONNX Run（只取 scores 输出）。
+    auto outputs = impl_->session->Run(Ort::RunOptions{nullptr}, in_names,
+                                       &in_tensor, 1, out_names, 1);
+    if (outputs.empty())
+      return std::nullopt;
+
+    const float* scores = outputs[0].GetTensorMutableData<float>();
+    auto out_info = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+    // scores 形状 [6, 521] 或 [N, 521]。
+    size_t num_frames = (out_info.size() >= 2) ? out_info[0] : kYamnetNumFrames;
+    size_t num_classes =
+        (out_info.size() >= 2) ? out_info[1] : kYamnetNumClasses;
+    if (num_classes == 0)
+      return std::nullopt;
+
+    // 4. 6 帧分数取均值 -> [521]。
+    std::vector<float> mean_scores(num_classes, 0.0f);
+    for (size_t fr = 0; fr < num_frames; ++fr) {
+      for (size_t c = 0; c < num_classes; ++c) {
+        mean_scores[c] += sanitize(scores[fr * num_classes + c]);
       }
-      float w = 0.0f;
-      if (f <= f_center) {
-        float denom = (f_center - f_left);
-        w = (denom > 1e-12f) ? (f - f_left) / denom : 0.0f;
-      } else {
-        float denom = (f_right - f_center);
-        w = (denom > 1e-12f) ? (f_right - f) / denom : 0.0f;
-      }
-      impl_->mel_filterbank[m][k] = w;
     }
+    for (size_t c = 0; c < num_classes; ++c)
+      mean_scores[c] /= static_cast<float>(num_frames);
+
+    // 5. 白名单过滤 + 降序排序 -> top-3。
+    std::vector<MlTypeScore> filtered;
+    for (size_t i = 0; i < kNoiseClassCount; ++i) {
+      int idx = kNoiseClassIndices[i];
+      if (idx < 0 || static_cast<size_t>(idx) >= num_classes)
+        continue;
+      float s = mean_scores[idx];
+      if (s < kMinScore)
+        continue;
+      MlTypeScore ts;
+      ts.score = s;
+      auto it = impl_->class_map.find(idx);
+      ts.type_name = (it != impl_->class_map.end())
+                         ? it->second
+                         : "class_" + std::to_string(idx);
+      filtered.push_back(std::move(ts));
+    }
+    std::sort(filtered.begin(), filtered.end(),
+              [](const MlTypeScore& a, const MlTypeScore& b) {
+                return a.score > b.score;
+              });
+
+    if (filtered.empty())
+      return std::nullopt;
+
+    // 6. 构造 MlResult。
+    MlResult result;
+    result.type_name = filtered[0].type_name;
+    result.score = filtered[0].score;
+    size_t top_n = std::min(filtered.size(), kTopN);
+    result.top_types.assign(filtered.begin(), filtered.begin() + top_n);
+    return result;
+  } catch (...) {
+    // RT 契约：Run/张量异常不抛出，返回 nullopt。
+    return std::nullopt;
   }
-  impl_->mel_built = true;
 }
 
-std::array<float, kVggishEmbedDim> MlClassifier::embed(const float* pcm48k,
-                                                       size_t n) const {
-  std::array<float, kVggishEmbedDim> out{};
-  out.fill(0.0f);
+std::vector<float> MlClassifier::embed(const float* pcm48k, size_t n) const {
+  std::vector<float> out(kYamnetEmbedDim, 0.0f);
   if (!available() || pcm48k == nullptr || n == 0)
     return out;
 
   try {
-    ensure_mel_filterbank();
-    // 1. 48k -> 16k 重采样。
-    const size_t cap = impl_->downsample->max_output_for_input(n);
-    if (impl_->mel16.size() < cap)
-      impl_->mel16.resize(cap);
-    size_t n16 =
-        impl_->downsample->process(pcm48k, n, impl_->mel16.data(), cap);
+    // 1. 48k -> 16k 重采样（局部 Resampler，避免共享状态污染，同 classify）。
+    Resampler downsample(48000, kYamnetSampleRate);
+    const size_t cap = downsample.max_output_for_input(n);
+    std::vector<float> pcm16k(cap);
+    std::lock_guard<std::mutex> lock(classify_mutex_);
+    size_t n16 = downsample.process(pcm48k, n, pcm16k.data(), cap);
     if (n16 == 0)
       return out;
 
-    // 2. STFT -> log-mel [96][64]。
-    impl_->logmel.assign(kVggishNumFrames * kVggishMelBins, 0.0f);
-    const size_t nbins = kVggishNfft / 2 + 1;  // 257
-    // canonical VGGish（tf.signal.hann_window）：周期 Hann（periodic，分母 N）
-    // 而非对称 Hann（分母 N-1）。
-    std::vector<float> hann(kVggishFrame);
-    for (size_t i = 0; i < kVggishFrame; ++i)
-      hann[i] = 0.5f - 0.5f * std::cos(2.0f * fft::kPi * static_cast<float>(i) /
-                                       static_cast<float>(kVggishFrame));
-    if (impl_->scratch_frame.size() < kVggishNfft)
-      impl_->scratch_frame.assign(kVggishNfft, 0.0f);
+    // 2. 构造输入张量 [1, 48000]。
+    std::vector<float> input(kYamnetInputSamples, 0.0f);
+    size_t copy_n = std::min(n16, kYamnetInputSamples);
+    std::memcpy(input.data(), pcm16k.data(), copy_n * sizeof(float));
 
-    for (size_t fr = 0; fr < kVggishNumFrames; ++fr) {
-      size_t start = fr * kVggishHop;
-      // 取一帧（零填充超出部分）。
-      std::vector<std::complex<float>> X(kVggishNfft,
-                                         std::complex<float>(0.0f, 0.0f));
-      for (size_t i = 0; i < kVggishFrame; ++i) {
-        float s = (start + i < n16) ? impl_->mel16[start + i] : 0.0f;
-        X[i] = std::complex<float>(s * hann[i], 0.0f);
-      }
-      // radix-2 FFT（512 是 2 的幂）。
-      fft::FftRadix2(X, -1);
-      // 功率谱 -> mel -> log(mel + 0.01)（canonical VGGish：加 0.01 偏移，
-      // 非 log1p(e)=log(1+e*1.0)；0.01 vs 1 偏移差异大，off-distribution）。
-      for (size_t m = 0; m < kVggishMelBins; ++m) {
-        float e = 0.0f;
-        for (size_t k = 0; k < nbins; ++k) {
-          e += impl_->mel_filterbank[m][k] * std::norm(X[k]);
-        }
-        impl_->logmel[fr * kVggishMelBins + m] = std::log(e + kVggishLogOffset);
-      }
-    }
-
-    // 3. 绑定输入张量 [1, 96, 64] 并 Run。
     const Ort::MemoryInfo& mi = OnnxMemoryInfo();
-    int64_t in_shape[] = {1, static_cast<int64_t>(kVggishNumFrames),
-                          static_cast<int64_t>(kVggishMelBins)};
+    int64_t in_shape[] = {1, static_cast<int64_t>(kYamnetInputSamples)};
     Ort::Value in_tensor = Ort::Value::CreateTensor<float>(
-        mi, impl_->logmel.data(), impl_->logmel.size(), in_shape, 3);
+        mi, input.data(), input.size(), in_shape, 2);
     const char* in_names[1] = {impl_->in_name.c_str()};
-    const char* out_names[1] = {impl_->out_name.c_str()};
+    const char* out_names[1] = {impl_->embeddings_name.c_str()};
+
+    // 3. ONNX Run（取 embeddings 输出）。
     auto outputs = impl_->session->Run(Ort::RunOptions{nullptr}, in_names,
                                        &in_tensor, 1, out_names, 1);
     if (outputs.empty())
       return out;
+
     const float* emb = outputs[0].GetTensorMutableData<float>();
     size_t out_n = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
-    size_t copy_n = std::min(out_n, kVggishEmbedDim);
-    for (size_t i = 0; i < copy_n; ++i)
-      out[i] = sanitize(emb[i]);
+    // embeddings [6, 1024] -> 取最后一帧（最新）。
+    size_t frame_size = kYamnetEmbedDim;
+    size_t num_frames = out_n / frame_size;
+    if (num_frames == 0)
+      return out;
+    size_t offset = (num_frames - 1) * frame_size;
+    size_t copy = std::min(frame_size, kYamnetEmbedDim);
+    for (size_t i = 0; i < copy; ++i)
+      out[i] = sanitize(emb[offset + i]);
   } catch (...) {
-    // RT 契约：Run/张量异常不抛出，返回全零（L3 退化为未识别）。
-    out.fill(0.0f);
+    out.assign(kYamnetEmbedDim, 0.0f);
   }
   return out;
-}
-
-std::optional<L3Match> MlClassifier::classify(
-    const float* pcm48k,
-    size_t n,
-    const NoiseTemplateDB& templates) const {
-  if (!available())
-    return std::nullopt;
-  auto emb = embed(pcm48k, n);
-  // 全零嵌入（Run 失败/静音）-> 无法检索。
-  float norm = 0.0f;
-  for (float v : emb)
-    norm += v * v;
-  if (norm <= 0.0f)
-    return std::nullopt;
-  auto [tid, sim] = templates.match_vggish(emb);
-  if (tid == 0)
-    return std::nullopt;
-  L3Match m;
-  m.template_id = tid;
-  m.similarity = sim;
-  if (const Template* t = templates.get_template(tid))
-    m.label = t->name;
-  return m;
 }
 
 }  // namespace noise

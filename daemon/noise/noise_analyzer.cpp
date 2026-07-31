@@ -15,8 +15,8 @@
 #include <numeric>
 #include <vector>
 
-#include "ml_classifier.hpp"        // Spec5 T3：L3 ML 分类
-#include "noise_template_db.hpp"    // Spec5 T3：L3 kNN 模板检索
+#include "ml_classifier.hpp"      // L3 ML 分类（YAMNet）
+#include "noise_template_db.hpp"  // L2 Bark 模板匹配
 
 namespace noise {
 
@@ -163,8 +163,8 @@ void accumulate_bark_bands(const std::vector<float>& power,
 }
 }  // namespace
 
-// Spec5 T3：out-of-line 构造/析构。ml_classifier_/template_db_ 的 shared_ptr
-// 成员需完整类型析构（前向声明在头），定义在 .cpp（此处 include 全定义）。
+// out-of-line 构造/析构。ml_classifier_ 的 shared_ptr 成员需完整类型析构
+// （前向声明在头），定义在 .cpp（此处 include 全定义）。
 NoiseAnalyzer::NoiseAnalyzer() = default;
 NoiseAnalyzer::~NoiseAnalyzer() = default;
 
@@ -179,31 +179,35 @@ void NoiseAnalyzer::set_template_db(std::shared_ptr<NoiseTemplateDB> db) {
 NoiseAnalysisResult NoiseAnalyzer::analyze(
     const float* frames,
     size_t frame_size,
-    const NoiseDetectionResult& detection) {
+    const NoiseDetectionResult& detection,
+    const float* original_pcm,
+    size_t original_n) {
   NoiseAnalysisResult result{};
-  result.primary_type = NoiseType::Unknown;
-  result.primary_confidence = 0.0f;
-  result.is_mixed = false;
-  result.noise_level_dbfs = -120.0f;
-  result.spectral_centroid_hz = 0.0f;
-  result.spectral_flatness = 0.0f;
-  result.hum_strength_db = 0.0f;
-  result.impulse_count = 0.0f;
-  result.band_energy.fill(0.0f);
-  // Spec5 T3：L3 字段默认（source 默认 l1；L3 触发时 maybe_run_l3_ 覆盖）。
-  result.l3_match_type.clear();
-  result.l3_similarity = 0.0f;
-  result.noise_type_source = "l1";
+  result.is_speech = detection.is_speech;
+
+  // L3 字段：恢复上次 L3 命中结果（持久化，避免 1/300 帧瞬态被覆盖）。
+  if (l3_has_result_) {
+    result.ml_noise_type = last_l3_type_;
+    result.ml_noise_score = last_l3_score_;
+    result.ml_top_types = last_l3_top_types_;
+  }
 
   if (frame_size == 0 || frames == nullptr)
     return result;
 
-  // arch §3.3.1:分析 OriginalPCM(降噪关闭)时,需 VAD 过滤语音段,仅在
-  // 非语音段做频谱分析。speech 帧不是噪声 -> 跳过分析,返回 Unknown。
-  // 不推 FrameFeatures 到环形缓冲(语音帧不参与窗口聚合统计)。
-  if (detection.is_speech) {
-    return result;
-  }
+  // L3 PCM 累积 + 分类：独立于 VAD 和 L1。
+  // L3 优先使用原始音频（YAMNet 多标签分类需完整混合音频，能同时识别
+  // 语音+噪声，白名单过滤掉 Speech 后报告噪声类型）。降噪开启时噪声分量
+  // 是失真残留，YAMNet 无法有效分类。无原始音频时回退到 frames。
+  const float* l3_pcm =
+      (original_pcm && original_n > 0) ? original_pcm : frames;
+  size_t l3_n = (original_pcm && original_n > 0) ? original_n : frame_size;
+  maybe_run_l3_(result, l3_pcm, l3_n);
+
+  // L1 频域分析：始终运行，不受 VAD 门控。
+  // 降噪开启时分析输入是噪声分量（纯噪声），VAD 无意义。
+  // 降噪关闭时 L1 规则本身不会误判语音为噪声（语音 SF≈0.1-0.3，不触发
+  // White/Pink；语音基频 80-300Hz，不触发 Hum50/60）。
 
   const float sample_rate = static_cast<float>(kDefaultSampleRate);
 
@@ -344,12 +348,21 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   auto candidates = classify_rule_based(power, kFftSize, sample_rate, frames,
                                         frame_size, sf_recomputed);
 
-  // 额外填充 Hum50Hz/60Hz 候选(Goertzel 精确数据,classify_rule_based 不再添加)
-  float hum_conf = clampf((peak_db - 10.0f) / 20.0f, 0.0f, 1.0f);
-  if (hum_conf > 0.1f) {
+  // 额外填充 Hum50Hz/60Hz 候选(Goertzel 精确数据)
+  // hum_conf: peak_db > 4dB 即开始报告。Goertzel 精确检测 50/60Hz 基频，
+  // 误判风险低（不同于 FFT bin 粗估）。peak_db 4-6dB 是弱 hum 但仍可识别。
+  float hum_conf = clampf((peak_db - 4.0f) / 16.0f, 0.0f, 1.0f);
+  if (hum_conf > 0.05f) {
     NoiseType hum_type =
         (peak_50hz >= peak_60hz) ? NoiseType::Hum50Hz : NoiseType::Hum60Hz;
     candidates.push_back({hum_type, hum_conf});
+    // Goertzel 检测到 hum 时，pink 候选不可靠（hum 谐波产生的斜率碰巧
+    // 接近 -3dB/oct 是假阳性）。移除 pink 候选，让 hum 成为唯一主类型。
+    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                    [](const NoiseTypeCandidate& c) {
+                                      return c.type == NoiseType::Pink;
+                                    }),
+                     candidates.end());
   }
 
   // 额外填充 Impulse 候选(需要时域数据)
@@ -396,68 +409,49 @@ NoiseAnalysisResult NoiseAnalyzer::analyze(
   if (!result.candidates.empty()) {
     result.primary_type = result.candidates[0].type;
     result.primary_confidence = result.candidates[0].confidence;
-    // 混合:candidates.size() >= 2 && candidates[1].confidence > 0.3
     result.is_mixed =
         result.candidates.size() >= 2 && result.candidates[1].confidence > 0.3f;
   }
 
-  // ── 逐帧 FrameFeatures 推入环形缓冲(arch §3.3.7) ────────────────────
-  FrameFeatures feat{};
-  feat.bark_energy = result.band_energy;
-  feat.spectral_flatness = sf_recomputed;
-  feat.spectral_centroid_hz = result.spectral_centroid_hz;
-  feat.noise_level_dbfs = result.noise_level_dbfs;
-  feat.hum_strength_db = result.hum_strength_db;
-  feat.impulse_count = result.impulse_count;
-  feat.l1_type = result.primary_type;
-  feat.l1_confidence = result.primary_confidence;
-
-  if (feature_ring_.size() < kRingCapacity) {
-    feature_ring_.push_back(feat);
-    ++ring_count_;
-  } else {
-    feature_ring_[ring_head_] = feat;
-    ring_head_ = (ring_head_ + 1) % kRingCapacity;
+  // ── L2 Bark 模板匹配（每帧，用当前 band_energy 匹配用户模板库）──
+  if (template_db_) {
+    auto [tid, sim] = template_db_->match(result.band_energy);
+    if (tid > 0) {
+      result.l2_match_id = tid;
+      result.l2_similarity = sim;
+      const Template* t = template_db_->get_template(tid);
+      if (t)
+        result.l2_match_name = t->name;
+    }
   }
-  // 窗口到期时聚合(arch §3.3.7 L625)。当前实现:每 200 帧(2s)聚合一次。
-  // Task 5 仅保留缓冲 + 聚合入口;Task 6/7 消费聚合结果。
-  if (ring_count_ >= kRingCapacity) {
-    aggregate_window();
-  }
-
-  // Spec5 T3：L1 规则式结果已定。若 primary_confidence < 阈值（L1+L2 未识别）
-  // 且 MlClassifier 可用，追加 PCM 环形缓冲并触发 L3（覆盖 noise_type_source=l3）。
-  maybe_run_l3_(result, frames, frame_size);
 
   return result;
 }
 
-// Spec5 T3（D-S5.8）：L3 ML 分类层。
-// 每帧追加 analysis PCM 到 0.96s 环形缓冲；当缓冲满 + L1 未识别
-// （primary_confidence < 阈值）+ 节流冷却到期时，取最新一窗 PCM 调
-// MlClassifier::classify 做嵌入 + kNN 检索。命中 -> noise_type_source="l3"
-// + l3_match_type/l3_similarity；未命中/未触发 -> 保持 source="l1"。
+// L3 ML 分类层（YAMNet 端到端分类，独立于 L1）。
+// 每帧追加 analysis PCM 到 3s 环形缓冲；当缓冲满 + 节流冷却到期时，
+// 取最新一窗 PCM 调 MlClassifier::classify 做直接分类。
+// 命中 -> noise_type_source="l3" + ml_noise_type/ml_noise_score/ml_top_types。
 //
-// 触发频率：节流 kL3CooldownFrames(=0.96s) 一次，避免持续未知噪声时每帧
-// 跑 ONNX。L3 仅在 L1+L2 未识别时触发（低频），~ms 级可接受（brief）。
-// 注意：当前 L2 Bark 模板匹配未接入 RT analyze() 路径（既有 HTTP /test 独有），
-// 故 primary_confidence 实际反映 L1 规则式结果；L2 接入是既有 gap，不在 T3
-// 范围。L3 门的语义（置信度低才触发）与 spec 一致。
+// L3 与 L1 是互补维度（频域特征 vs 声源识别），并行运行：
+// - L3 不受 L1 置信度门控（L1 高置信时 L3 仍运行，提供声源信息）
+// - L3 不受 VAD 门控（YAMNet 多标签能处理混合音频）
+// 触发频率：节流 kL3CooldownFrames(=3s) 一次，避免每帧跑 ONNX。
 void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
                                   const float* frames,
                                   size_t frame_size) {
-  if (!ml_classifier_ || !template_db_)
+  if (!ml_classifier_)
     return;
   if (frames == nullptr || frame_size == 0)
     return;
 
   // 追加到 PCM 环形缓冲（惰性分配）。
   if (pcm_ring_.empty())
-    pcm_ring_.assign(kVggishWindowSamples, 0.0f);
+    pcm_ring_.assign(kYamnetWindowSamples, 0.0f);
   for (size_t i = 0; i < frame_size; ++i) {
     pcm_ring_[pcm_ring_head_] = frames[i];
-    pcm_ring_head_ = (pcm_ring_head_ + 1) % kVggishWindowSamples;
-    if (pcm_ring_count_ < kVggishWindowSamples)
+    pcm_ring_head_ = (pcm_ring_head_ + 1) % kYamnetWindowSamples;
+    if (pcm_ring_count_ < kYamnetWindowSamples)
       ++pcm_ring_count_;
   }
 
@@ -466,60 +460,30 @@ void NoiseAnalyzer::maybe_run_l3_(NoiseAnalysisResult& result,
     --l3_cooldown_;
 
   // 触发条件：缓冲满 + L1 未识别 + 冷却到期。
-  if (pcm_ring_count_ < kVggishWindowSamples)
-    return;  // 不足 0.96s，无法嵌入
-  if (result.primary_confidence >= l3_threshold_)
-    return;  // L1 已识别，跳过 L3
+  if (pcm_ring_count_ < kYamnetWindowSamples)
+    return;  // 不足 3s，无法分类
   if (l3_cooldown_ > 0)
     return;  // 节流中
 
-  // 取最新一窗（环形缓冲按写入顺序展开为连续 0.96s）。
-  std::vector<float> window(kVggishWindowSamples);
+  // 取最新一窗（环形缓冲按写入顺序展开为连续 3s）。
+  std::vector<float> window(kYamnetWindowSamples);
   // head 指向下一个写入位置 = 最旧样本位置（缓冲满时）。
-  for (size_t i = 0; i < kVggishWindowSamples; ++i)
-    window[i] = pcm_ring_[(pcm_ring_head_ + i) % kVggishWindowSamples];
+  for (size_t i = 0; i < kYamnetWindowSamples; ++i)
+    window[i] = pcm_ring_[(pcm_ring_head_ + i) % kYamnetWindowSamples];
 
-  auto m = ml_classifier_->classify(window.data(), kVggishWindowSamples,
-                                    *template_db_);
+  auto m = ml_classifier_->classify(window.data(), kYamnetWindowSamples);
   l3_cooldown_ = kL3CooldownFrames;  // 触发后冷却（无论命中）
   if (m.has_value()) {
-    result.noise_type_source = "l3";
-    result.l3_match_type = m->label;
-    result.l3_similarity = m->similarity;
+    // 持久化 L3 结果：后续帧恢复此结果，直到下次 L3 触发更新。
+    last_l3_type_ = m->type_name;
+    last_l3_score_ = m->score;
+    last_l3_top_types_ = m->top_types;
+    l3_has_result_ = true;
+    result.ml_noise_type = m->type_name;
+    result.ml_noise_score = m->score;
+    result.ml_top_types = std::move(m->top_types);
   }
-  // 未命中：保持 source="l1"（L1 的 Unknown），L3 已尽力。
-}
-
-void NoiseAnalyzer::set_analysis_window_ms(uint32_t ms) {
-  analysis_window_ms_ = ms;
-}
-
-void NoiseAnalyzer::aggregate_window() {
-  // arch §3.3.7 L625:窗口内特征聚合
-  // - 加权平均 bark_energy -> L2 模板匹配输入
-  // - 取中位数 spectral_flatness -> 最终 SF
-  // - 取 max impulse_count -> 脉冲率
-  // - 投票 L1 type -> 窗口级分类结果
-  // 当前实现:清空缓冲,聚合结果供 Task 6/7 消费。
-  // Task 5 仅保留入口;详细聚合逻辑在 Task 6 实现。
-  if (feature_ring_.empty())
-    return;
-  // 简单聚合:计算 bark_energy 均值(占位,Task 6 扩展)
-  std::array<float, 32> avg_bark{};
-  avg_bark.fill(0.0f);
-  for (const auto& f : feature_ring_) {
-    for (size_t b = 0; b < 32; ++b) {
-      avg_bark[b] += f.bark_energy[b];
-    }
-  }
-  float n = static_cast<float>(feature_ring_.size());
-  for (size_t b = 0; b < 32; ++b) {
-    avg_bark[b] /= n;
-  }
-  // 清空缓冲(聚合后)
-  feature_ring_.clear();
-  ring_head_ = 0;
-  ring_count_ = 0;
+  // 未命中：保持上次 L3 结果（如有），L3 已尽力。
 }
 
 std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
@@ -538,18 +502,29 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
 
   const float bin_freq = sample_rate / fft_n;
 
-  // ── 规则 1: 白噪声(arch §3.3.4 L523)
-  // SF > 0.7,conf = clamp((SF - 0.7) / 0.3, 0, 1)
-  if (spectral_flatness > 0.7f) {
-    float conf = clampf((spectral_flatness - 0.7f) / 0.3f, 0.0f, 1.0f);
+  // ── 规则 1: 白噪声
+  // SF > 0.6,conf = clamp((SF - 0.6) / 0.4, 0, 1)
+  // 原 SF > 0.7 阈值偏高，合成白噪 SF≈0.84 -> conf 仅 0.47。
+  // 降至 0.6 使 conf 提升到 0.6+，同时不误判语音（语音 SF≈0.1-0.3）。
+  if (spectral_flatness > 0.6f) {
+    float conf = clampf((spectral_flatness - 0.6f) / 0.4f, 0.0f, 1.0f);
     if (conf > 0.1f)
       candidates.push_back({NoiseType::White, conf});
   }
 
-  // ── 规则 2: 粉红噪声(arch §3.3.4 L524)
-  // 频谱斜率 ≈ -3dB/oct,conf = 1 - |slope + 3| / 1.5
-  // 计算:在 log-freq vs power_db 空间做线性回归
-  {
+  // ── 规则 2: 粉红噪声
+  // 频谱斜率 ≈ -3dB/oct，容差 ±2dB（原 ±3dB 过宽）。
+  // 真实粉红噪声斜率在 -2 到 -5 之间波动，±2dB 容差能覆盖且减少误判。
+  // conf = 1 - |slope + 3| / 2.0
+  //
+  // SF 守卫：真实粉红噪声 SF≈0.2-0.5（比白噪声低，比语音/自然声高）。
+  // 64 路验证发现几乎任何低频重的自然声（rain/engine/siren 等）斜率都
+  // 偏负，碰巧落进 -3dB/oct 容差被误判 Pink，但它们的 SF 仅 0.01-0.08。
+  // 要求 SF >= 0.2 才报 Pink，消除低平坦度信号的假阳性。
+  //
+  // 拟合优度守卫：真实粉红噪声 log2(频率)-dB 近似线性，R² > 0.7。
+  // 自然声频谱起伏大、线性度差，R² 低 -> 不报 Pink。
+  if (spectral_flatness >= 0.2f) {
     std::vector<float> log_freqs;
     std::vector<float> power_db;
     for (size_t k = 1; k < n_half; ++k) {
@@ -562,7 +537,6 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
       power_db.push_back(10.0f * std::log10(power_spectrum[k - 1]));
     }
     if (log_freqs.size() >= 10) {
-      // 线性回归:power_db = a * log_freq + b
       float n = static_cast<float>(log_freqs.size());
       float sum_x = std::accumulate(log_freqs.begin(), log_freqs.end(), 0.0f);
       float sum_y = std::accumulate(power_db.begin(), power_db.end(), 0.0f);
@@ -574,8 +548,22 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
       float denom = n * sum_xx - sum_x * sum_x;
       if (std::abs(denom) > 1e-10f) {
         float slope = (n * sum_xy - sum_x * sum_y) / denom;
+        // 拟合优度 R²：1 - SS_res/SS_tot。真实粉红噪声 R² > 0.7。
+        float mean_y = sum_y / n;
+        float ss_res = 0.0f, ss_tot = 0.0f;
+        float intercept = (sum_y - slope * sum_x) / n;
+        for (size_t i = 0; i < log_freqs.size(); ++i) {
+          float predicted = slope * log_freqs[i] + intercept;
+          ss_res += (power_db[i] - predicted) * (power_db[i] - predicted);
+          ss_tot += (power_db[i] - mean_y) * (power_db[i] - mean_y);
+        }
+        float r_squared = (ss_tot > 1e-10f) ? (1.0f - ss_res / ss_tot) : 0.0f;
         // slope 单位:dB/oct(log2 频率)
-        float conf = 1.0f - std::abs(slope + 3.0f) / 1.5f;
+        float conf = 1.0f - std::abs(slope + 3.0f) / 2.0f;
+        // R² 软降（非硬门槛）：单帧 10ms 粉红噪声 R² 仅 0.3-0.4（频谱
+        // 起伏大），硬门槛 0.7 会误拦真粉噪。改 R²/0.4 软降，自然声
+        // R²<0.2 -> conf 被压到 0.1 以下不报；合成粉噪 R²≈0.37 -> conf*0.92。
+        conf *= clampf(r_squared / 0.4f, 0.0f, 1.0f);
         conf = clampf(conf, 0.0f, 1.0f);
         if (conf > 0.1f)
           candidates.push_back({NoiseType::Pink, conf});
@@ -584,44 +572,75 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   }
 
   // ── 规则 3: 工频哼声(Goertzel,在 analyze() 中计算)
-  // Resolution #2(Important #2):classify_rule_based 不再添加粗略 hum 候选。
-  // 原 FFT bin 1-3(93.75-281.25Hz)粗估会产生误判 -- 200Hz 纯音等非 hum
-  // 低频信号被误归为 Hum50Hz 且无法被 Goertzel 路径覆盖替换。
-  // hum 分类完全交由 analyze() 中的 Goertzel 精确检测(直接 DFT at
-  // 50/60/100/120/150/180 Hz,能正确区分 50 vs 60Hz)。
 
-  // ── 规则 4: 脉冲(时域,在 analyze() 中计算,此处不重复)
-  // analyze() 在调用 classify_rule_based 后追加 Impulse 候选。
+  // ── 规则 4: 脉冲(时域,在 analyze() 中计算)
 
-  // ── 规则 5: 宽带噪声(arch §3.3.4 L527)
-  // SF 0.3~0.7,conf = 1 - |SF - 0.5| / 0.2
-  if (spectral_flatness >= 0.3f && spectral_flatness <= 0.7f) {
-    float conf = 1.0f - std::abs(spectral_flatness - 0.5f) / 0.2f;
+  // ── 规则 5: 宽带噪声
+  // SF 0.15~0.6，conf = 1 - |SF - 0.375| / 0.225
+  // 原 SF 0.3~0.7 范围偏窄，真实环境噪声 SF 常 0.15-0.3，全部落入空档。
+  // 扩展到 0.15~0.6，中心 0.375，覆盖更多非平坦噪声。
+  // 语音 SF≈0.1-0.3，与宽带噪声重叠区 conf 低（<0.5），不会强误判。
+  //
+  // Pink 优先：粉红噪声 SF 0.2-0.5 落在 broadband 范围内，若 pink 候选
+  // 已存在（conf>0.3）则跳过 broadband，避免粉噪被 broadband 抢首位。
+  bool has_pink = false;
+  for (const auto& c : candidates) {
+    if (c.type == NoiseType::Pink && c.confidence > 0.3f) {
+      has_pink = true;
+      break;
+    }
+  }
+  if (!has_pink && spectral_flatness >= 0.15f && spectral_flatness <= 0.6f) {
+    float conf = 1.0f - std::abs(spectral_flatness - 0.375f) / 0.225f;
     conf = clampf(conf, 0.0f, 1.0f);
     if (conf > 0.1f)
       candidates.push_back({NoiseType::Broadband, conf});
   }
 
-  // ── 规则 6: 数字噪声(arch §3.3.4 L528)
-  // 高频(>8kHz)能量比"异常高",conf = clamp((hf_ratio - 0.5) / 0.3, 0, 1)
-  // Guard:arch 说"异常高" -- 平坦频谱(白噪)的 hf_ratio 自然 ≈0.67
-  // (因为 8-24kHz 占 0-24kHz 的 2/3),这不是"异常"。仅在频谱非平坦
-  // (SF < 0.6)时启用,避免白噪误判为 Digital。flat 噪声由 White 规则捕获。
+  // ── 规则 6: 数字噪声
+  // 高频(>8kHz)能量比异常高，conf = clamp((hf_ratio - 0.5) / 0.3, 0, 1)
+  // 仅在频谱非平坦(SF < 0.6)时启用，避免白噪误判。
+  //
+  // 高频平坦度守卫：64 路验证发现 crickets（蟋蟀）高频能量比 >0.5 被误判
+  // Digital，但蟋蟀鸣叫是准周期单频谐波峰（高频不平坦），而真正的数字噪声
+  // （clipping/aliasing）是宽带连续高频噪声（高频相对平坦）。要求高频区域
+  // SF >= 0.1（非纯尖峰）才报 Digital，排除谐波结构型高频声。
   if (spectral_flatness < 0.6f) {
     float hf_energy = 0.0f;
     float total_energy = 0.0f;
+    // 高频区域几何均值/算术均值 -> 高频平坦度（与 compute_spectral_flatness
+    // 同语义，但仅限 >8kHz bins）。
+    float hf_log_sum = 0.0f;
+    float hf_arith_sum = 0.0f;
+    size_t hf_bin_count = 0;
     for (size_t k = 1; k < n_half; ++k) {
       float freq_hz = static_cast<float>(k) * bin_freq;
       total_energy += power_spectrum[k - 1];
       if (freq_hz > 8000.0f) {
-        hf_energy += power_spectrum[k - 1];
+        float p = power_spectrum[k - 1];
+        hf_energy += p;
+        if (p > 1e-12f) {
+          hf_log_sum += std::log(p);
+          hf_arith_sum += p;
+          ++hf_bin_count;
+        }
       }
     }
-    if (total_energy > 1e-12f) {
+    if (total_energy > 1e-12f && hf_bin_count > 2) {
       float hf_ratio = hf_energy / total_energy;
-      float conf = clampf((hf_ratio - 0.5f) / 0.3f, 0.0f, 1.0f);
-      if (conf > 0.1f)
-        candidates.push_back({NoiseType::Digital, conf});
+      // 高频平坦度 = exp(mean(log)) / mean(arith)，范围 [0,1]，1=完全平坦。
+      float hf_geom = std::exp(hf_log_sum / static_cast<float>(hf_bin_count));
+      float hf_arith = hf_arith_sum / static_cast<float>(hf_bin_count);
+      float hf_flatness = (hf_arith > 1e-12f) ? hf_geom / hf_arith : 0.0f;
+      // 硬门槛：高频尖峰型（谐波结构，如蟋蟀鸣叫 hf_flatness<0.15）不报
+      // Digital。真正的数字噪声（clipping/aliasing）是宽带连续高频，高频
+      // 区域相对平坦（hf_flatness >= 0.15）。crickets hf_flatness 0.02-0.08
+      // -> 拦截；合成高频噪声 hf_flatness > 0.3 -> 通过。
+      if (hf_flatness >= 0.15f) {
+        float conf = clampf((hf_ratio - 0.5f) / 0.3f, 0.0f, 1.0f);
+        if (conf > 0.1f)
+          candidates.push_back({NoiseType::Digital, conf});
+      }
     }
   }
 

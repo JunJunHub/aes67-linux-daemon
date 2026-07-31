@@ -60,6 +60,22 @@ enum class AlertLevel : uint8_t {
   Critical = 3,
 };
 
+// AlertLevel -> 字符串（review M6 DRY：消除 noise_http/noise_manager
+// 内联重复）。
+inline const char* alert_level_to_string(AlertLevel level) {
+  switch (level) {
+    case AlertLevel::Info:
+      return "info";
+    case AlertLevel::Warning:
+      return "warning";
+    case AlertLevel::Critical:
+      return "critical";
+    case AlertLevel::None:
+    default:
+      return "none";
+  }
+}
+
 // Spec4 T4：告警事件（arch §C 新增告警事件 JSON）。
 // raise/clear 时 push 到 alert_history_ + alert_broadcaster_。
 // raised_at_ms 用 NoiseMetrics::frame_counter_（与 snapshot.timestamp_ms
@@ -88,20 +104,28 @@ struct NoiseMetricsSnapshot {
 
   // ② 检测结果（NoiseDetector）
   bool is_noisy{false};
+  bool is_speech{false};
   float noise_confidence{0.0f};  // 检测置信度（是否含噪声）
   float estimated_snr_db{0.0f};
 
-  // ③ 分析结果（NoiseAnalyzer）
+  // ③ 分析结果（NoiseAnalyzer）-- L1/L2/L3 三层并行
+  // L1 规则式（频域特征）
   NoiseType noise_type{NoiseType::Unknown};
-  float noise_type_confidence{0.0f};  // 分类置信度（区别于 noise_confidence）
+  float noise_type_confidence{0.0f};
   bool is_mixed{false};
-  // Spec5 T3（D-S5.8）：主结果来源层 "l1"|"l2"|"l3"（默认空=l1）。
-  // 由 collect() 从 NoiseAnalysisResult.noise_type_source 拷入。source="l3"
-  // 时权威类型为 l3_match_type（模板 label），noise_type 仍为 L1 的 Unknown。
-  std::string noise_type_source;
   std::array<NoiseTypeCandidateSnapshot, kMaxNoiseCandidates>
       noise_candidates{};
   size_t noise_candidates_count{0};
+  // L2 Bark 模板匹配
+  uint32_t l2_match_id{0};
+  std::string l2_match_name;
+  float l2_similarity{0.0f};
+  // L3 YAMNet 分类
+  std::string ml_noise_type;
+  float ml_noise_score{0.0f};
+  std::string
+      ml_top_types;  // 序列化： "Air conditioning:0.87;Mechanical fan:0.73"
+
   float noise_level_dbfs{-100.0f};
   float spectral_centroid_hz{0.0f};
   float spectral_flatness{0.0f};
@@ -142,12 +166,6 @@ struct NoiseMetricsSnapshot {
   // 在 switch_plugin 到非 passthrough 插件且该插件恢复 kOk 后清。告警引擎
   // 据此评估 plugin_degraded 规则（Warning）。
   bool plugin_degraded{false};
-  // Spec6 T1（D-S6.7）：L3 ML 分类结果字段暴露进快照（从
-  // NoiseAnalysisResult 拷入），供 /metrics + /history 序列化 + NoiseStore
-  // 持久化。l3_match_type 为 L3 匹配到的模板 label（空=未触发/未匹配），
-  // l3_similarity 为余弦相似度 [-1,1]。collect() 从 analysis 拷入。
-  std::string l3_match_type;
-  float l3_similarity{0.0f};
 };
 
 // ④NoiseMetrics - 聚合 ①②③ 链路结果到 NoiseMetricsSnapshot。

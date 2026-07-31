@@ -8,6 +8,7 @@
 #include <boost/log/trivial.hpp>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <iterator>
@@ -141,6 +142,29 @@ uint8_t PcmCaptureService::get_sink_channel_count(uint8_t sink_id) const {
   return config_ ? config_->get_streamer_channels() : test_channels_;
 }
 
+std::vector<uint8_t> PcmCaptureService::get_sink_channel_map(
+    uint8_t sink_id) const {
+  // 从 SessionManager 查询 StreamSink.map（用户通过 PUT /api/sink/:id 配置）。
+  // _HAS_SESSION_MANAGER_LINK_：仅生产 aes67-daemon 定义（SOURCES 含
+  // session_manager.cpp）。noise-test 不链接 session_manager.cpp，缺
+  // SessionManager::get_sink 符号 -> 守卫跳过编译期引用；运行时
+  // session_manager_ 为 nullptr（create_for_test）-> 返回空，add_sensor 用
+  // {0} 兜底。
+  // 此前用 #ifndef _USE_FAKE_DRIVER_ 守卫是错的：生产 FAKE daemon 也定义
+  // _USE_FAKE_DRIVER_，导致 FAKE 模式下 channel_map 查询被跳过，所有 sink
+  // 兜底到 channel 0，64 路并发验证无法区分通道（FAKE 测试与真实场景不一致）。
+  if (!session_manager_)
+    return {};
+#ifdef _HAS_SESSION_MANAGER_LINK_
+  StreamSink sink;
+  if (!session_manager_->get_sink(sink_id, sink))
+    return sink.map;
+#else
+  (void)sink_id;
+#endif
+  return {};
+}
+
 bool PcmCaptureService::is_capturing() const {
   return running_.load();
 }
@@ -244,55 +268,95 @@ bool PcmCaptureService::stop_capture() {
 // FAKE_DRIVER：模拟 ALSA period 节拍分发（§11 风险21 三规格）。
 void PcmCaptureService::fake_capture_loop() {
   BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_capture_loop start";
-  // 静音帧缓冲（S16_LE 交错），按 test_rate_/test_channels_ 配置。
-  // Spec1：未指定 fake_pcm_source_ 时用内置静音帧（§4.3）。
-  const uint8_t channels = test_channels_;
-  const uint32_t rate = test_rate_;
+  // 与真实 capture_loop 一致：生产路径（create()，持 config_）读 config 的
+  // sample_rate / streamer_channels；测试路径（create_for_test，无 config_）
+  // fallback 到 test_ 成员。此前 fake_capture_loop 硬用 test_ 成员（channels
+  // 默认 2），导致 FAKE_DRIVER 下配 streamer_channels=64 仍只分发 2 通道，
+  // 多路并发验证无法覆盖 64 路（FAKE 测试与真实场景行为不一致）。
+  const uint8_t channels =
+      config_ ? config_->get_streamer_channels() : test_channels_;
+  const uint32_t rate = config_ ? config_->get_sample_rate() : test_rate_;
   const size_t bytes_per_sample = 2;  // S16_LE
   const size_t period_bytes = kPeriodSamples * channels * bytes_per_sample;
   std::vector<uint8_t> silent(period_bytes, 0);
 
-  // Spec3 Task 8：若 config_->get_fake_pcm_source() 非空，读 WAV（48kHz
-  // PCM-16 mono）循环喂帧（替内置静音）。复用 T5 的 parse_wav_pcm16_48k_mono
-  // （DRY，不重复 WAV 解析）。
-  std::vector<int16_t> wav_samples;  // mono S16
+  // fake_pcm_source 支持：
+  // 1. 文件路径：所有 channel 共享同一 WAV（单源模式，向后兼容）
+  // 2. 目录路径：目录下 WAV 文件按文件名排序，依次加载到 channel 0/1/2...
+  //    文件数不足时循环复用。多源模式用于 64 路并发不同噪声验证。
+  std::vector<std::vector<int16_t>> wav_per_channel;  // [channel] -> mono S16
   bool use_wav = false;
+
   if (config_ && !config_->get_fake_pcm_source().empty()) {
-    std::ifstream file(config_->get_fake_pcm_source(), std::ios::binary);
-    if (file.is_open()) {
+    namespace fs = std::filesystem;
+    const std::string& src = config_->get_fake_pcm_source();
+
+    // 收集 WAV 文件列表（文件或目录）
+    std::vector<std::string> wav_files;
+    if (fs::is_directory(src)) {
+      for (const auto& entry : fs::directory_iterator(src)) {
+        if (entry.path().extension() == ".wav" ||
+            entry.path().extension() == ".WAV")
+          wav_files.push_back(entry.path().string());
+      }
+      std::sort(wav_files.begin(), wav_files.end());
+    } else {
+      wav_files.push_back(src);
+    }
+
+    // 加载 WAV 文件 -> 按 channel 分配
+    for (size_t fi = 0; fi < wav_files.size() && fi < channels; ++fi) {
+      std::ifstream file(wav_files[fi], std::ios::binary);
+      if (!file.is_open()) {
+        BOOST_LOG_TRIVIAL(warning)
+            << "PcmCaptureService: cannot open " << wav_files[fi];
+        continue;
+      }
       std::string wav_bytes((std::istreambuf_iterator<char>(file)),
                             std::istreambuf_iterator<char>());
       std::vector<float> float_samples;
       uint32_t sample_rate = 0;
       if (noise::parse_wav_pcm16_48k_mono(wav_bytes, float_samples,
                                           sample_rate)) {
-        wav_samples.reserve(float_samples.size());
+        std::vector<int16_t> s16;
+        s16.reserve(float_samples.size());
         for (float v : float_samples) {
           if (v > 1.0f)
             v = 1.0f;
           if (v < -1.0f)
             v = -1.0f;
-          wav_samples.push_back(static_cast<int16_t>(v * 32767.0f));
+          s16.push_back(static_cast<int16_t>(v * 32767.0f));
         }
-        use_wav = !wav_samples.empty();
-        BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_pcm_source loaded "
-                                << wav_samples.size() << " samples from "
-                                << config_->get_fake_pcm_source();
+        wav_per_channel.push_back(std::move(s16));
+        BOOST_LOG_TRIVIAL(info) << "PcmCaptureService: fake_pcm_source[" << fi
+                                << "] loaded " << wav_per_channel.back().size()
+                                << " samples from " << wav_files[fi];
       } else {
         BOOST_LOG_TRIVIAL(warning)
-            << "PcmCaptureService: failed to parse fake_pcm_source WAV ("
-            << config_->get_fake_pcm_source() << "), using silence";
+            << "PcmCaptureService: failed to parse " << wav_files[fi];
       }
-    } else {
-      BOOST_LOG_TRIVIAL(warning)
-          << "PcmCaptureService: cannot open " << config_->get_fake_pcm_source()
-          << ", using silence";
     }
+
+    // 文件数不足时循环复用第一个（或所有 channel 共享）
+    while (wav_per_channel.size() < channels && !wav_per_channel.empty())
+      wav_per_channel.push_back(wav_per_channel[0]);
+
+    use_wav = !wav_per_channel.empty();
   }
 
-  // period 缓冲：WAV 模式下每 period 从 wav_samples 循环填充；否则用静音帧。
+  // period 缓冲：WAV 模式下每 period 从 wav_samples 循环填充各 channel。
   std::vector<uint8_t> period_buf(period_bytes, 0);
-  size_t wav_pos = 0;
+  // 各 channel 初始读取位置错开：真实场景各路音频独立到达、相位不同步，
+  // FAKE 测试若所有 channel 都从 offset 0 同步循环，会导致 L3（3s 窗口）
+  // 在多路间取到相同 WAV 相位 -> 同类别文件给出相同分数，掩盖解复用的
+  // 独立性。按 channel index 确定性错开（无需随机数，可复现），贴近真实。
+  std::vector<size_t> wav_pos(channels, 0);
+  for (uint8_t ch = 0; ch < channels && ch < wav_per_channel.size(); ++ch) {
+    size_t wsize = wav_per_channel[ch].size();
+    if (wsize > 0)
+      // 错开 ~0.5s（24000 样本@48k）的整数倍，保证各 channel 不同相位。
+      wav_pos[ch] = (static_cast<size_t>(ch) * 24000) % wsize;
+  }
 
   // period 时长 = 6144 / 48000 ≈ 128ms
   const auto period_duration =
@@ -300,11 +364,12 @@ void PcmCaptureService::fake_capture_loop() {
   auto next_period = std::chrono::steady_clock::now();
   while (!stop_flag_.load()) {
     if (use_wav) {
-      // 从 wav_samples 循环读取 kPeriodSamples 帧，交错复制到 channels 通道。
+      // 每个 channel 从各自的 WAV 循环读取 kPeriodSamples 帧。
       for (size_t i = 0; i < kPeriodSamples; ++i) {
-        int16_t s = wav_samples[wav_pos];
-        wav_pos = (wav_pos + 1) % wav_samples.size();
         for (uint8_t ch = 0; ch < channels; ++ch) {
+          auto& wav = wav_per_channel[ch];
+          int16_t s = wav[wav_pos[ch]];
+          wav_pos[ch] = (wav_pos[ch] + 1) % wav.size();
           std::memcpy(
               period_buf.data() + (i * channels + ch) * bytes_per_sample, &s,
               bytes_per_sample);

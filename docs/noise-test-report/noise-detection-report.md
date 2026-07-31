@@ -82,7 +82,7 @@ noise-testset/concurrent64/
 
 ---
 
-## 3. L1/L2/L3 三层并行架构验证
+## 3. L1/L2/L3 三层噪声分析并行架构验证
 
 ### 3.1 架构说明
 
@@ -127,7 +127,7 @@ analyze(frames, frame_size, detection, original_pcm, original_n)
 
 ---
 
-## 4. 64 路满载并发验证
+## 4. 64 路满载并发验证(仅检测)
 
 ### 4.1 测试配置
 
@@ -259,12 +259,18 @@ SID | ESC-50 类别      | L1        | L3                      score
 
 ### 5.1 单次 classify() 耗时
 
-| 步骤 | 耗时 | 说明 |
-|------|------|------|
-| 重采样 48k -> 16k | ~1 ms | 144000 -> 48000 样本 |
-| ONNX Run | ~17 ms | YAMNet 前向推理 |
-| scores 均值 + 白名单过滤 | ~1 ms | 6×521 均值 + 48 类过滤 + 排序 |
-| **总计** | **~19 ms** | 10 次平均 |
+**64 路满载并发实测**（16 核，198 次采样）：
+
+| 步骤 | 平均耗时 | 说明 |
+|------|----------|------|
+| 重采样 48k -> 16k | ~1 ms | SpeexDSP，144000 -> 48000 样本（局部 Resampler） |
+| ONNX Run | ~19.6 ms | YAMNet 前向推理（CPUExecutionProvider） |
+| scores 均值 + 白名单过滤 | ~0.03 ms | 6×521 均值 + 48 类过滤 + 排序 |
+| **总计** | **~21 ms**（中位 19.3ms，范围 17.4-42ms） | 198 次平均 |
+
+> 单路无负载时 ONNX Run 仅 ~3.7ms（Python 实测），但 64 路满载并发时
+> ONNX Runtime 内部多线程与 daemon 其他线程（L1/降噪/capture）争抢 CPU，
+> ONNX Run 升至 ~19.6ms。这是并发负载下的真实耗时。
 
 ### 5.2 并发影响
 
@@ -273,7 +279,9 @@ SID | ESC-50 类别      | L1        | L3                      score
 - **重采样改用局部 Resampler**（非成员）：此前成员 `downsample` 的 SpeexDSP
   滤波状态被 64 路交叉调用污染（sensor A 残留混入 B 输出），导致分类失真
   偏向 Water。局部构造无状态残留，3s 一次批处理构造开销可忽略（<<1ms）
-- 64 路调 `classify()` 时 ONNX Run 串行，每路每 3s 触发一次，实际竞争极少
+- 64 路调 `classify()` 时 ONNX Run 串行（mutex），每路每 3s 触发一次（300 帧
+  中 1 帧），实际同时触发概率低；最坏情况 64 路同时触发：64 × 21ms ≈ 1.3s
+  串行等待，但 YAMNet 结果 sticky 持久化（3s 内复用上次结果），不影响实时性
 
 ### 5.3 L3 独立性
 

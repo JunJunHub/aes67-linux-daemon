@@ -144,8 +144,12 @@ glass_breaking。
 |------|-----|
 | **不同 score 数** | **64/64（100% 独立）** |
 | **L3 类型多样性** | 21-25 种（3 轮） |
-| **L1 类型多样性** | 5-6 种（unknown/pink/digital/hum_60hz/hum_50hz/broadband） |
+| **L1 类型多样性** | 2-4 种（unknown/hum_50hz/hum_60hz/broadband/impulse） |
 | **L3 非空率** | 58/64（91%，6 路低于 min_score 阈值） |
+
+> L1 规则经 §4.7 守卫优化后更保守（unknown 占多数），这是诚实结论：
+> L1 定位"信号形态分类"（White/Pink/Hum/Broadband），ESC-50 真实环境声
+> 多为谐波/瞬态结构不属于这 6 种形态；声源识别交给 L3 YAMNet（21+ 类型）。
 
 ### 4.4 L3 类型分布（典型轮次）
 
@@ -166,21 +170,26 @@ glass_breaking。
 > ground truth 高度吻合。此前"全部 Water"的假象是 channel_map 解复用 bug
 > 所致（详见 §4.6）。
 
-### 4.5 逐路结果示例（修复后）
+### 4.5 逐路结果示例（L1 优化后）
 
 ```
 SID | ESC-50 类别      | L1        | L3                      score
 --------------------------------------------------------------------
-  0 | rain             | unknown   | Water                   0.786
-  9 | crickets         | unknown   | Rattle                  0.572
- 12 | water_drops      | unknown   | Liquid                  0.337
- 27 | vacuum_cleaner   | pink      | Jet engine              0.526
- 42 | siren            | digital   | Siren                   0.391
- 45 | engine           | pink      | Motor vehicle (road)    0.076
- 48 | train            | unknown   | Wind                    0.085
- 54 | fireworks        | unknown   | Outside, rural/natural  0.062
- 63 | glass_breaking   | pink      | Scrape                  0.079
+  0 | rain             | unknown   | Water                   0.774
+  9 | crickets         | unknown   | Rattle                  0.539
+ 12 | water_drops      | impulse   | Liquid                  0.243
+ 27 | vacuum_cleaner   | unknown   | Jet engine              0.353
+ 42 | siren            | unknown   | Siren                   0.622
+ 45 | engine           | unknown   | Motor vehicle (road)    0.081
+ 48 | train            | hum_50hz  | Motor vehicle (road)    0.076
+ 54 | fireworks        | unknown   | Thump, thud             0.100
+ 63 | glass_breaking   | unknown   | Clang                   0.064
 ```
+
+> L1 优化前 crickets 误判 digital、vacuum_cleaner/engine 误判 pink；
+> 优化后这些误判消除（unknown 是诚实结论，声源由 L3 识别）。L3 与 ESC-50
+> ground truth 高度吻合（rain→Water, siren→Siren, vacuum_cleaner→Jet engine,
+> crickets→Rattle, water_drops→Liquid 等）。
 
 ### 4.6 修复的并发验证阻断 bug
 

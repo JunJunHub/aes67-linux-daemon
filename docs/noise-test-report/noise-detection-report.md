@@ -1,8 +1,8 @@
 # 噪声分析检测报告
 
-> **版本**: v1.0
-> **日期**: 2026-07-29
-> **环境**: FAKE_DRIVER 模式，noise-dev.sh 构建（WITH_NOISE=ON, WITH_STREAMER=ON）
+> **版本**: v1.1
+> **日期**: 2026-07-31
+> **环境**: FAKE_DRIVER 模式，out-of-source 构建（WITH_NOISE=ON, WITH_STREAMER=ON）
 > **模型**: YAMNet yamnet_3s.onnx（15MB，ONNX Runtime 1.27.0）
 > **关联**: [架构设计](architecture-design.md) §3.3、[YAMNet 迁移计划](../superpowers/plans/yamnet-migration-plan.md)
 
@@ -13,11 +13,13 @@
 | 项目 | 配置 |
 |------|------|
 | OS | Linux 7.0.0-28-generic |
-| CPU | 8 核 |
+| CPU | 16 核 |
 | 内存 | 8.7 GB |
 | 构建方式 | out-of-source（daemon/build/） |
-| 编译选项 | FAKE_DRIVER=ON, WITH_NOISE=ON, WITH_STREAMER=ON, WITH_AVAHI=OFF |
-| 模型目录 | `/tmp/noise_models_proper/`（子目录布局） |
+| 编译选项 | FAKE_DRIVER=ON, WITH_NOISE=ON, WITH_STREAMER=ON, WITH_AVAHI=OFF, ENABLE_TESTS=ON |
+| 模型目录 | `noise_models/`（worktree 内子目录布局） |
+| 测试数据集 | ESC-50（2000 文件，22 类环境声）→ 64 文件转 48kHz mono，存 `noise-testset/concurrent64/audio/` |
+| 测试脚本 | `noise-testset/concurrent64/run_verify.sh`（启停 daemon + 建 64 sink/sensor + 查询统计） |
 
 ### 模型目录布局
 
@@ -29,6 +31,20 @@ noise_models/
 ```
 
 adapter 路径推导：`onnx_model_dir` 指向父目录，各 adapter 先找 `<dir>/<plugin_name>/` 子目录，再回退 `<dir>/` 平铺。
+
+### 64 路并发测试配置
+
+```
+noise-testset/concurrent64/
+├── audio/ch00.wav..ch63.wav   # 64 文件，48kHz mono s16，各 channel 相位错开
+├── manifest.csv               # channel → ESC-50 文件 → category ground truth
+├── config/daemon.conf         # streamer_channels=64, fake_pcm_source=audio 目录
+├── prepare_audio.sh           # 从 ESC-50 选 64 文件 + ffmpeg 转换 + manifest
+└── run_verify.sh              # 一键验证：start/setup/query/summarize/runall
+```
+
+测试链路贴近真实场景：64 个 sink 各配 `map:[N]` 绑定驱动 channel N，64 个 sensor
+各关联 sink_id=N，`fake_pcm_source` 目录模式提供 64 通道 WAV（详见 §4.1）。
 
 ---
 

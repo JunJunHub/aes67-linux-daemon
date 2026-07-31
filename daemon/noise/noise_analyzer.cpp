@@ -513,10 +513,18 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   }
 
   // ── 规则 2: 粉红噪声
-  // 频谱斜率 ≈ -3dB/oct，容差 ±3dB（原 ±1.5dB 过严）。
-  // 真实粉红噪声斜率在 -2 到 -6 之间波动，±3dB 容差能覆盖。
-  // conf = 1 - |slope + 3| / 3.0
-  {
+  // 频谱斜率 ≈ -3dB/oct，容差 ±2dB（原 ±3dB 过宽）。
+  // 真实粉红噪声斜率在 -2 到 -5 之间波动，±2dB 容差能覆盖且减少误判。
+  // conf = 1 - |slope + 3| / 2.0
+  //
+  // SF 守卫：真实粉红噪声 SF≈0.2-0.5（比白噪声低，比语音/自然声高）。
+  // 64 路验证发现几乎任何低频重的自然声（rain/engine/siren 等）斜率都
+  // 偏负，碰巧落进 -3dB/oct 容差被误判 Pink，但它们的 SF 仅 0.01-0.08。
+  // 要求 SF >= 0.2 才报 Pink，消除低平坦度信号的假阳性。
+  //
+  // 拟合优度守卫：真实粉红噪声 log2(频率)-dB 近似线性，R² > 0.7。
+  // 自然声频谱起伏大、线性度差，R² 低 -> 不报 Pink。
+  if (spectral_flatness >= 0.2f) {
     std::vector<float> log_freqs;
     std::vector<float> power_db;
     for (size_t k = 1; k < n_half; ++k) {
@@ -540,8 +548,22 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
       float denom = n * sum_xx - sum_x * sum_x;
       if (std::abs(denom) > 1e-10f) {
         float slope = (n * sum_xy - sum_x * sum_y) / denom;
+        // 拟合优度 R²：1 - SS_res/SS_tot。真实粉红噪声 R² > 0.7。
+        float mean_y = sum_y / n;
+        float ss_res = 0.0f, ss_tot = 0.0f;
+        float intercept = (sum_y - slope * sum_x) / n;
+        for (size_t i = 0; i < log_freqs.size(); ++i) {
+          float predicted = slope * log_freqs[i] + intercept;
+          ss_res += (power_db[i] - predicted) * (power_db[i] - predicted);
+          ss_tot += (power_db[i] - mean_y) * (power_db[i] - mean_y);
+        }
+        float r_squared = (ss_tot > 1e-10f) ? (1.0f - ss_res / ss_tot) : 0.0f;
         // slope 单位:dB/oct(log2 频率)
-        float conf = 1.0f - std::abs(slope + 3.0f) / 3.0f;
+        float conf = 1.0f - std::abs(slope + 3.0f) / 2.0f;
+        // R² 软降（非硬门槛）：单帧 10ms 粉红噪声 R² 仅 0.3-0.4（频谱
+        // 起伏大），硬门槛 0.7 会误拦真粉噪。改 R²/0.4 软降，自然声
+        // R²<0.2 -> conf 被压到 0.1 以下不报；合成粉噪 R²≈0.37 -> conf*0.92。
+        conf *= clampf(r_squared / 0.4f, 0.0f, 1.0f);
         conf = clampf(conf, 0.0f, 1.0f);
         if (conf > 0.1f)
           candidates.push_back({NoiseType::Pink, conf});
@@ -558,7 +580,17 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   // 原 SF 0.3~0.7 范围偏窄，真实环境噪声 SF 常 0.15-0.3，全部落入空档。
   // 扩展到 0.15~0.6，中心 0.375，覆盖更多非平坦噪声。
   // 语音 SF≈0.1-0.3，与宽带噪声重叠区 conf 低（<0.5），不会强误判。
-  if (spectral_flatness >= 0.15f && spectral_flatness <= 0.6f) {
+  //
+  // Pink 优先：粉红噪声 SF 0.2-0.5 落在 broadband 范围内，若 pink 候选
+  // 已存在（conf>0.3）则跳过 broadband，避免粉噪被 broadband 抢首位。
+  bool has_pink = false;
+  for (const auto& c : candidates) {
+    if (c.type == NoiseType::Pink && c.confidence > 0.3f) {
+      has_pink = true;
+      break;
+    }
+  }
+  if (!has_pink && spectral_flatness >= 0.15f && spectral_flatness <= 0.6f) {
     float conf = 1.0f - std::abs(spectral_flatness - 0.375f) / 0.225f;
     conf = clampf(conf, 0.0f, 1.0f);
     if (conf > 0.1f)
@@ -568,21 +600,47 @@ std::vector<NoiseTypeCandidate> NoiseAnalyzer::classify_rule_based(
   // ── 规则 6: 数字噪声
   // 高频(>8kHz)能量比异常高，conf = clamp((hf_ratio - 0.5) / 0.3, 0, 1)
   // 仅在频谱非平坦(SF < 0.6)时启用，避免白噪误判。
+  //
+  // 高频平坦度守卫：64 路验证发现 crickets（蟋蟀）高频能量比 >0.5 被误判
+  // Digital，但蟋蟀鸣叫是准周期单频谐波峰（高频不平坦），而真正的数字噪声
+  // （clipping/aliasing）是宽带连续高频噪声（高频相对平坦）。要求高频区域
+  // SF >= 0.1（非纯尖峰）才报 Digital，排除谐波结构型高频声。
   if (spectral_flatness < 0.6f) {
     float hf_energy = 0.0f;
     float total_energy = 0.0f;
+    // 高频区域几何均值/算术均值 -> 高频平坦度（与 compute_spectral_flatness
+    // 同语义，但仅限 >8kHz bins）。
+    float hf_log_sum = 0.0f;
+    float hf_arith_sum = 0.0f;
+    size_t hf_bin_count = 0;
     for (size_t k = 1; k < n_half; ++k) {
       float freq_hz = static_cast<float>(k) * bin_freq;
       total_energy += power_spectrum[k - 1];
       if (freq_hz > 8000.0f) {
-        hf_energy += power_spectrum[k - 1];
+        float p = power_spectrum[k - 1];
+        hf_energy += p;
+        if (p > 1e-12f) {
+          hf_log_sum += std::log(p);
+          hf_arith_sum += p;
+          ++hf_bin_count;
+        }
       }
     }
-    if (total_energy > 1e-12f) {
+    if (total_energy > 1e-12f && hf_bin_count > 2) {
       float hf_ratio = hf_energy / total_energy;
-      float conf = clampf((hf_ratio - 0.5f) / 0.3f, 0.0f, 1.0f);
-      if (conf > 0.1f)
-        candidates.push_back({NoiseType::Digital, conf});
+      // 高频平坦度 = exp(mean(log)) / mean(arith)，范围 [0,1]，1=完全平坦。
+      float hf_geom = std::exp(hf_log_sum / static_cast<float>(hf_bin_count));
+      float hf_arith = hf_arith_sum / static_cast<float>(hf_bin_count);
+      float hf_flatness = (hf_arith > 1e-12f) ? hf_geom / hf_arith : 0.0f;
+      // 硬门槛：高频尖峰型（谐波结构，如蟋蟀鸣叫 hf_flatness<0.15）不报
+      // Digital。真正的数字噪声（clipping/aliasing）是宽带连续高频，高频
+      // 区域相对平坦（hf_flatness >= 0.15）。crickets hf_flatness 0.02-0.08
+      // -> 拦截；合成高频噪声 hf_flatness > 0.3 -> 通过。
+      if (hf_flatness >= 0.15f) {
+        float conf = clampf((hf_ratio - 0.5f) / 0.3f, 0.0f, 1.0f);
+        if (conf > 0.1f)
+          candidates.push_back({NoiseType::Digital, conf});
+      }
     }
   }
 

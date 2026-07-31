@@ -50,35 +50,50 @@ noise-testset/concurrent64/
 
 ## 2. 三路降噪模型对比验证
 
+**验证方法**：同一含噪音频，3 个 sensor 各配一个降噪 plugin（`denoise_enabled=true`），
+对比降噪量 + L1 + L3。测试脚本 `noise-testset/denoise_compare/run_compare.sh`。
+
+> L3 三路结果相同是预期行为：L3 分析**原始音频**（YAMNet 多标签分类需完整混合
+> 音频），三路原始音频相同，故 YAMNet 输出一致；三路的差异体现在**降噪量**和
+> **L1 噪声分量分析**（L1 分析降噪后的残留噪声，不同 plugin 残留不同）。
+
 ### 2.1 白噪声测试
 
-**音频源**: 合成白噪声 10s（48kHz mono，seed=42）
+**音频源**: 合成白噪声 10s（48kHz mono，`anoisesrc color=white amplitude=0.3`）
 
 | 维度 | RNNoise | DTLN | DeepFilterNet |
 |------|---------|------|---------------|
-| **降噪量** | 48.8 dB | 36.0 dB | 12.6 dB |
-| **L1 规则式** | white (0.47) | white (0.51) | white (0.35) |
+| **降噪量** | 41-44 dB | 30-39 dB | 12-13 dB |
+| **L1 规则式** | white (0.58) | white (0.53) | white (0.59) |
 | **L2 模板匹配** | 无模板 | 无模板 | 无模板 |
-| **L3 YAMNet** | White noise (0.58) | White noise (0.53) | Static (0.29) |
-| **L3 top-3** | White noise, Noise, Static | White noise, Noise, Static | Static, White noise, Pink noise |
+| **L3 YAMNet** | White noise (0.45) | White noise (0.45) | White noise (0.45) |
+| **L3 top-3** | White noise, Static, Noise | （同左） | （同左） |
 | **告警** | critical | critical | critical |
 | **plugin_degraded** | false | false | false |
 
+**结论**：RNNoise 对合成白噪降噪最强（~43dB），DTLN 次之（~35dB），DeepFilterNet
+偏弱（~12dB，DFN 针对真实环境噪声优化，合成白噪非其强项）。三路 L1 均正确识别
+white，L3 均识别 White noise（互证）。
+
 ### 2.2 含噪语音测试（VoiceBank-DEMAND）
 
-**音频源**: VoiceBank-DEMAND `p232_023.wav`（含噪语音，9.8s）
+**音频源**: VoiceBank-DEMAND `p232_023.wav`（含噪语音，9.8s，转 48k mono）
 
 | 维度 | RNNoise | DTLN | DeepFilterNet |
 |------|---------|------|---------------|
-| **降噪量** | 10.1 dB | 4.3 dB | 7.7 dB |
-| **L1 规则式** | unknown (0.00) | unknown (0.00) | pink (0.22) |
-| **L3 YAMNet** | Pour (0.07) | Pour (0.10) | Liquid (0.06) |
-| **L3 top-3** | Pour, Liquid, Trickle | Pour, Trickle, Liquid | Liquid, Trickle, Pour |
+| **降噪量** | 1-32 dB（中位 ~10） | -1~35 dB（中位 ~7） | 1-14 dB（中位 ~7） |
+| **L1 规则式** | unknown/hum_50hz | unknown/hum_50hz | unknown/hum_50hz |
+| **L3 YAMNet** | Liquid (0.066) | Liquid (0.066) | Liquid (0.066) |
+| **L3 top-3** | Liquid, Pour, Trickle | （同左） | （同左） |
 
-**说明**:
-- L1 分析噪声分量（original - denoised），SF≈0.01-0.03，不匹配规则式类型
-- L3 分析原始音频，YAMNet 多标签分类识别出水声/液体声背景噪声
-- Speech(0.75) 被白名单排除，Pour/Liquid/Trickle 是剩余高分噪声类别
+**说明**：
+- 含噪语音是非稳态信号（语音 + 背景噪声交替），瞬时降噪量（每帧 `noise_reduction_db`）
+  波动大，表中给出范围 + 中位数。RNNoise 在语音活动帧降噪较强，静音段较弱。
+- L1 分析降噪后残留噪声，SF≈0.01-0.03，多帧为 unknown，偶发 hum_50hz（残留
+  低频分量），不匹配稳态噪声规则——符合预期（残留是失真非稳态噪声）。
+- L3 分析原始音频，YAMNet 多标签分类识别出 Liquid/Pour/Trickle（水声/液体声
+  背景噪声）。Speech(0.75) 被白名单排除，Liquid/Pour 是剩余高分噪声类别。
+- 三路 L3 完全相同（0.066）：验证 L3 分析原始音频、与降噪 plugin 无关的设计。
 
 ---
 
@@ -127,13 +142,13 @@ analyze(frames, frame_size, detection, original_pcm, original_n)
 
 ---
 
-## 4. 64 路满载并发验证(仅检测)
+## 4. 64 路满载并发验证(仅检测无降噪)
 
 ### 4.1 测试配置
 
 | 项目 | 值 |
 |------|-----|
-| Sensor 数 | 64（系统上限，sink 0-63） |
+| Sensor 数 | 64（本系统上限，sink 0-63） |
 | 降噪 | 关闭（`denoise_enabled=false`） |
 | 音频源 | ESC-50 数据集 64 个环境声 WAV（22 类噪声，每类 3 个文件） |
 | 音频源模式 | `fake_pcm_source` 目录模式（64 文件 → 64 通道），各 channel 相位错开 |
@@ -231,10 +246,8 @@ SID | ESC-50 类别      | L1        | L3                      score
 
 #### L1 识别原理与判断逻辑概要
 
-L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次 FFT，从频谱
-形态判断噪声类型，输出 6 种 `NoiseType` 之一 + 连续置信度（top-3 候选）。
-定位为"信号形态分类"，与 L3 的"声源识别"互补——L1 回答"这是什么形状的
-频谱"，L3 回答"这是什么声源"。
+L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次 FFT，从频谱形态判断噪声类型，输出 6 种 `NoiseType` 之一 + 连续置信度（top-3 候选）。
+定位为"信号形态分类"，与 L3 的"声源识别"互补——L1 回答"这是什么形状的频谱"，L3 回答"这是什么声源"。
 
 **判断逻辑（`classify_rule_based` + `analyze` 中的 Goertzel/时域检测）**：
 
@@ -248,7 +261,7 @@ L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次
 | **Impulse** | 时域幅度突变 | 帧内 max_dev > 6σ | (max_dev-6)/6 |
 | **Unknown** | 以上均不命中 | — | 0 |
 
-关键守卫（§4.7 优化新增，避免误判）：
+关键守卫（避免误判）：
 - Pink：SF≥0.2 守卫（真实粉噪 SF 0.2-0.5，低频重自然声 SF 0.01-0.08 不命中）
 - Digital：高频平坦度硬门槛（crickets 谐波尖峰 hf_flatness<0.15 不命中）
 - Broadband：Pink 候选 conf>0.3 时跳过（避免粉噪被 Broadband 抢首位）
@@ -285,7 +298,7 @@ L1 是**单帧频域规则式分类**：每帧（480 样本/10ms@48k）做一次
 
 ---
 
-## 5. L3 YAMNet 性能基准
+## 5. L3 YAMNet 性能基准(仅检测无降噪)
 
 ### 5.1 单次 classify() 耗时
 
